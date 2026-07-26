@@ -3,7 +3,7 @@ on:
   permissions:
     pull-requests: read
   reaction: eyes
-  schedule: daily around 3:00 utc+8
+  schedule: weekly on friday around 3:00 utc+8
   slash_command:
     name: test-assist
     strategy: centralized
@@ -28,7 +28,7 @@ network:
     - rust
     - java
 imports:
-  - shared/engine-deepseek.md
+  - shared/engine-minimax.md
   - shared/runtime.md
 safe-outputs:
   report-failure-as-issue: false

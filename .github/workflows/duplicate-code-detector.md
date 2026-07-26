@@ -1,13 +1,13 @@
 ---
 on:
-  schedule: daily around 5:00 utc+8
+  schedule: weekly on tuesday around 5:00 utc+8
   workflow_dispatch: null
 permissions:
   contents: read
   issues: read
   pull-requests: read
 imports:
-  - shared/engine-deepseek.md
+  - shared/engine-minimax.md
   - shared/runtime.md
 safe-outputs:
   report-failure-as-issue: false

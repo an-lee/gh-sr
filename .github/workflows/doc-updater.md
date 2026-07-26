@@ -2,7 +2,7 @@
 on:
   permissions:
     pull-requests: read
-  schedule: daily around 1:00 utc+8
+  schedule: weekly on monday around 1:00 utc+8
   steps:
     - env:
         GH_TOKEN: ${{ github.token }}
@@ -27,7 +27,7 @@ network:
     - rust
     - java
 imports:
-  - shared/engine-deepseek.md
+  - shared/engine-minimax.md
   - shared/runtime.md
 safe-outputs:
   report-failure-as-issue: false
