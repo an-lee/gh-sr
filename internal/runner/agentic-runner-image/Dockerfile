@@ -70,8 +70,15 @@ RUN useradd --create-home --shell /bin/bash runner \
        > /etc/sudoers.d/runner-nopasswd \
     && chmod 0440 /etc/sudoers.d/runner-nopasswd
 
-# /opt/hostedtoolcache — gh-aw agent containers look here for pre-installed tools
-RUN mkdir -p /opt/hostedtoolcache && chown runner:runner /opt/hostedtoolcache
+# Tool cache — must NOT live under /opt/* because gh-aw's compiled AWF invocation
+# (see repo-assist.lock.yml) intentionally SKIPS mounting any RUNNER_TOOL_CACHE
+# whose path matches `/opt/*` to avoid leaking the rest of /opt (e.g. /opt/gh-aw
+# control-plane files) into the agent container. Using /home/runner/.toolcache
+# instead keeps it owned by the runner user, ephemeral per container (same lifetime
+# as the prior /opt/hostedtoolcache), and — crucially — outside gh-aw's exclusion,
+# so setup-* actions (Node, Go, Flutter, Python, …) land where the AWF agent can
+# actually see them.
+RUN mkdir -p /home/runner/.toolcache && chown runner:runner /home/runner/.toolcache
 
 # Actions runner binary — installed at image build time so startup is fast.
 # RUNNER_VERSION is injected by `docker build --build-arg RUNNER_VERSION=<ver>`.

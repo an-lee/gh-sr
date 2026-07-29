@@ -109,7 +109,7 @@ Because agentic runners are container-isolated, the host needs only Docker with 
 
 - **`host.docker.internal` DNS** — baked into the image (the inner default bridge gateway is pinned to `10.200.0.1` and inner container DNS points at a bundled dnsmasq). No host `/etc/hosts`, dnsmasq, or `daemon.json` changes are required. **Do NOT** map `host.docker.internal` to `127.0.0.1` anywhere.
 - **`sudo` / iptables for AWF** — the runner user inside the container already has passwordless sudo; no host sudoers setup is needed for agentic.
-- **Tool cache (`/opt/hostedtoolcache`)** — provided inside the image where gh-aw's agent containers expect it.
+- **Tool cache (`/home/runner/.toolcache`)** — provided inside the image where gh-aw's agent containers expect it. Lives outside `/opt/*` so gh-aw's compiled AWF invocation actually bind-mounts it into the agent container (gh-aw deliberately skips any `RUNNER_TOOL_CACHE` whose path matches `/opt/*` to avoid leaking `/opt/gh-aw` and similar control-plane paths).
 - **`RUNNER_TEMP`** — set to a non-`/tmp` path inside the container so it never collides with `/tmp/gh-aw`.
 
 `gh sr doctor` validates the host Docker daemon, `--privileged` support, and — for each instance — the container, inner `dockerd`, registration, inner `host.docker.internal` resolution, the AWF service-routing bypass, and AWF/Docker hygiene.

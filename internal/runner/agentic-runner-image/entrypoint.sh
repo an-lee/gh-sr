@@ -374,10 +374,17 @@ fi
 # RUNNER_TEMP must not be /tmp (gh-aw explicitly requires a non-/tmp path).
 export RUNNER_TEMP="${RUNNER_TEMP_DIR}"
 
-# RUNNER_TOOL_CACHE must be /opt/hostedtoolcache so tools installed by
-# actions/setup-node, actions/setup-python, etc. land where gh-aw's agent
-# container looks for them ("Execute" step hard-codes /opt/hostedtoolcache).
-export RUNNER_TOOL_CACHE="/opt/hostedtoolcache"
+# RUNNER_TOOL_CACHE must live OUTSIDE /opt/* — gh-aw's compiled AWF invocation
+# (e.g. repo-assist.lock.yml) does:
+#     if [[ "$GH_AW_TOOL_CACHE" != /opt/* ]]; then
+#         GH_AW_TOOL_CACHE_MOUNT="$GH_AW_TOOL_CACHE:$GH_AW_TOOL_CACHE:ro"
+#     fi
+# i.e. it deliberately skips mounting any tool cache under /opt to avoid leaking
+# other /opt/<x> (e.g. /opt/gh-aw control-plane files) into the agent container.
+# /home/runner/.toolcache is owned by the runner user, ephemeral per container
+# (same lifetime as the old /opt/hostedtoolcache), and passes gh-aw's guard so
+# setup-* actions (Node, Go, Flutter, Python, …) are reachable from inside AWF.
+export RUNNER_TOOL_CACHE="/home/runner/.toolcache"
 
 # ── 6. Wire per-job reset hooks into the runner .env ────────────────────────────
 # The Actions runner reads .env at startup. We write it deterministically (the file
@@ -385,7 +392,7 @@ export RUNNER_TOOL_CACHE="/opt/hostedtoolcache"
 # rather than append to stay idempotent).
 cat > "${RUNNER_DIR}/.env" <<EOF
 RUNNER_TEMP=${RUNNER_TEMP_DIR}
-RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+RUNNER_TOOL_CACHE=/home/runner/.toolcache
 ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/gh-sr/hooks/job-started.sh
 ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/gh-sr/hooks/job-completed.sh
 EOF

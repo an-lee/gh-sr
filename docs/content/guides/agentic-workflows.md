@@ -64,7 +64,7 @@ sudo usermod -aG docker "$USER"   # log out/in (or: newgrp docker)
 docker run --rm --privileged alpine echo privileged-ok   # must print privileged-ok
 ```
 
-That is all the host setup `gh sr` cannot do for you. There is **no** host dnsmasq, `/etc/hosts`, sudoers-for-iptables, `RUNNER_TEMP`, or `/opt/hostedtoolcache` configuration to perform — those concerns are handled inside the image.
+That is all the host setup `gh sr` cannot do for you. There is **no** host dnsmasq, `/etc/hosts`, sudoers-for-iptables, `RUNNER_TEMP`, or tool-cache configuration to perform — those concerns are handled inside the image.
 
 ## 3. Configuration
 
