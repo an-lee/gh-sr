@@ -312,10 +312,23 @@ func containersPresentOneShot(h *host.Host, instanceNames []string) (map[string]
 	if err != nil {
 		return present, err
 	}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
+	// strings.SplitSeq avoids the upfront []string allocation that strings.Split
+	// makes for the full output of `docker ps -a --filter name=gh-sr-`. Each line
+	// is a sub-slice of `out` (no copy), and the rare trailing \r (CRLF) is
+	// trimmed in-place by slicing one byte off the end — also 0-alloc. The
+	// per-call alloc drop compounds across the NeedsSetup/Remove/Status paths
+	// that call containersPresentOneShot once per host.
+	for line := range strings.SplitSeq(out, "\n") {
 		if line == "" {
 			continue
+		}
+		// Defensive against CRLF line endings from Windows-hosted scripts:
+		// the trailing \r would otherwise make `present["ci-1\r"]` miss.
+		if line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+			if line == "" {
+				continue
+			}
 		}
 		if _, ok := present[line]; ok {
 			present[line] = true
