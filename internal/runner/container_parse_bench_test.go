@@ -46,7 +46,10 @@ var containersPresentOneShotInputs = []string{
 // BenchmarkContainersPresentOneShot measures the parsing cost of the batched
 // container-presence helper. The mock executor's Run returns a canned list,
 // so b.N iterations stay free of SSH round-trips; only the parsing path is
-// on the hot loop.
+// on the hot loop. After the SplitSeq refactor the per-call alloc count is
+// 2 (one for the result map, one for the initial `present[name]=false`
+// insert that triggers bucket growth on the empty map); the previous
+// `strings.Split` slice allocation is gone.
 func BenchmarkContainersPresentOneShot(b *testing.B) {
 	mock := &loopbackExecutor{}
 	h := newContainersBenchHost(mock)
