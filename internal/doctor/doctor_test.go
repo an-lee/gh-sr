@@ -1294,3 +1294,156 @@ func TestCheckNativeRunnerInstall_SkipsOtherHosts(t *testing.T) {
 		t.Fatalf("skipped: counters should stay zero, got %+v", r)
 	}
 }
+
+// TestCheckContainerRunnerInstall_Empty covers the no-targets path for the
+// container predicate and host filter.
+func TestCheckContainerRunnerInstall_Empty(t *testing.T) {
+	t.Parallel()
+	h := host.NewHost("h1", config.HostConfig{OS: "linux", Addr: "local"})
+	called := false
+	h.SetConn(&testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			called = true
+			return "", nil
+		},
+	})
+	runners := []config.RunnerConfig{
+		{Name: "native", Host: "h1", Repo: "o/r", Count: 1},
+		{Name: "container-other-host", Host: "h2", Repo: "o/r", Count: 1, RunnerMode: config.RunnerModeContainer},
+	}
+	var buf bytes.Buffer
+	r := Result{}
+	checkContainerRunnerInstall(&buf, "h1", h, runners, &r)
+	if called {
+		t.Fatal("checkContainerRunnerInstall must not probe when no container targets match")
+	}
+	if r.Fail != 0 || r.Warn != 0 {
+		t.Fatalf("empty: counters should stay zero, got %+v", r)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("empty: expected no output, got %q", buf.String())
+	}
+}
+
+// TestCheckContainerRunnerInstall covers the user-facing health classifications
+// and verifies terminal states stop before the inner-container probe.
+func TestCheckContainerRunnerInstall(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name             string
+		bootstrapFailed  bool
+		inspectOut       string
+		inspectErr       error
+		execOut          string
+		wantFail         int
+		wantWarn         int
+		wantInspectCalls int
+		wantExecCalls    int
+		wantContains     []string
+		wantNotContains  []string
+	}{
+		{
+			name:            "bootstrap failed",
+			bootstrapFailed: true,
+			wantFail:        1,
+			wantContains:    []string{"bootstrap failed", "gh sr up aw", "gh sr rebuild aw"},
+			wantNotContains: []string{"Docker container"},
+		},
+		{
+			name:             "container missing",
+			inspectOut:       "missing\n",
+			wantFail:         1,
+			wantInspectCalls: 1,
+			wantContains:     []string{"Docker container gh-sr-aw-1 not found", "gh sr setup aw"},
+		},
+		{
+			name:             "inspect error",
+			inspectErr:       errors.New("docker unavailable"),
+			wantFail:         1,
+			wantInspectCalls: 1,
+			wantContains:     []string{"Docker container gh-sr-aw-1 not found", "gh sr setup aw"},
+		},
+		{
+			name:             "not accepting jobs",
+			inspectOut:       "exited\n",
+			wantWarn:         1,
+			wantInspectCalls: 1,
+			wantContains:     []string{`state is "exited"`, "gh sr up aw"},
+			wantNotContains:  []string{"inner dockerd"},
+		},
+		{
+			name:             "inner dockerd and registration missing",
+			inspectOut:       "running\n",
+			execOut:          "no\nno\n",
+			wantFail:         1,
+			wantWarn:         1,
+			wantInspectCalls: 1,
+			wantExecCalls:    1,
+			wantContains:     []string{"inner dockerd not responding", "missing .runner", "gh sr setup aw"},
+		},
+		{
+			name:             "healthy",
+			inspectOut:       "running\n",
+			execOut:          "dockerd-ok\nok\n",
+			wantInspectCalls: 1,
+			wantExecCalls:    1,
+			wantContains:     []string{"inner dockerd healthy", "registered (.runner present"},
+			wantNotContains:  []string{"not found", "not configured"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := host.NewHost("h1", config.HostConfig{OS: "linux", Addr: "local"})
+			inspectCalls := 0
+			execCalls := 0
+			h.SetConn(&testutil.MockExecutor{
+				RunFn: func(cmd string) (string, error) {
+					switch {
+					case cmd == "echo $HOME":
+						return "/home/test\n", nil
+					case strings.Contains(cmd, "bootstrap-failed"):
+						if tt.bootstrapFailed {
+							return "yes\n", nil
+						}
+						return "no\n", nil
+					case strings.Contains(cmd, "docker inspect --format"):
+						inspectCalls++
+						return tt.inspectOut, tt.inspectErr
+					case strings.Contains(cmd, "docker exec"):
+						execCalls++
+						return tt.execOut, nil
+					default:
+						t.Fatalf("unexpected command: %s", cmd)
+						return "", nil
+					}
+				},
+			})
+			runners := []config.RunnerConfig{
+				{Name: "aw", Host: "h1", Repo: "o/r", Count: 1, RunnerMode: config.RunnerModeContainer},
+			}
+			var buf bytes.Buffer
+			r := Result{}
+			checkContainerRunnerInstall(&buf, "h1", h, runners, &r)
+
+			if r.Fail != tt.wantFail || r.Warn != tt.wantWarn {
+				t.Fatalf("counters: got %+v, want Fail=%d Warn=%d", r, tt.wantFail, tt.wantWarn)
+			}
+			if inspectCalls != tt.wantInspectCalls || execCalls != tt.wantExecCalls {
+				t.Fatalf("probe calls: inspect=%d exec=%d, want inspect=%d exec=%d", inspectCalls, execCalls, tt.wantInspectCalls, tt.wantExecCalls)
+			}
+			out := buf.String()
+			for _, want := range tt.wantContains {
+				if !strings.Contains(out, want) {
+					t.Errorf("missing %q in output:\n%s", want, out)
+				}
+			}
+			for _, unwanted := range tt.wantNotContains {
+				if strings.Contains(out, unwanted) {
+					t.Errorf("unexpected %q in output:\n%s", unwanted, out)
+				}
+			}
+		})
+	}
+}
