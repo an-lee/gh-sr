@@ -237,9 +237,10 @@ func staleRegistrationScript(h *host.Host, instanceName string) string {
 func windowsNativeStartScript(h *host.Host, instanceName string) string {
 	// Win32-OpenSSH tears down the session job on disconnect, killing Start-Process children.
 	// Win32_Process.Create starts outside that job so the listener survives after gh sr closes SSH.
-	// CREATE_NO_WINDOW (0x08000000) prevents the console subsystem from creating a conhost window;
-	// ShowWindow=0 is kept as belt-and-suspenders but CREATE_NO_WINDOW is the flag that actually
-	// suppresses the visible cmd.exe console on modern Windows.
+	// ShowWindow=0 sets STARTF_USESHOWWINDOW + wShowWindow=SW_HIDE so no visible conhost window
+	// pops up. CREATE_NO_WINDOW (0x08000000) cannot be set here: WMI's Win32_Process.Create
+	// validates CreateFlags against a small allow-list and rejects 0x08000000 with
+	// ERROR_INVALID_PARAMETER (21), which fails the whole start with no fallback.
 	parts := []string{
 		windowsRunnerDirAssignment(h, instanceName) + "; ",
 		`$pidFile = Join-Path $runnerDir '.runner_pid'; `,
@@ -247,7 +248,7 @@ func windowsNativeStartScript(h *host.Host, instanceName string) string {
 		`if (Test-Path $pidFile) { $existingPid = Get-Content $pidFile; try { Get-Process -Id $existingPid -EA Stop | Out-Null; Write-Host 'already running'; exit 0 } catch {} }; `,
 		`$cmdArg = 'cd /d "' + $runnerDir + '" && run.cmd > "' + $logFile + '" 2>&1'; `,
 		`$fullLine = 'cmd.exe /c ' + $cmdArg; `,
-		`$si = New-CimInstance -CimClass (Get-CimClass -ClassName Win32_ProcessStartup) -Property @{CreateFlags=0x08000000; ShowWindow=0} -ClientOnly; `,
+		`$si = New-CimInstance -CimClass (Get-CimClass -ClassName Win32_ProcessStartup) -Property @{ShowWindow=0} -ClientOnly; `,
 		`$cim = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $fullLine; CurrentDirectory = $runnerDir; ProcessStartupInformation = $si }; `,
 		`if ($cim.ReturnValue -ne 0) { Write-Host ('Win32_Process.Create failed: ' + $cim.ReturnValue); exit 1 }; `,
 		`$cim.ProcessId | Out-File -FilePath $pidFile -NoNewline; `,

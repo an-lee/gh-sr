@@ -189,8 +189,11 @@ func Test_windowsStartNative_usesCimProcessCreateForMergedLogs(t *testing.T) {
 		if !strings.Contains(script, "ReturnValue") {
 			t.Fatalf("addr=%s: should check Win32_Process.Create ReturnValue: %q", addr, script)
 		}
-		if !strings.Contains(script, "CreateFlags=0x08000000") {
-			t.Fatalf("addr=%s: should use CREATE_NO_WINDOW (0x08000000) to suppress console: %q", addr, script)
+		if strings.Contains(script, "CreateFlags=0x08000000") {
+			t.Fatalf("addr=%s: must not pass CreateFlags=0x08000000 to Win32_Process.Create: WMI rejects it with ERROR_INVALID_PARAMETER (21) and the start fails: %q", addr, script)
+		}
+		if !strings.Contains(script, "ShowWindow=0") {
+			t.Fatalf("addr=%s: should set ShowWindow=0 on Win32_ProcessStartup to keep the conhost window hidden: %q", addr, script)
 		}
 		if !strings.Contains(script, "Win32_ProcessStartup") {
 			t.Fatalf("addr=%s: should use Win32_ProcessStartup: %q", addr, script)
