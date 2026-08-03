@@ -71,7 +71,7 @@ func TestDockerRunArgShape(t *testing.T) {
 		"  --name " + hostshell.PosixSingleQuote(cName),
 		"  --privileged",
 		"  --shm-size=2g",
-		"  --restart on-failure:5",
+		"  --restart unless-stopped",
 		"  -v " + hostshell.PosixSingleQuote(stateDir) + ":/runner-state",
 		"  -e GH_SR_RUNNER_NAME=" + hostshell.PosixSingleQuote(instanceName),
 		"  -e GH_SR_RUNNER_TOKEN=" + hostshell.PosixSingleQuote("tok"),
@@ -90,8 +90,8 @@ func TestDockerRunArgShape(t *testing.T) {
 	if !strings.Contains(cmd, "--shm-size=2g") {
 		t.Error("docker create command must include --shm-size=2g for browser/system tests")
 	}
-	if !strings.Contains(cmd, "--restart on-failure:") {
-		t.Error("docker create command must include --restart on-failure:N for bounded bootstrap retries")
+	if !strings.Contains(cmd, "--restart unless-stopped") {
+		t.Error("docker create command must include --restart unless-stopped so crashes / daemon restarts / host reboots bring the container back")
 	}
 	if !strings.Contains(cmd, cName) {
 		t.Errorf("docker create command must include container name %q", cName)
@@ -604,13 +604,18 @@ func TestAgenticRunnerEntrypointDockerdBootstrapResilience(t *testing.T) {
 	}
 }
 
+// TestContainerRestartPolicy pins the "unless-stopped" choice. This policy
+// restarts the container on every non-explicit exit (crash, OOM, inner
+// process shutdown, Docker daemon restart, host reboot) while still honoring
+// `docker stop` / `gh sr down` — closing the historical "agentic runner just
+// stopped, not restart" failure mode that the old "on-failure:N" policy had
+// (clean exits left the container permanently down). The bootstrap-failure
+// bound is now the entrypoint's `bootstrap-failed` marker + `exec sleep
+// infinity`, not Docker's retry counter.
 func TestContainerRestartPolicy(t *testing.T) {
 	t.Parallel()
-	if got := containerRestartPolicy(5); got != "on-failure:5" {
-		t.Fatalf("got %q", got)
-	}
-	if got := containerRestartPolicy(0); got != "on-failure:5" {
-		t.Fatalf("zero retries should default to 5, got %q", got)
+	if got := containerRestartPolicy(); got != "unless-stopped" {
+		t.Fatalf("got %q, want %q", got, "unless-stopped")
 	}
 }
 
@@ -2153,10 +2158,13 @@ func TestStartContainer_OneSshRoundTrip(t *testing.T) {
 		t.Errorf("script must not single-quote $HOME paths (blocks expansion); got: %q", script)
 	}
 	// docker update chained before docker start, with `|| true` so it cannot
-	// block the start. containerBootstrapMaxRetries defaults to 5, so the
-	// policy is "on-failure:5" — assert the prefix is present.
-	if !strings.Contains(script, "docker update --restart='on-failure:") {
-		t.Errorf("script missing docker update --restart=<policy>; got: %q", script)
+	// block the start. The policy must be "unless-stopped" so a crash, OOM,
+	// inner process shutdown, Docker daemon restart, or host reboot brings
+	// the container back automatically (see TestContainerRestartPolicy for
+	// the full rationale). The PosixSingleQuote on the policy value is what
+	// produces the `--restart='unless-stopped'` shape on the wire.
+	if !strings.Contains(script, "docker update --restart='unless-stopped'") {
+		t.Errorf("script missing docker update --restart='unless-stopped'; got: %q", script)
 	}
 	if !strings.Contains(script, "2>/dev/null || true") {
 		t.Errorf("docker update must be best-effort (2>/dev/null || true); got: %q", script)

@@ -74,7 +74,7 @@ A **runner** is a declared runner instance in your config. Each runner has a nam
 Runners can run as **native** processes or inside **Docker** containers:
 
 - **native** — Runner software installed directly on the host filesystem; process managed by a shell script and PID file
-- **docker** — Runner runs in a container (`ghcr.io/actions/actions-runner:latest`); container managed by Docker with `--restart on-failure` and bootstrap retry limits
+- **docker** — Runner runs in a container (`ghcr.io/actions/actions-runner:latest`); container managed by Docker with `--restart unless-stopped` so crashes / Docker daemon restarts / host reboots bring it back automatically, while `gh sr down` still keeps it down. Persistent inner-`dockerd` bootstrap failures are bounded by the entrypoint's `bootstrap-failed` marker.
 
 Linux defaults to **docker** if you don't specify. Windows and macOS default to **native**.
 

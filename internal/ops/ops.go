@@ -366,6 +366,13 @@ func removeHost(w io.Writer, cfg *config.Config, mgr *runner.Manager, cfgPath st
 // All host groups are queried concurrently, reducing wall-clock time from
 // O(N_hosts × SSH_latency) to O(SSH_latency) for multi-host configurations.
 func CollectStatus(w io.Writer, cfg *config.Config, mgr *runner.Manager, filterHost, filterRepo string, nameArgs []string) ([]runner.RunnerStatus, error) {
+	// Mirror the Setup/Start/Stop/Remove orchestrators: status needs the same
+	// image-revision inputs (CLI version, extra apt packages) as the build, or
+	// it computes a "stale" build fingerprint that disagrees with the one
+	// stamped on the running image. Without this call ContainerImageExtraApt
+	// is nil and every container with `container_runner_image.extra_apt_packages`
+	// reports "stale" indefinitely even when the layout actually matches.
+	applyContainerImageExtras(mgr, cfg)
 	runners, err := resolveAndFilter(w, cfg, filterHost, filterRepo, nameArgs)
 	if err != nil {
 		return nil, err

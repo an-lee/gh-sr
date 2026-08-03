@@ -451,11 +451,39 @@ func bootstrapMaxRetriesDockerCreateArg(maxRetries int) string {
 	return dockerCreateEnvLineIf("GH_SR_BOOTSTRAP_MAX_RETRIES", maxRetries, maxRetries > 0)
 }
 
-func containerRestartPolicy(maxRetries int) string {
-	if maxRetries <= 0 {
-		maxRetries = 5
-	}
-	return "on-failure:" + strconv.Itoa(maxRetries)
+// containerRestartPolicy returns the Docker --restart policy used for every
+// container-mode runner instance.
+//
+// Why "unless-stopped" (and not "on-failure:N" or "always"):
+//
+//   - "on-failure:N" (the historical choice) only restarts on a NON-ZERO exit
+//     code. Clean exits — SIGTERM handled by the entrypoint's _shutdown (exit
+//     0), `docker stop` after a graceful stop, the actions runner .NET process
+//     terminating normally, the Docker daemon itself restarting, the host
+//     rebooting — all leave the container permanently stopped. That is exactly
+//     the "agentic runner just stopped, not restart" failure mode we saw on
+//     x1, where every `docker stop` (e.g. a host reboot, a `gh sr down`) took
+//     the runner offline and it never came back.
+//
+//   - "always" would also restart after an explicit `docker stop` / `gh sr
+//     down`, which is surprising for operators and breaks the "down means
+//     down" contract that `gh sr up` / `gh sr down` rely on.
+//
+//   - "unless-stopped" restarts on any non-explicit exit (crash, OOM, daemon
+//     restart, host reboot) but honours `docker stop`. Native-mode runners use
+//     `Restart=always` in their systemd unit (internal/autostart/generate.go),
+//     so this also brings container mode in line with the native behaviour for
+//     crashes and host reboots while keeping a clean down/up story.
+//
+// Persistent bootstrap failures (inner dockerd cannot start) are NOT handled
+// here: the entrypoint caps consecutive dockerd-start failures with the
+// `bootstrap-failed` marker and `exec sleep infinity` (entrypoint.sh §2b), so
+// the container parks itself on persistent host-side problems instead of
+// looping forever. That guard is what made the old "on-failure:N" safe to
+// begin with, and it stays in place — the new policy just stops suppressing
+// recovery on every other exit path.
+func containerRestartPolicy() string {
+	return "unless-stopped"
 }
 
 // resolveContainerMTU returns the MTU to pin for a new runner container: the explicit
@@ -541,13 +569,17 @@ func (m *Manager) createContainerInstance(h *host.Host, rc config.RunnerConfig, 
 	mtuEnv := mtuDockerCreateArg(m.resolveContainerMTU(h))
 	dockerdTimeoutEnv := dockerdStartTimeoutDockerCreateArg(m.containerDockerdStartTimeout())
 	bootstrapRetriesEnv := bootstrapMaxRetriesDockerCreateArg(m.containerBootstrapMaxRetries())
-	restartPolicy := containerRestartPolicy(m.containerBootstrapMaxRetries())
+	restartPolicy := containerRestartPolicy()
 
-	// Build the `docker create` command. We use `--restart on-failure:N` so bootstrap
-	// failures exit non-zero with bounded Docker retries; the entrypoint also caps
-	// consecutive dockerd start failures via persisted state and holds the container
-	// instead of looping forever. `--privileged` is required for DinD (inner dockerd
-	// needs full capabilities). Large `/dev/shm` avoids Chromium/Selenium flakiness.
+	// Build the `docker create` command. We use `--restart unless-stopped` so any
+	// non-explicit exit (crash, OOM, inner process shutdown, Docker daemon
+	// restart, host reboot) brings the container back automatically — but
+	// `docker stop` / `gh sr down` still keep it down. The entrypoint caps
+	// consecutive inner-dockerd bootstrap failures with the `bootstrap-failed`
+	// marker + `exec sleep infinity`, so persistent host-side problems park
+	// the container instead of looping forever. `--privileged` is required
+	// for DinD (inner dockerd needs full capabilities). Large `/dev/shm`
+	// avoids Chromium/Selenium flakiness.
 	cmd := fmt.Sprintf(`
 mkdir -p %s
 docker create \
@@ -605,7 +637,7 @@ docker create \
 // (PR #264) and rebuildContainerImage (PR #255).
 func (m *Manager) startContainer(h *host.Host, instanceName string) error {
 	name := containerName(instanceName)
-	policy := containerRestartPolicy(m.containerBootstrapMaxRetries())
+	policy := containerRestartPolicy()
 	// Keep $HOME outside single quotes so the remote shell expands it.
 	// PosixSingleQuote("$HOME/...") would freeze the literal "$HOME" path
 	// (same pitfall as a single-quoted assignment). Double-quoted form

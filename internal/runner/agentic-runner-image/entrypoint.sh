@@ -422,12 +422,23 @@ su - runner -c "
 " 2>/dev/null || true
 
 # ── 8. Graceful shutdown handler ────────────────────────────────────────────────
+# On SIGTERM (sent by `docker stop`, the Docker daemon, or systemd), tear down
+# the inner dockerd so its containers/networks do not leak. We deliberately do
+# NOT call `config.sh remove --token ...` here:
+#
+#   - RUNNER_TOKEN is the GitHub *registration* token (one-time, ~1h TTL). After
+#     it expires, `config.sh remove` fails silently and the call is a no-op.
+#   - On the next start the entrypoint runs `config.sh --replace` (idempotent
+#     against an existing runner with the same name), so the GitHub-side
+#     registration is renewed automatically without us having to deregister.
+#   - This matches native runners, whose `svc.sh` / systemd unit never
+#     deregister on stop — they just let the next `gh sr up` re-attach.
+#
+# Exit 0 so `docker stop` is honored as an explicit operator action; the
+# `--restart unless-stopped` policy on the container is what decides whether
+# the next event (crash, OOM, daemon restart, host reboot) brings it back.
 _shutdown() {
     echo "[entrypoint] received SIGTERM — stopping runner..."
-    # Ask the runner to finish the current job then stop.
-    if [ -f "${RUNNER_DIR}/.runner" ]; then
-        su - runner -c "cd '${RUNNER_DIR}' && ./config.sh remove --token '${RUNNER_TOKEN}'" 2>/dev/null || true
-    fi
     # Shut down the inner dockerd.
     kill "${DOCKERD_PID}" 2>/dev/null && wait "${DOCKERD_PID}" 2>/dev/null || true
     exit 0
