@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/an-lee/gh-sr/internal/agentic"
@@ -1442,6 +1443,240 @@ func TestCheckContainerRunnerInstall(t *testing.T) {
 			for _, unwanted := range tt.wantNotContains {
 				if strings.Contains(out, unwanted) {
 					t.Errorf("unexpected %q in output:\n%s", unwanted, out)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckContainerAgenticInnerHygiene_Empty covers the no-targets path for
+// the agentic profile predicate and host filter.
+func TestCheckContainerAgenticInnerHygiene_Empty(t *testing.T) {
+	t.Parallel()
+	h := host.NewHost("h1", config.HostConfig{OS: "linux", Addr: "local"})
+	called := false
+	h.SetConn(&testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			called = true
+			return "", nil
+		},
+	})
+	runners := []config.RunnerConfig{
+		{Name: "native", Host: "h1", Repo: "o/r", Count: 1},
+		{Name: "container", Host: "h1", Repo: "o/r", Count: 1, RunnerMode: config.RunnerModeContainer},
+		{Name: "agentic-other-host", Host: "h2", Repo: "o/r", Count: 1, Profile: "agentic"},
+	}
+	var buf bytes.Buffer
+	r := Result{}
+	checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r)
+	if called {
+		t.Fatal("checkContainerAgenticInnerHygiene must not probe when no agentic targets match")
+	}
+	if r.Fail != 0 || r.Warn != 0 {
+		t.Fatalf("empty: counters should stay zero, got %+v", r)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("empty: expected no output, got %q", buf.String())
+	}
+}
+
+type agenticInnerHygieneExecutor struct {
+	mu sync.Mutex
+
+	inspectOut string
+	inspectErr error
+	mtuOut     string
+	awfOut     string
+	fanoutOut  string
+
+	calls      []string
+	unexpected []string
+}
+
+func (e *agenticInnerHygieneExecutor) Run(cmd string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, cmd)
+
+	switch {
+	case strings.Contains(cmd, "ip -o route get 1.1.1.1"):
+		return e.mtuOut, nil
+	case strings.Contains(cmd, "docker inspect --format"):
+		return e.inspectOut, e.inspectErr
+	case strings.Contains(cmd, `echo "#container-inner-host-docker-internal:$?"`):
+		return e.fanoutOut, nil
+	case strings.Contains(cmd, `--filter "name=awf-" --filter "name=gh-aw"`):
+		return e.awfOut, nil
+	case strings.Contains(cmd, "iptables -L DOCKER-USER"):
+		return "", nil
+	case strings.Contains(cmd, `--filter "name=gh-aw-mcpg-"`):
+		return "", nil
+	default:
+		e.unexpected = append(e.unexpected, cmd)
+		return "", fmt.Errorf("unexpected command: %s", cmd)
+	}
+}
+
+func (e *agenticInnerHygieneExecutor) Upload(string, string) error { return nil }
+func (e *agenticInnerHygieneExecutor) Close() error                { return nil }
+
+func (e *agenticInnerHygieneExecutor) snapshot() (calls, unexpected []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.calls...), append([]string(nil), e.unexpected...)
+}
+
+// TestCheckContainerAgenticInnerHygiene covers the strict running-state gate,
+// clean result, both warning sources, and the host-MTU fanout gate.
+func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
+	t.Parallel()
+
+	const cleanFanout = "#container-inner-host-docker-internal:0\n" +
+		"#container-inner-resolv:0\n" +
+		"#container-awf-service-routing:0\n" +
+		"#container-node-npm:0\n" +
+		"#container-awf:0"
+
+	tests := []struct {
+		name            string
+		inspectOut      string
+		inspectErr      error
+		mtuOut          string
+		awfOut          string
+		fanoutOut       string
+		wantWarn        int
+		wantExecCalls   int
+		wantFanoutCalls int
+		wantMTUBlock    bool
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			name:            "inspect error skips inner probes",
+			inspectErr:      errors.New("docker unavailable"),
+			mtuOut:          "1400\n",
+			wantNotContains: []string{"container(agent):"},
+		},
+		{
+			name:            "restarting skips inner probes",
+			inspectOut:      "restarting\n",
+			mtuOut:          "1400\n",
+			wantNotContains: []string{"container(agent):"},
+		},
+		{
+			name:            "healthy standard MTU",
+			inspectOut:      "running\n",
+			mtuOut:          "1500\n",
+			fanoutOut:       cleanFanout,
+			wantExecCalls:   4,
+			wantFanoutCalls: 1,
+			wantContains:    []string{"container(agent): awf installed, inner Docker clean", "gh-sr-aw-1"},
+			wantNotContains: []string{"[WARN]", "[FAIL]"},
+		},
+		{
+			name:            "inner AWF orphan warning",
+			inspectOut:      "running\n",
+			mtuOut:          "1500\n",
+			awfOut:          "awf-c1\n",
+			fanoutOut:       cleanFanout,
+			wantWarn:        1,
+			wantExecCalls:   4,
+			wantFanoutCalls: 1,
+			wantContains: []string{
+				"container(agent): orphan gh-aw/awf containers in inner Docker",
+				"docker exec -it gh-sr-aw-1 bash",
+				"See: agentic-workflows.md §12",
+			},
+		},
+		{
+			name:            "fanout probe warning",
+			inspectOut:      "running\n",
+			mtuOut:          "1500\n",
+			fanoutOut:       "#container-node-npm:1",
+			wantWarn:        1,
+			wantExecCalls:   4,
+			wantFanoutCalls: 1,
+			wantContains: []string{
+				"container(agent): node LTS/npm are not on PATH",
+				"gh sr rebuild aw",
+				"See: agentic-workflows.md §8",
+			},
+		},
+		{
+			name:            "healthy reduced MTU includes probe",
+			inspectOut:      "running\n",
+			mtuOut:          "1400\n",
+			fanoutOut:       cleanFanout + "\n#container-mtu:0",
+			wantExecCalls:   4,
+			wantFanoutCalls: 1,
+			wantMTUBlock:    true,
+			wantContains:    []string{"container(agent): awf installed, inner Docker clean"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			exec := &agenticInnerHygieneExecutor{
+				inspectOut: tt.inspectOut,
+				inspectErr: tt.inspectErr,
+				mtuOut:     tt.mtuOut,
+				awfOut:     tt.awfOut,
+				fanoutOut:  tt.fanoutOut,
+			}
+			h := host.NewHost("h1", config.HostConfig{OS: "linux", Addr: "local"})
+			h.SetConn(exec)
+			runners := []config.RunnerConfig{
+				{Name: "aw", Host: "h1", Repo: "o/r", Count: 1, Profile: "agentic"},
+			}
+			var buf bytes.Buffer
+			r := Result{}
+			checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r)
+
+			if r.Fail != 0 || r.Warn != tt.wantWarn {
+				t.Fatalf("counters: got %+v, want Fail=0 Warn=%d", r, tt.wantWarn)
+			}
+			out := buf.String()
+			for _, want := range tt.wantContains {
+				if !strings.Contains(out, want) {
+					t.Errorf("missing %q in output:\n%s", want, out)
+				}
+			}
+			for _, unwanted := range tt.wantNotContains {
+				if strings.Contains(out, unwanted) {
+					t.Errorf("unexpected %q in output:\n%s", unwanted, out)
+				}
+			}
+
+			calls, unexpected := exec.snapshot()
+			if len(unexpected) != 0 {
+				t.Fatalf("unexpected commands: %q", unexpected)
+			}
+			var mtuCalls, inspectCalls, execCalls, fanoutCalls int
+			var fanoutCommand string
+			for _, cmd := range calls {
+				switch {
+				case strings.Contains(cmd, "ip -o route get 1.1.1.1"):
+					mtuCalls++
+				case strings.Contains(cmd, "docker inspect --format"):
+					inspectCalls++
+				}
+				if strings.Contains(cmd, `docker exec "gh-sr-aw-1"`) {
+					execCalls++
+				}
+				if strings.Contains(cmd, `echo "#container-inner-host-docker-internal:$?"`) {
+					fanoutCalls++
+					fanoutCommand = cmd
+				}
+			}
+			if mtuCalls != 1 || inspectCalls != 1 || execCalls != tt.wantExecCalls || fanoutCalls != tt.wantFanoutCalls {
+				t.Fatalf("probe calls: mtu=%d inspect=%d exec=%d fanout=%d; want 1, 1, %d, %d\nall calls: %q",
+					mtuCalls, inspectCalls, execCalls, fanoutCalls, tt.wantExecCalls, tt.wantFanoutCalls, calls)
+			}
+			if tt.wantFanoutCalls != 0 {
+				hasMTUBlock := strings.Contains(fanoutCommand, `echo "#container-mtu:$?"`) && strings.Contains(fanoutCommand, "host=1400")
+				if hasMTUBlock != tt.wantMTUBlock {
+					t.Errorf("fanout MTU block = %v, want %v\ncommand: %s", hasMTUBlock, tt.wantMTUBlock, fanoutCommand)
 				}
 			}
 		})
