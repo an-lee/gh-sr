@@ -636,9 +636,12 @@ func checkRunnerDiskUsage(w io.Writer, hostName string, h *host.Host, runners []
 	}
 	sort.Strings(instances)
 
+	// One batched SSH round-trip per host replaces the prior per-instance
+	// MeasureDiskUsage loop (N+1 fold; matches the win-class of PRs
+	// #358/#361/#372/#380/#379).
+	entries := runner.MeasureDiskUsageBatch(h, hostName, instances, rcByInstance)
 	for _, inst := range instances {
-		rc := rcByInstance[inst]
-		entry := runner.MeasureDiskUsage(h, hostName, inst, rc)
+		entry := entries[inst]
 		if entry.Err != nil {
 			printLine(w, sevWarn, hostName, fmt.Sprintf("disk: instance %s: %v", inst, entry.Err))
 			r.Warn++

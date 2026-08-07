@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -92,6 +93,192 @@ func TestMeasureDiskUsage_agenticMode(t *testing.T) {
 	}
 	if entry.Mode != "container" {
 		t.Fatalf("mode=%q, want container", entry.Mode)
+	}
+}
+
+// TestParseDirSizesBatch_happyPath pins the parser contract used by
+// dirSizesBatchPOSIX: tab-separated `<inst>\t<total>\t<work>\t<temp>\t<docker>`
+// lines, one per requested instance. Missing instances → error.
+func TestParseDirSizesBatch_happyPath(t *testing.T) {
+	t.Parallel()
+	out := "ci-1\t1000\t200\t100\t300\nci-2\t2500\t500\t250\t750\n"
+	res, err := parseDirSizesBatch(out, []string{"ci-1", "ci-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res["ci-1"].total != 1000 || res["ci-1"].work != 200 || res["ci-1"].temp != 100 || res["ci-1"].dockerData != 300 {
+		t.Errorf("ci-1: %+v", res["ci-1"])
+	}
+	if res["ci-2"].total != 2500 || res["ci-2"].work != 500 || res["ci-2"].temp != 250 || res["ci-2"].dockerData != 750 {
+		t.Errorf("ci-2: %+v", res["ci-2"])
+	}
+}
+
+// TestParseDirSizesBatch_missingInstance covers the truncation-detection
+// branch: the script was supposed to emit one line per instance but only
+// N-1 lines came back. The parser must surface an explicit error rather
+// than silently dropping the missing instance.
+func TestParseDirSizesBatch_missingInstance(t *testing.T) {
+	t.Parallel()
+	out := "ci-1\t1000\t0\t0\t0\n"
+	_, err := parseDirSizesBatch(out, []string{"ci-1", "ci-2"})
+	if err == nil {
+		t.Fatal("expected error for missing instance")
+	}
+	if !strings.Contains(err.Error(), "ci-2") {
+		t.Errorf("error should mention missing instance: %v", err)
+	}
+}
+
+// TestParseDirSizesBatch_tooFewFields rejects lines that don't have the
+// 5-field contract. Defends against a future script change that drops a
+// column.
+func TestParseDirSizesBatch_tooFewFields(t *testing.T) {
+	t.Parallel()
+	out := "ci-1\t1000\t0\t0\n"
+	_, err := parseDirSizesBatch(out, []string{"ci-1"})
+	if err == nil {
+		t.Fatal("expected error for too-few-fields line")
+	}
+	if !strings.Contains(err.Error(), "too few fields") {
+		t.Errorf("error should mention field count: %v", err)
+	}
+}
+
+// TestBuildDirSizesBatchPOSIXScript_structure pins the structural
+// contract of the batch script: a single `for inst in ...; do` loop with
+// the ghsr-batch-disk-v1 sentinel and the same `du --max-depth`/`du -d`
+// probe as the single-instance script. Pinned separately so a future
+// refactor that re-introduces a per-instance dispatch trips this test.
+func TestBuildDirSizesBatchPOSIXScript_structure(t *testing.T) {
+	t.Parallel()
+	s := buildDirSizesBatchPOSIXScript([]string{"ci-1", "ci-2"})
+	if !strings.Contains(s, "# ghsr-batch-disk-v1") {
+		t.Errorf("missing batch sentinel: %q", s)
+	}
+	if !strings.Contains(s, "for inst in") {
+		t.Errorf("missing for-loop: %q", s)
+	}
+	if strings.Count(s, "for inst in") != 1 {
+		t.Errorf("expected exactly one for-loop, got %d", strings.Count(s, "for inst in"))
+	}
+	if !strings.Contains(s, "du --max-depth") || !strings.Contains(s, "du -d 1") {
+		t.Errorf("missing du GNU/BSD probe: %q", s)
+	}
+	// Only ONE `du` invocation per instance is needed (the loop reuses
+	// the same body). The structural sentinel guards against a future
+	// refactor that re-introduces a per-instance `du` outside the loop.
+	if strings.Count(s, "du --max-depth=1") != 1 {
+		t.Errorf("expected exactly one du --max-depth=1 invocation: %q", s)
+	}
+}
+
+// TestMeasureDiskUsageBatch_linux covers the happy path on Linux: one
+// SSH round-trip, three instances, sizes match the batch mock's response.
+func TestMeasureDiskUsageBatch_linux(t *testing.T) {
+	t.Parallel()
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			if !strings.Contains(cmd, "for inst in") {
+				t.Errorf("unexpected non-batch command: %q", cmd)
+			}
+			return "ci-1\t1000\t200\t100\t300\nci-2\t2500\t500\t250\t750\nstale-orphan\t500\t0\t0\t0\n", nil
+		},
+	})
+	ci1 := config.RunnerConfig{Name: "ci", Count: 2, Repo: "o/r"}
+	rcByInstance := map[string]*config.RunnerConfig{
+		"ci-1": &ci1,
+		"ci-2": &ci1,
+	}
+	entries := MeasureDiskUsageBatch(h, "host1", []string{"ci-1", "ci-2", "stale-orphan"}, rcByInstance)
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	if e := entries["ci-1"]; e.TotalBytes != 1000 || e.WorkBytes != 200 || e.TempBytes != 100 || e.DockerDataBytes != 300 || e.Orphan {
+		t.Errorf("ci-1 unexpected: %+v", e)
+	}
+	if e := entries["ci-2"]; e.TotalBytes != 2500 || e.WorkBytes != 500 || e.TempBytes != 250 || e.DockerDataBytes != 750 || e.Orphan {
+		t.Errorf("ci-2 unexpected: %+v", e)
+	}
+	if e := entries["stale-orphan"]; e.TotalBytes != 500 || !e.Orphan || e.Mode != "unknown" {
+		t.Errorf("stale-orphan unexpected: %+v", e)
+	}
+	// Other = total - work - temp - docker. For ci-1: 1000 - 200 - 100 - 300 = 400.
+	if entries["ci-1"].OtherBytes != 400 {
+		t.Errorf("ci-1 OtherBytes = %d, want 400", entries["ci-1"].OtherBytes)
+	}
+}
+
+// TestMeasureDiskUsageBatch_unsafeInstanceName surfaces unsafe instance
+// names with Err set without spending a shell round-trip on them. Mirrors
+// the per-instance API's contract.
+func TestMeasureDiskUsageBatch_unsafeInstanceName(t *testing.T) {
+	t.Parallel()
+	var calls int
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			calls++
+			return "ok-1\t0\t0\t0\t0\n", nil
+		},
+	})
+	entries := MeasureDiskUsageBatch(h, "host1", []string{"ok-1", "bad;name"}, nil)
+	if calls != 1 {
+		t.Errorf("expected 1 SSH round-trip (only safe names shipped), got %d", calls)
+	}
+	if entries["bad;name"].Err == nil {
+		t.Errorf("expected Err for unsafe name, got %+v", entries["bad;name"])
+	}
+	if entries["ok-1"].Err != nil {
+		t.Errorf("unexpected error for safe name: %v", entries["ok-1"].Err)
+	}
+}
+
+// TestMeasureDiskUsageBatch_hostError propagates the SSH-round-trip error
+// to every safe entry's Err field. Matches the per-instance API's
+// "Err set, other fields zero" contract.
+func TestMeasureDiskUsageBatch_hostError(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("ssh: connection reset")
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(string) (string, error) {
+			return "", sentinel
+		},
+	})
+	entries := MeasureDiskUsageBatch(h, "host1", []string{"ci-1", "ci-2"}, nil)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if !errors.Is(entries["ci-1"].Err, sentinel) {
+		t.Errorf("ci-1 err = %v, want sentinel", entries["ci-1"].Err)
+	}
+	if !errors.Is(entries["ci-2"].Err, sentinel) {
+		t.Errorf("ci-2 err = %v, want sentinel", entries["ci-2"].Err)
+	}
+}
+
+// TestMeasureDiskUsageBatch_windows forces the Windows dispatch branch
+// on a host with OS="windows". The mocked RunFn returns the four-bucket
+// layout wrapped in RunShell's UTF-16LE + base64 encoded command path;
+// the mock intercepts the encoded command and returns the same tab-
+// separated shape the POSIX branch would emit.
+func TestMeasureDiskUsageBatch_windows(t *testing.T) {
+	t.Parallel()
+	h := diskMockHost("windows", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			// The Windows path uses h.RunShell which base64-encodes the
+			// script; the mock returns the tabular output for any
+			// invocation. We don't need to validate the script shape
+			// here — the structural test for the generator guards the
+			// dispatch contract.
+			return "ci-1\t42\t10\t0\t5\n", nil
+		},
+	})
+	entries := MeasureDiskUsageBatch(h, "host1", []string{"ci-1"}, nil)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if e := entries["ci-1"]; e.TotalBytes != 42 || e.WorkBytes != 10 || e.TempBytes != 0 || e.DockerDataBytes != 5 {
+		t.Errorf("ci-1 unexpected: %+v", e)
 	}
 }
 
@@ -362,6 +549,99 @@ func TestPruneInstance_pruneCacheIncludesDockerPrune(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected inner docker cache prune action with --prune-cache")
+	}
+}
+
+// TestPruneInnerDockerCache_innerDockerDown covers the guard branch:
+// pruneInnerDockerCache runs `docker info` first; if the inner dockerd
+// isn't responding, the function must short-circuit with a descriptive
+// error and NOT run the destructive `docker system prune -af --volumes`.
+func TestPruneInnerDockerCache_innerDockerDown(t *testing.T) {
+	t.Parallel()
+	var calls []string
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			calls = append(calls, cmd)
+			// Mimic `docker info` returning "no" (inner dockerd down).
+			if strings.Contains(cmd, "docker info") {
+				return "no\n", nil
+			}
+			return "", nil
+		},
+	})
+	err := pruneInnerDockerCache(h, "gh-sr-my-1")
+	if err == nil {
+		t.Fatal("expected error when inner dockerd is down")
+	}
+	if !strings.Contains(err.Error(), "inner dockerd not responding") {
+		t.Errorf("expected descriptive error, got %v", err)
+	}
+	if len(calls) != 1 {
+		t.Errorf("expected 1 SSH call (probe only), got %d: %v", len(calls), calls)
+	}
+	for _, c := range calls {
+		if strings.Contains(c, "docker system prune") {
+			t.Errorf("must not run docker system prune when probe fails: %q", c)
+		}
+	}
+}
+
+// TestPruneInnerDockerCache_happyPath covers the happy path: probe
+// returns "ok" so the destructive prune runs. Verifies the function
+// returns the second call's error directly (or nil on success).
+func TestPruneInnerDockerCache_happyPath(t *testing.T) {
+	t.Parallel()
+	var calls []string
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			calls = append(calls, cmd)
+			if strings.Contains(cmd, "docker info") {
+				return "ok\n", nil
+			}
+			if strings.Contains(cmd, "docker system prune") {
+				return "", nil
+			}
+			return "", nil
+		},
+	})
+	if err := pruneInnerDockerCache(h, "gh-sr-my-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 SSH calls (probe + prune), got %d: %v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], "docker info") {
+		t.Errorf("first call should be the probe, got %q", calls[0])
+	}
+	if !strings.Contains(calls[1], "docker system prune") {
+		t.Errorf("second call should be the prune, got %q", calls[1])
+	}
+}
+
+// TestPruneInnerDockerCache_probeError covers the case where the probe's
+// underlying SSH call fails (e.g. host unreachable). The function
+// surfaces the descriptive "inner dockerd not responding" error and must
+// not run the destructive prune.
+func TestPruneInnerDockerCache_probeError(t *testing.T) {
+	t.Parallel()
+	var pruneCalls int
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			if strings.Contains(cmd, "docker system prune") {
+				pruneCalls++
+			}
+			return "", errors.New("ssh: connection reset")
+		},
+	})
+	err := pruneInnerDockerCache(h, "gh-sr-my-1")
+	if err == nil {
+		t.Fatal("expected error when probe SSH fails")
+	}
+	if !strings.Contains(err.Error(), "inner dockerd not responding") {
+		t.Errorf("err = %v, want descriptive error", err)
+	}
+	if pruneCalls != 0 {
+		t.Errorf("prune must not run when probe fails; got %d calls", pruneCalls)
 	}
 }
 

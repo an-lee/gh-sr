@@ -577,6 +577,12 @@ func TestCheckRunnerDiskUsage_warnsOrphanOverThreshold(t *testing.T) {
 			if strings.Contains(cmd, `ls -1 "$HOME/.gh-sr/runners"`) {
 				return "orphan-1\n", nil
 			}
+			if strings.Contains(cmd, "for inst in") {
+				// Batch disk-usage script (MeasureDiskUsageBatch → dirSizesBatchPOSIX).
+				// Emits one tab-separated line per instance; only "orphan-1"
+				// is over the threshold, so we surface the full size for it.
+				return fmt.Sprintf("orphan-1\t%d\t0\t0\t0\n", runner.DiskWarnThresholdBytes()+1), nil
+			}
 			if strings.Contains(cmd, "du --max-depth=1") || strings.Contains(cmd, "du -d 1") {
 				return fmt.Sprintf("%d 0 0 0\n", runner.DiskWarnThresholdBytes()+1), nil
 			}

@@ -40,10 +40,57 @@ type diskMockOpts struct {
 	diskDirs []string
 }
 
+// batchInstancesFromScript extracts the list of instance names from a
+// `for inst in ...; do` block in the batch disk-usage script. Used by
+// the test mocks to emit one tab-separated "instance total work temp
+// docker" line per walked instance — matching the batch script's output
+// shape so the Go-side parser can be exercised end-to-end.
+func batchInstancesFromScript(cmd string) []string {
+	const marker = "for inst in"
+	idx := strings.Index(cmd, marker)
+	if idx < 0 {
+		return nil
+	}
+	rest := cmd[idx+len(marker):]
+	end := strings.Index(rest, "; do")
+	if end < 0 {
+		return nil
+	}
+	tokens := strings.Fields(rest[:end])
+	var out []string
+	for _, tok := range tokens {
+		// Strip surrounding single or double quotes (the script's
+		// `strconv.Quote` produces double-quoted tokens).
+		if len(tok) >= 2 {
+			first, last := tok[0], tok[len(tok)-1]
+			if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
+				out = append(out, tok[1:len(tok)-1])
+				continue
+			}
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
+// batchOutputFor emits the tab-separated batch-line shape that
+// dirSizesBatchPOSIX's Go-side parser expects. One line per instance,
+// all populated with the configured sizes.
+func batchOutputFor(insts []string, total, work, temp, docker int64) string {
+	var b strings.Builder
+	for _, inst := range insts {
+		fmt.Fprintf(&b, "%s\t%d\t%d\t%d\t%d\n", inst, total, work, temp, docker)
+	}
+	return b.String()
+}
+
 func newDiskMock(d diskMockOpts) *testutil.MockExecutor {
 	if d.RunFn == nil {
 		d.RunFn = func(cmd string) (string, error) {
 			switch {
+			case strings.Contains(cmd, "for inst in"):
+				// Batch disk-usage script (dirSizesBatchPOSIX).
+				return batchOutputFor(batchInstancesFromScript(cmd), d.totalBytes, d.workBytes, d.tempBytes, d.dockerBts), nil
 			case strings.Contains(cmd, "du --max-depth") || strings.Contains(cmd, "du -d 1"):
 				return fmt.Sprintf("%d %d %d %d\n", d.totalBytes, d.workBytes, d.tempBytes, d.dockerBts), nil
 			case strings.Contains(cmd, `ls -1 "$HOME/.gh-sr/runners"`):
@@ -707,3 +754,151 @@ func TestPruneDisk_MultiHostFanOut(t *testing.T) {
 // Compile-time guard: keep diskMockOpts visible if a future refactor
 // removes its only constructor's only caller.
 var _ = diskMockOpts{}
+
+// TestCollectDiskUsage_SingleHostBatchSshRoundTrip pins the post-batch SSH
+// round-trip count for `gh sr disk usage`. After the batched
+// MeasureDiskUsageBatch fold, a single host with K instances must pay
+// exactly 2 SSH round-trips for the disk listing:
+//
+//  1. ListRunnerInstanceDirs (the runner-tree watcher; unchanged)
+//  2. The batched dirSizesBatchPOSIX script (one round-trip walks all
+//     instances and emits one `<inst>\t<total>\t<work>\t<temp>\t<docker>`
+//     line per instance)
+//
+// Pre-fold the K-instance path paid 1 + K round-trips (1 listing + K
+// `du --max-depth` calls). A future refactor that re-introduces the
+// per-instance `du` will trip this test and force a maintainer review —
+// the per-tick disk-usage metrics will be affected.
+func TestCollectDiskUsage_SingleHostBatchSshRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	var (
+		listingCalls int
+		batchCalls   int
+		duCalls      int
+	)
+	mock := &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			switch {
+			case strings.Contains(cmd, "for inst in"):
+				batchCalls++
+				// Emit one line per requested instance with a recognisable
+				// size so we can assert the per-instance mapping worked.
+				insts := batchInstancesFromScript(cmd)
+				return batchOutputFor(insts, 1024, 256, 64, 16), nil
+			case strings.Contains(cmd, "du --max-depth") || strings.Contains(cmd, "du -d 1"):
+				duCalls++
+				return "0 0 0 0\n", nil
+			case strings.Contains(cmd, `ls -1 "$HOME/.gh-sr/runners"`):
+				listingCalls++
+				return "ci-1\nci-2\nci-3\n", nil
+			default:
+				return "", nil
+			}
+		},
+	}
+	installMockConnectHost(t, map[string]host.Executor{"h1": mock})
+
+	ts := newDiskGitHubHTTPServer(t)
+	mgr := &runner.Manager{GitHub: runner.NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL)}
+	cfg := cfgWithLocalHost("h1")
+	cfg.Runners = []config.RunnerConfig{
+		{Name: "ci", Host: "h1", Repo: "o/r", Count: 3},
+	}
+
+	var buf bytes.Buffer
+	entries, err := CollectDiskUsage(&buf, cfg, mgr, "", "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d: %+v", len(entries), entries)
+	}
+	if listingCalls != 1 {
+		t.Errorf("listingCalls = %d, want 1 (ListRunnerInstanceDirs is unchanged)", listingCalls)
+	}
+	if batchCalls != 1 {
+		t.Errorf("batchCalls = %d, want 1 (MeasureDiskUsageBatch must be one SSH round-trip per host)", batchCalls)
+	}
+	if duCalls != 0 {
+		t.Errorf("duCalls = %d, want 0 (per-instance du must be folded into the batch script)", duCalls)
+	}
+	for _, e := range entries {
+		if e.TotalBytes != 1024 {
+			t.Errorf("entry %s: TotalBytes = %d, want 1024", e.Instance, e.TotalBytes)
+		}
+	}
+}
+
+// TestCollectDiskUsage_MultiHostBatchSshRoundTrip pins the count across
+// multiple hosts: each host pays exactly 2 SSH round-trips regardless of
+// how many instances it owns. Pre-fold this would have been 1 + K_i
+// per host i — for a 3-host 9-instance fleet, 12 round-trips. Post-fold
+// stays at 6.
+func TestCollectDiskUsage_MultiHostBatchSshRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	makeH := func(dirSuffix string) (*testutil.MockExecutor, *int, *int) {
+		var list, batch int
+		exec := &testutil.MockExecutor{
+			RunFn: func(cmd string) (string, error) {
+				switch {
+				case strings.Contains(cmd, "for inst in"):
+					batch++
+					insts := batchInstancesFromScript(cmd)
+					return batchOutputFor(insts, 100, 0, 0, 0), nil
+				case strings.Contains(cmd, `ls -1 "$HOME/.gh-sr/runners"`):
+					list++
+					// Match the configured instances exactly (RunnerConfig.Name
+					// is the prefix). The directory layout for `Runners[0]=ci<dirSuffix>,
+					// Count=3` is `ci<dirSuffix>-1`, `ci<dirSuffix>-2`, `ci<dirSuffix>-3`.
+					return fmt.Sprintf("ci%s-1\nci%s-2\nci%s-3\n", dirSuffix, dirSuffix, dirSuffix), nil
+				default:
+					return "", nil
+				}
+			},
+		}
+		return exec, &list, &batch
+	}
+
+	ex1, l1, b1 := makeH("1")
+	ex2, l2, b2 := makeH("2")
+	ex3, l3, b3 := makeH("3")
+
+	installMockConnectHost(t, map[string]host.Executor{
+		"h1": ex1,
+		"h2": ex2,
+		"h3": ex3,
+	})
+
+	ts := newDiskGitHubHTTPServer(t)
+	mgr := &runner.Manager{GitHub: runner.NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL)}
+	cfg := cfgWithLocalHost("h1", "h2", "h3")
+	cfg.Runners = []config.RunnerConfig{
+		{Name: "ci1", Host: "h1", Repo: "o/r", Count: 3},
+		{Name: "ci2", Host: "h2", Repo: "o/r", Count: 3},
+		{Name: "ci3", Host: "h3", Repo: "o/r", Count: 3},
+	}
+
+	var buf bytes.Buffer
+	entries, err := CollectDiskUsage(&buf, cfg, mgr, "", "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 9 {
+		t.Fatalf("expected 9 entries, got %d: %+v", len(entries), entries)
+	}
+	if *l1+*l2+*l3 != 3 {
+		t.Errorf("listing calls = %d, want 3 (one per host)", *l1+*l2+*l3)
+	}
+	if *b1+*b2+*b3 != 3 {
+		t.Errorf("batch calls = %d, want 3 (one per host)", *b1+*b2+*b3)
+	}
+	// Each host should have exactly one of each.
+	if *l1 != 1 || *l2 != 1 || *l3 != 1 {
+		t.Errorf("per-host listing counts: h1=%d h2=%d h3=%d, want 1 each", *l1, *l2, *l3)
+	}
+	if *b1 != 1 || *b2 != 1 || *b3 != 1 {
+		t.Errorf("per-host batch counts: h1=%d h2=%d h3=%d, want 1 each", *b1, *b2, *b3)
+	}
+}

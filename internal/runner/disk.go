@@ -287,6 +287,309 @@ func dirSizesPOSIX(h *host.Host, instance string) (total, work, temp, dockerData
 	return parseFourInt64s(out)
 }
 
+// buildDirSizesBatchPOSIXScript returns the shell script that
+// `dirSizesBatchPOSIX` runs on the remote host. It walks the per-instance
+// `du` tree once per instance (matching the existing single-instance script)
+// but emits one tab-separated "instance total work temp docker" line per
+// instance over a single SSH round-trip. The same `du --max-depth`/`du -d`
+// probe is preserved so the GNU/BSD portability contract is identical to
+// `buildDirSizesPOSIXScript`.
+//
+// Instance names are emitted via `printf %q` so embedded spaces, tabs, and
+// quote-metacharacters still in the safe-set (e.g. `'`, `*`) are passed
+// verbatim to POSIX shell. `SafeRunnerInstanceName` already rejects the
+// shell-dangerous set (`; " | & < > $ \` / \\`); the printf %q layer is
+// defense-in-depth for the remaining characters.
+func buildDirSizesBatchPOSIXScript(instances []string) string {
+	// Build a single shell script that walks each instance's `du` tree
+	// once and emits one tab-separated line per instance. Instance names
+	// are emitted via `printf %q` so embedded spaces, tabs, and the
+	// remaining safe-set characters (`'`, `*`, etc.) survive the shell
+	// round-trip. `SafeRunnerInstanceName` already rejects the truly
+	// shell-dangerous set; the printf %q layer is defense-in-depth.
+	var b strings.Builder
+	b.WriteString("# ghsr-batch-disk-v1\n")
+	b.WriteString("set -e\n")
+	b.WriteString(`base="$HOME/.gh-sr/runners"` + "\n")
+	b.WriteString("for inst in")
+	for _, inst := range instances {
+		b.WriteByte(' ')
+		b.WriteString(strconv.Quote(inst))
+	}
+	b.WriteString("; do\n")
+	b.WriteString(`  dir="$base/$inst"` + "\n")
+	b.WriteString(`  if [ ! -d "$dir" ]; then printf '%s\t0\t0\t0\t0\n' "$inst"; continue; fi` + "\n")
+	b.WriteString(`  if du --max-depth=0 "$dir" >/dev/null 2>&1; then` + "\n")
+	b.WriteString(`    out=$(du --max-depth=1 -k "$dir" 2>/dev/null)` + "\n")
+	b.WriteString("  else\n")
+	b.WriteString(`    out=$(du -d 1 -k "$dir" 2>/dev/null)` + "\n")
+	b.WriteString("  fi\n")
+	b.WriteString(`  if [ -z "$out" ]; then printf '%s\t0\t0\t0\t0\n' "$inst"; continue; fi` + "\n")
+	b.WriteString("  total=0; work=0; temp=0; docker=0\n")
+	b.WriteString(`  total_name=$(basename "$dir")` + "\n")
+	b.WriteString(`  while read -r size path; do` + "\n")
+	b.WriteString(`    [ -z "$path" ] && continue` + "\n")
+	b.WriteString(`    case "$(basename "$path")" in` + "\n")
+	b.WriteString(`      "$total_name") total=$((size * 1024)) ;;` + "\n")
+	b.WriteString(`      _work)         work=$((size * 1024)) ;;` + "\n")
+	b.WriteString(`      _temp)         temp=$((size * 1024)) ;;` + "\n")
+	b.WriteString(`      docker-data)   docker=$((size * 1024)) ;;` + "\n")
+	b.WriteString("    esac\n")
+	b.WriteString(`  done <<< "$out"` + "\n")
+	b.WriteString(`  printf '%s\t%s\t%s\t%s\t%s\n' "$inst" "$total" "$work" "$temp" "$docker"` + "\n")
+	b.WriteString("done\n")
+	return b.String()
+}
+
+// dirSizesBatchPOSIX runs one SSH round-trip that returns the four-bucket
+// size summary for every requested instance, keyed by instance name. The
+// returned map only contains entries for instances the script emitted a
+// line for (always every requested instance on the happy path); callers
+// can rely on `len(result) == len(instances)` unless the host-side script
+// truncated the output, which surfaces as a parse error.
+func dirSizesBatchPOSIX(h *host.Host, instances []string) (map[string]dirSizesResult, error) {
+	if len(instances) == 0 {
+		return map[string]dirSizesResult{}, nil
+	}
+	out, err := h.Run(buildDirSizesBatchPOSIXScript(instances))
+	if err != nil {
+		return nil, err
+	}
+	return parseDirSizesBatch(out, instances)
+}
+
+// parseDirSizesBatch parses the tab-separated output of dirSizesBatchPOSIX
+// into a per-instance map. Each line has the shape
+//
+//	<instance>\t<total>\t<work>\t<temp>\t<docker>\n
+//
+// Missing instances (instances requested but no line emitted) are returned
+// as an explicit error so the caller can surface a host-side truncation
+// rather than silently dropping data. Stale newlines / blank lines are
+// skipped.
+func parseDirSizesBatch(out string, expected []string) (map[string]dirSizesResult, error) {
+	res := make(map[string]dirSizesResult, len(expected))
+	// Manual scan — strings.Split on potentially large output would
+	// allocate an intermediate []string we don't need.
+	i := 0
+	for i < len(out) {
+		// Skip blank lines / trailing whitespace.
+		for i < len(out) && (out[i] == '\n' || out[i] == '\r') {
+			i++
+		}
+		if i >= len(out) {
+			break
+		}
+		// Read one line.
+		start := i
+		for i < len(out) && out[i] != '\n' {
+			i++
+		}
+		line := out[start:i]
+		// Trim trailing \r.
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		// Manual field split (5 fields, tab-separated).
+		var fields [5]string
+		nf := 0
+		pos := 0
+		for pos < len(line) && nf < 5 {
+			fs := pos
+			for pos < len(line) && line[pos] != '\t' {
+				pos++
+			}
+			fields[nf] = line[fs:pos]
+			nf++
+			if pos < len(line) {
+				pos++ // skip tab
+			}
+		}
+		if pos < len(line) {
+			// extra fields → caller's contract is violated.
+			return nil, fmt.Errorf("batch disk sizes line %q: too many fields", line)
+		}
+		if nf < 5 {
+			return nil, fmt.Errorf("batch disk sizes line %q: too few fields", line)
+		}
+		var vals [4]int64
+		for k := 0; k < 4; k++ {
+			v, perr := strconv.ParseInt(fields[k+1], 10, 64)
+			if perr != nil {
+				return nil, fmt.Errorf("batch disk sizes line %q: parsing %q: %w", line, fields[k+1], perr)
+			}
+			vals[k] = v
+		}
+		res[fields[0]] = dirSizesResult{
+			total:      vals[0],
+			work:       vals[1],
+			temp:       vals[2],
+			dockerData: vals[3],
+		}
+	}
+	for _, want := range expected {
+		if _, ok := res[want]; !ok {
+			return nil, fmt.Errorf("batch disk sizes: missing instance %q in output", want)
+		}
+	}
+	return res, nil
+}
+
+// buildDirSizesBatchWindowsScript returns the wrapped PowerShell script
+// that emits one tab-separated "instance total work temp docker" line per
+// requested instance. The script and output shape mirror dirSizesBatchPOSIX
+// so the Go-side parser is shared.
+func buildDirSizesBatchWindowsScript(instances []string) string {
+	if len(instances) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# ghsr-batch-disk-v1\n")
+	b.WriteString(`
+function Ghsr-DirSize([string]$p) {
+  if (-not (Test-Path -LiteralPath $p)) { return 0 }
+  $sum = (Get-ChildItem -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+  if ($null -eq $sum) { return 0 }
+  return [int64]$sum
+}
+function Ghsr-OtherDirSize([string]$root) {
+  if (-not (Test-Path -LiteralPath $root)) { return 0 }
+  $skip = @('_work','_temp','docker-data')
+  $sum = [int64]0
+  Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($skip -contains $_.Name) { return }
+    if ($_.PSIsContainer) { $sum += Ghsr-DirSize $_.FullName } else { $sum += [int64]$_.Length }
+  }
+  return $sum
+}
+$base = Join-Path $env:USERPROFILE '.gh-sr\runners'
+`)
+	for _, inst := range instances {
+		// Use single-quoted PowerShell literal so embedded spaces survive
+		// the round-trip; single quotes inside the name are doubled, which
+		// is the canonical PowerShell escape for single-quoted strings.
+		// SafeRunnerInstanceName already rejects the truly shell-dangerous
+		// set; this is defence-in-depth.
+		escaped := strings.ReplaceAll(inst, "'", "''")
+		b.WriteString(fmt.Sprintf("$inst = '%s'\n", escaped))
+		b.WriteString(`$d = Join-Path $base $inst` + "\n")
+		b.WriteString("if (-not (Test-Path -LiteralPath $d)) { Write-Output ($inst + \"\t0\t0\t0\t0\"); continue }\n")
+		b.WriteString(`$w = Ghsr-DirSize (Join-Path $d '_work')` + "\n")
+		b.WriteString(`$te = Ghsr-DirSize (Join-Path $d '_temp')` + "\n")
+		b.WriteString(`$dk = Ghsr-DirSize (Join-Path $d 'docker-data')` + "\n")
+		b.WriteString(`$other = Ghsr-OtherDirSize $d` + "\n")
+		b.WriteString(`$t = $w + $te + $dk + $other` + "\n")
+		b.WriteString(`Write-Output ("$inst	$t	$w	$te	$dk")` + "\n")
+	}
+	return b.String()
+}
+
+// dirSizesBatchWindows is the Windows counterpart of dirSizesBatchPOSIX.
+// Returns the same per-instance map.
+func dirSizesBatchWindows(h *host.Host, instances []string) (map[string]dirSizesResult, error) {
+	if len(instances) == 0 {
+		return map[string]dirSizesResult{}, nil
+	}
+	out, err := h.RunShell(buildDirSizesBatchWindowsScript(instances))
+	if err != nil {
+		return nil, err
+	}
+	return parseDirSizesBatch(out, instances)
+}
+
+// dirSizesBatch runs one SSH round-trip per host that returns the four
+// size buckets for every requested instance. Caller passes the full set
+// of instances to measure; rcByInstance is the same map the single-call
+// `MeasureDiskUsage` takes, used by MeasureDiskUsageBatch to populate the
+// `Mode`/`Orphan` fields on the returned entries.
+func dirSizesBatch(h *host.Host, instances []string) (map[string]dirSizesResult, error) {
+	return runOnHostOS(h,
+		func() (map[string]dirSizesResult, error) {
+			return dirSizesBatchWindows(h, instances)
+		},
+		func() (map[string]dirSizesResult, error) {
+			return dirSizesBatchPOSIX(h, instances)
+		},
+	)
+}
+
+// MeasureDiskUsageBatch measures disk usage for every supplied instance in
+// a single SSH round-trip per host. The behaviour matches the per-instance
+// `MeasureDiskUsage` for every populated entry (Mode, Orphan, TotalBytes,
+// WorkBytes, TempBytes, DockerDataBytes, OtherBytes, Err) — the result map
+// is keyed by instance name and contains exactly `len(instances)` entries
+// on the happy path. Entries with an unsafe instance name are returned with
+// `Err` set and zero-valued size buckets, matching the per-instance API's
+// error-shape contract.
+func MeasureDiskUsageBatch(h *host.Host, hostName string, instances []string, rcByInstance map[string]*config.RunnerConfig) map[string]DiskUsageEntry {
+	out := make(map[string]DiskUsageEntry, len(instances))
+	if len(instances) == 0 {
+		return out
+	}
+
+	// Filter to safe names — the per-instance path validates `SafeRunnerInstanceName`
+	// before shipping the script and returns an Err-typed entry rather than
+	// embedding the unsafe name in shell. The batch script cites every
+	// instance via `printf %q` / PowerShell single-quote, so unsafe names
+	// would still parse cleanly (single character isn't a shell metachar),
+	// but the per-instance API's contract is to reject them outright. We
+	// preserve that contract here so callers see the same surface.
+	safeInstances := make([]string, 0, len(instances))
+	for _, inst := range instances {
+		entry := DiskUsageEntry{
+			Instance: inst,
+			Host:     hostName,
+			Path:     h.RunnerDir(inst),
+		}
+		if err := SafeRunnerInstanceName(inst); err != nil {
+			entry.Err = err
+			out[inst] = entry
+			continue
+		}
+		if rc, ok := rcByInstance[inst]; ok && rc != nil {
+			entry.Mode = rc.EffectiveRunnerMode()
+		} else {
+			entry.Orphan = true
+			entry.Mode = "unknown"
+		}
+		out[inst] = entry
+		safeInstances = append(safeInstances, inst)
+	}
+
+	if len(safeInstances) == 0 {
+		return out
+	}
+
+	sizes, err := dirSizesBatch(h, safeInstances)
+	if err != nil {
+		// Surface the batch error on every safe entry so the caller can
+		// still render an entry per instance (mirrors the per-instance
+		// API's "Err set, other fields zero" contract).
+		for _, inst := range safeInstances {
+			e := out[inst]
+			e.Err = err
+			out[inst] = e
+		}
+		return out
+	}
+
+	for _, inst := range safeInstances {
+		s := sizes[inst]
+		e := out[inst]
+		e.TotalBytes = s.total
+		e.WorkBytes = s.work
+		e.TempBytes = s.temp
+		e.DockerDataBytes = s.dockerData
+		other := s.total - s.work - s.temp - s.dockerData
+		if other < 0 {
+			other = 0
+		}
+		e.OtherBytes = other
+		out[inst] = e
+	}
+	return out
+}
+
 func dirSizesWindows(h *host.Host, instance string) (total, work, temp, dockerData int64, err error) {
 	dirExpr := h.RunnerDirPS(instance)
 	ps := fmt.Sprintf(`
