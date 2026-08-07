@@ -120,14 +120,14 @@ func CollectDiskUsage(w io.Writer, cfg *config.Config, mgr *runner.Manager, filt
 			configured := configuredInstancesOnHost(g.runners)
 			rcByInstance := rcByInstanceForHost(g.runners, g.name)
 
+			// Build the full set of instance names to measure (configured +
+			// orphan). One batched SSH round-trip per host — replaces the
+			// 1 ListRunnerInstanceDirs + len(instances) MeasureDiskUsage
+			// pattern that previously paid N+1 SSH round-trips per host.
+			instances := make([]string, 0, len(rcByInstance)+4)
 			for inst := range configured {
 				seen[inst] = struct{}{}
-				rc := rcByInstance[inst]
-				entry := runner.MeasureDiskUsage(h, g.name, inst, rc)
-				key := diskHostInstanceKey(g.name, inst)
-				entry.Busy = statusMaps.busy[key]
-				entry.Remote = statusMaps.remote[key]
-				results[i].entries = append(results[i].entries, entry)
+				instances = append(instances, inst)
 			}
 
 			diskDirs, listErr := runner.ListRunnerInstanceDirs(h)
@@ -139,7 +139,16 @@ func CollectDiskUsage(w io.Writer, cfg *config.Config, mgr *runner.Manager, filt
 				if _, ok := seen[inst]; ok {
 					continue
 				}
-				entry := runner.MeasureDiskUsage(h, g.name, inst, nil)
+				seen[inst] = struct{}{}
+				instances = append(instances, inst)
+			}
+
+			entries := runner.MeasureDiskUsageBatch(h, g.name, instances, rcByInstance)
+			for _, inst := range instances {
+				entry := entries[inst]
+				key := diskHostInstanceKey(g.name, inst)
+				entry.Busy = statusMaps.busy[key]
+				entry.Remote = statusMaps.remote[key]
 				results[i].entries = append(results[i].entries, entry)
 			}
 		}(i, g)
