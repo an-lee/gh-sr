@@ -552,6 +552,99 @@ func TestPruneInstance_pruneCacheIncludesDockerPrune(t *testing.T) {
 	}
 }
 
+// TestPruneInnerDockerCache_innerDockerDown covers the guard branch:
+// pruneInnerDockerCache runs `docker info` first; if the inner dockerd
+// isn't responding, the function must short-circuit with a descriptive
+// error and NOT run the destructive `docker system prune -af --volumes`.
+func TestPruneInnerDockerCache_innerDockerDown(t *testing.T) {
+	t.Parallel()
+	var calls []string
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			calls = append(calls, cmd)
+			// Mimic `docker info` returning "no" (inner dockerd down).
+			if strings.Contains(cmd, "docker info") {
+				return "no\n", nil
+			}
+			return "", nil
+		},
+	})
+	err := pruneInnerDockerCache(h, "gh-sr-my-1")
+	if err == nil {
+		t.Fatal("expected error when inner dockerd is down")
+	}
+	if !strings.Contains(err.Error(), "inner dockerd not responding") {
+		t.Errorf("expected descriptive error, got %v", err)
+	}
+	if len(calls) != 1 {
+		t.Errorf("expected 1 SSH call (probe only), got %d: %v", len(calls), calls)
+	}
+	for _, c := range calls {
+		if strings.Contains(c, "docker system prune") {
+			t.Errorf("must not run docker system prune when probe fails: %q", c)
+		}
+	}
+}
+
+// TestPruneInnerDockerCache_happyPath covers the happy path: probe
+// returns "ok" so the destructive prune runs. Verifies the function
+// returns the second call's error directly (or nil on success).
+func TestPruneInnerDockerCache_happyPath(t *testing.T) {
+	t.Parallel()
+	var calls []string
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			calls = append(calls, cmd)
+			if strings.Contains(cmd, "docker info") {
+				return "ok\n", nil
+			}
+			if strings.Contains(cmd, "docker system prune") {
+				return "", nil
+			}
+			return "", nil
+		},
+	})
+	if err := pruneInnerDockerCache(h, "gh-sr-my-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 SSH calls (probe + prune), got %d: %v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], "docker info") {
+		t.Errorf("first call should be the probe, got %q", calls[0])
+	}
+	if !strings.Contains(calls[1], "docker system prune") {
+		t.Errorf("second call should be the prune, got %q", calls[1])
+	}
+}
+
+// TestPruneInnerDockerCache_probeError covers the case where the probe's
+// underlying SSH call fails (e.g. host unreachable). The function
+// surfaces the descriptive "inner dockerd not responding" error and must
+// not run the destructive prune.
+func TestPruneInnerDockerCache_probeError(t *testing.T) {
+	t.Parallel()
+	var pruneCalls int
+	h := diskMockHost("linux", &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			if strings.Contains(cmd, "docker system prune") {
+				pruneCalls++
+			}
+			return "", errors.New("ssh: connection reset")
+		},
+	})
+	err := pruneInnerDockerCache(h, "gh-sr-my-1")
+	if err == nil {
+		t.Fatal("expected error when probe SSH fails")
+	}
+	if !strings.Contains(err.Error(), "inner dockerd not responding") {
+		t.Errorf("err = %v, want descriptive error", err)
+	}
+	if pruneCalls != 0 {
+		t.Errorf("prune must not run when probe fails; got %d calls", pruneCalls)
+	}
+}
+
 func TestClearWorkTempPOSIX_escalatesForContainerMode(t *testing.T) {
 	t.Parallel()
 	script := clearWorkTempPOSIX("rune-agentic-3", true)
