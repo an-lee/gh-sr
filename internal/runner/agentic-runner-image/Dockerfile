@@ -78,7 +78,16 @@ RUN useradd --create-home --shell /bin/bash runner \
 # as the prior /opt/hostedtoolcache), and — crucially — outside gh-aw's exclusion,
 # so setup-* actions (Node, Go, Flutter, Python, …) land where the AWF agent can
 # actually see them.
-RUN mkdir -p /home/runner/.toolcache && chown runner:runner /home/runner/.toolcache
+#
+# Compatibility symlink: a handful of legacy actions (notably ruby/setup-ruby@v1)
+# hardcode `/opt/hostedtoolcache` and deliberately ignore $RUNNER_TOOL_CACHE when
+# they don't detect a self-hosted runner. Point /opt/hostedtoolcache at the new
+# tool-cache root so those `mkdir -p` calls (and pre-extracted Ruby installs)
+# resolve to the same writable, runner-owned location. The symlink target is
+# /home/runner/.toolcache, so $RUNNER_TOOL_CACHE and gh-aw's mount guard continue
+# to see the new path — the gh-aw fix from 5a8ae78 still works. (issue #405)
+RUN mkdir -p /home/runner/.toolcache && chown runner:runner /home/runner/.toolcache \
+    && ln -s /home/runner/.toolcache /opt/hostedtoolcache
 
 # Actions runner binary — installed at image build time so startup is fast.
 # RUNNER_VERSION is injected by `docker build --build-arg RUNNER_VERSION=<ver>`.

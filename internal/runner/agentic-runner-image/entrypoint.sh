@@ -384,6 +384,12 @@ export RUNNER_TEMP="${RUNNER_TEMP_DIR}"
 # /home/runner/.toolcache is owned by the runner user, ephemeral per container
 # (same lifetime as the old /opt/hostedtoolcache), and passes gh-aw's guard so
 # setup-* actions (Node, Go, Flutter, Python, …) are reachable from inside AWF.
+#
+# The Dockerfile also installs a /opt/hostedtoolcache -> /home/runner/.toolcache
+# symlink so legacy actions (notably ruby/setup-ruby@v1, which hardcodes
+# `/opt/hostedtoolcache` when it doesn't detect a self-hosted runner) can still
+# `mkdir -p` their tool-cache subdir — they land in the same writable location,
+# while $RUNNER_TOOL_CACHE and the AWF mount guard keep seeing /home/runner/...
 export RUNNER_TOOL_CACHE="/home/runner/.toolcache"
 
 # ── 6. Wire per-job reset hooks into the runner .env ────────────────────────────

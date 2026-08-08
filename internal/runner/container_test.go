@@ -533,6 +533,33 @@ func TestAgenticRunnerDockerfileBakesNetworkAndHooks(t *testing.T) {
 	}
 }
 
+// TestAgenticRunnerDockerfileSymlinksHostedToolCache guards the compatibility shim
+// for actions that hardcode /opt/hostedtoolcache (notably ruby/setup-ruby@v1,
+// which deliberately ignores $RUNNER_TOOL_CACHE when it doesn't detect a
+// self-hosted runner — see issue #405). Without the symlink the runner user's
+// `mkdir /opt/hostedtoolcache/Ruby/...` fails with EACCES because /opt is owned
+// by root and the new image no longer creates /opt/hostedtoolcache.
+func TestAgenticRunnerDockerfileSymlinksHostedToolCache(t *testing.T) {
+	t.Parallel()
+	// Both the new tool-cache root and the symlink must be created in one RUN
+	// so the symlink is guaranteed to resolve to a runner-owned directory at
+	// image-build time.
+	if !strings.Contains(agenticRunnerDockerfile, "ln -s /home/runner/.toolcache /opt/hostedtoolcache") {
+		t.Fatalf("Dockerfile should symlink /opt/hostedtoolcache -> /home/runner/.toolcache, got:\n%s", agenticRunnerDockerfile)
+	}
+	// The chown and the symlink must share the same RUN (single layer) so the
+	// symlink target exists and is owned by runner when the layer is committed.
+	if !strings.Contains(agenticRunnerDockerfile, "mkdir -p /home/runner/.toolcache && chown runner:runner /home/runner/.toolcache \\\n    && ln -s /home/runner/.toolcache /opt/hostedtoolcache") {
+		t.Fatal("symlink and tool-cache mkdir must run in a single RUN layer (chown must precede ln)")
+	}
+	// RUNNER_TOOL_CACHE in the entrypoint must remain /home/runner/.toolcache —
+	// the gh-aw mount guard from 5a8ae78 depends on the env var NOT being
+	// rewritten to /opt/hostedtoolcache.
+	if !strings.Contains(agenticRunnerEntrypoint, `RUNNER_TOOL_CACHE="/home/runner/.toolcache"`) {
+		t.Fatal("entrypoint must keep RUNNER_TOOL_CACHE at /home/runner/.toolcache so the AWF mount guard continues to pass")
+	}
+}
+
 func TestAgenticRunnerDockerfileDockerShimLayout(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
