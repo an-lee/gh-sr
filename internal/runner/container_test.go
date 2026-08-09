@@ -2228,6 +2228,96 @@ func TestStartContainer_PropagatesDockerStartError(t *testing.T) {
 	}
 }
 
+func TestManagerStartContainerRecoversStaleRegistration(t *testing.T) {
+	t.Parallel()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/actions/runners/registration-token") {
+			_ = json.NewEncoder(w).Encode(tokenResponse{Token: "fresh-token"})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	var out bytes.Buffer
+	var cleanupCmd string
+	var createCmd string
+	starts := 0
+	logChecks := 0
+	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
+		switch {
+		case strings.Contains(cmd, "docker update --restart") && strings.Contains(cmd, "docker start gh-sr-ci-1"):
+			starts++
+			return "gh-sr-ci-1\n", nil
+		case strings.Contains(cmd, "docker logs --tail 200") && strings.Contains(cmd, staleRegistrationMsg):
+			logChecks++
+			return "", nil
+		case strings.Contains(cmd, "docker inspect --format '{{.Config.Image}}'"):
+			return "gh-sr/agentic-runner:2.330.0\n", nil
+		case cmd == "echo $HOME":
+			return "/home/runner\n", nil
+		case strings.Contains(cmd, "docker rm -f") && strings.Contains(cmd, ".credentials_rsaparams"):
+			cleanupCmd = cmd
+			return "", nil
+		case strings.Contains(cmd, "docker create"):
+			createCmd = cmd
+			return "", nil
+		case strings.Contains(cmd, "docker inspect --format '{{.State.Status}}'"):
+			return "running\n", nil
+		case strings.Contains(cmd, `docker exec "gh-sr-ci-1" sh -c`) &&
+			strings.Contains(cmd, "docker info") &&
+			strings.Contains(cmd, "test -f /home/runner/actions-runner/.runner"):
+			return "dockerd-ok\nok\n", nil
+		default:
+			return "", nil
+		}
+	}}
+	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
+	h.SetConn(mock)
+	m := &Manager{
+		GitHub: NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
+		Out:    &out,
+	}
+	rc := config.RunnerConfig{
+		Name:       "ci",
+		Repo:       "o/r",
+		Host:       "h",
+		Count:      1,
+		RunnerMode: config.RunnerModeContainer,
+	}
+
+	if err := m.Start(h, rc); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if starts != 2 {
+		t.Fatalf("docker start calls = %d, want 2 (original start + recovered container start); calls=%v", starts, mock.Calls)
+	}
+	if logChecks != 1 {
+		t.Fatalf("stale log checks = %d, want 1; calls=%v", logChecks, mock.Calls)
+	}
+	for _, want := range []string{
+		"/home/runner/.gh-sr/runners/ci-1/.runner",
+		"/home/runner/.gh-sr/runners/ci-1/.credentials",
+		"/home/runner/.gh-sr/runners/ci-1/.credentials_rsaparams",
+	} {
+		if !strings.Contains(cleanupCmd, want) {
+			t.Fatalf("cleanup command missing %q: %q", want, cleanupCmd)
+		}
+	}
+	if strings.Contains(cleanupCmd, "rm -rf") {
+		t.Fatalf("cleanup must not remove the whole runner state directory: %q", cleanupCmd)
+	}
+	if !strings.Contains(createCmd, "GH_SR_RUNNER_TOKEN='fresh-token'") {
+		t.Fatalf("create command did not use fresh registration token: %q", createCmd)
+	}
+	if !strings.Contains(createCmd, "'gh-sr/agentic-runner:2.330.0'") {
+		t.Fatalf("create command did not preserve inspected image tag: %q", createCmd)
+	}
+	if !strings.Contains(out.String(), "registration expired on GitHub, re-creating container") {
+		t.Fatalf("missing stale-registration recovery message: %q", out.String())
+	}
+}
+
 // TestProbeDinDContainerReadiness_RunningHealthy verifies the happy path:
 // container is running, inner dockerd answers, .runner is present. The probe
 // returns a fully-positive report.
