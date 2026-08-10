@@ -869,13 +869,38 @@ fi
 `, posixScriptHeader(instance), containerBlock, passwordlessSudo())
 }
 
+// pruneInnerDockerCacheScript returns the shell snippet that probes the
+// inner dockerd and, when responsive, runs the destructive cache prune —
+// all in one SSH round-trip. The previous implementation issued a separate
+// probe + prune call (2 round-trips per container-mode prune-with-cache);
+// folding them into one script saves 1 SSH round-trip per instance without
+// weakening the "must not run the destructive prune when the inner dockerd
+// is down" invariant. The probe-down branch writes the same descriptive
+// "inner dockerd not responding" message to stderr and exits non-zero so
+// the caller's error-string contract is preserved.
+func pruneInnerDockerCacheScript(containerName string) string {
+	q := QuoteContainerName(containerName)
+	return fmt.Sprintf(`
+if ! docker info >/dev/null 2>&1; then
+  echo "inner dockerd not responding in %s; skipped cache prune" >&2
+  exit 1
+fi
+docker system prune -af --volumes
+`, q)
+}
+
 func pruneInnerDockerCache(h *host.Host, containerName string) error {
-	check, err := h.Run(DockerExecCommand(containerName, "docker info >/dev/null 2>&1 && echo ok || echo no"))
-	if err != nil || strings.TrimSpace(check) != "ok" {
-		return fmt.Errorf("inner dockerd not responding in %s; skipped cache prune", containerName)
+	_, err := h.Run(DockerExecCommand(containerName, pruneInnerDockerCacheScript(containerName)))
+	if err != nil {
+		// The script's stderr includes the descriptive "inner dockerd not
+		// responding" line on the probe-down path; for every other error
+		// path (SSH failure, prune failure) the wrapper error below keeps
+		// the call-site contract ("Err set when the cache is not pruned")
+		// intact. Returning the raw err keeps the underlying diagnostic
+		// (e.g. ssh: connection reset) reachable to the caller.
+		return fmt.Errorf("inner docker cache prune in %s: %w", containerName, err)
 	}
-	_, err = h.Run(DockerExecCommand(containerName, "docker system prune -af --volumes"))
-	return err
+	return nil
 }
 
 // FormatBytesHuman formats bytes as GiB/MiB/KiB/B for display.
