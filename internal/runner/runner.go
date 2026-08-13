@@ -145,6 +145,13 @@ func (m *Manager) Start(h *host.Host, rc config.RunnerConfig) error {
 				return err
 			}
 			fmt.Fprintf(m.out(), "  %s: container started\n", name)
+			if containerLogsContainStaleRegistration(h, name) {
+				fmt.Fprintf(m.out(), "  %s: registration expired on GitHub, re-creating container...\n", name)
+				if err := m.recoverContainerStaleRegistration(h, rc, i, name); err != nil {
+					return fmt.Errorf("recovering stale registration for %s: %w", name, err)
+				}
+				fmt.Fprintf(m.out(), "  %s: container re-created with fresh registration\n", name)
+			}
 			// Health-gate: confirm the slot is actually ready (inner dockerd up,
 			// runner registered) before treating it as available. Non-fatal so a
 			// slow first boot does not fail `gh sr up`; doctor surfaces persistent issues.

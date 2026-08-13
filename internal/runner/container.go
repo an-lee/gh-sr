@@ -658,6 +658,60 @@ func (m *Manager) startContainer(h *host.Host, instanceName string) error {
 	return nil
 }
 
+// containerLogsContainStaleRegistration reports whether the runner inside an
+// existing container has hit GitHub's "registration deleted" failure. With
+// --restart unless-stopped Docker can otherwise keep restarting the same stale
+// local .runner/.credentials files forever.
+func containerLogsContainStaleRegistration(h *host.Host, instanceName string) bool {
+	cname := containerName(instanceName)
+	cmd := fmt.Sprintf(
+		"docker logs --tail 200 %s 2>&1 | grep -F %s >/dev/null",
+		QuoteContainerName(cname),
+		hostshell.PosixSingleQuote(staleRegistrationMsg),
+	)
+	_, err := h.Run(cmd)
+	return err == nil
+}
+
+func containerInspectImage(h *host.Host, instanceName string) (string, error) {
+	cname := containerName(instanceName)
+	out, err := h.Run(fmt.Sprintf("docker inspect --format '{{.Config.Image}}' %s", QuoteContainerName(cname)))
+	if err != nil {
+		return "", err
+	}
+	image := strings.TrimSpace(out)
+	if image == "" {
+		return "", fmt.Errorf("container %s has empty image", cname)
+	}
+	return image, nil
+}
+
+func (m *Manager) recoverContainerStaleRegistration(h *host.Host, rc config.RunnerConfig, instanceIndex int, instanceName string) error {
+	imageTag, err := containerInspectImage(h, instanceName)
+	if err != nil {
+		return fmt.Errorf("inspecting stale container image: %w", err)
+	}
+	stateDir, err := resolveAbsoluteRunnerDir(h, instanceName)
+	if err != nil {
+		return fmt.Errorf("resolving state dir for %s: %w", instanceName, err)
+	}
+	cname := containerName(instanceName)
+	cleanup := fmt.Sprintf(
+		"docker rm -f %s 2>/dev/null || true; rm -f %s %s %s",
+		QuoteContainerName(cname),
+		hostshell.PosixSingleQuote(stateDir+"/.runner"),
+		hostshell.PosixSingleQuote(stateDir+"/.credentials"),
+		hostshell.PosixSingleQuote(stateDir+"/.credentials_rsaparams"),
+	)
+	if _, err := h.Run(cleanup); err != nil {
+		return fmt.Errorf("removing stale container state: %w", err)
+	}
+	if err := m.createContainerInstance(h, rc, instanceIndex, instanceName, imageTag); err != nil {
+		return err
+	}
+	return m.startContainer(h, instanceName)
+}
+
 // ContainerBootstrapFailed reports whether the runner instance gave up after repeated
 // inner-dockerd bootstrap failures (bootstrap-failed marker in the state bind-mount).
 func ContainerBootstrapFailed(h *host.Host, instanceName string) bool {
