@@ -50,12 +50,33 @@ bench-save:
 # summary plus the project total. Coverage data goes to coverage.out (gitignored
 # convention; add it to your local .gitignore if you keep the file around).
 # Use `make coverage-html` to open an annotated HTML report in your browser.
+#
+# The per-package breakdown is sorted by coverage ASCENDING so the lowest-
+# coverage packages surface first — this is the natural reading order for
+# "where should I add tests next?" The cmd/gh-sr package has no _test.go
+# files (it just wires Cobra commands to the internal packages), so it
+# surfaces at the top of the sorted list as a 0.0% row.
+#
+# We run `go test -cover` once for the per-package coverage output and
+# once with `-coverprofile` for the HTML report. Both invocations read
+# from Go's build cache for the package binaries; only the per-package
+# coverage instrumentation adds work (a single per-file counter bump per
+# statement), so the second invocation adds roughly the same wall-clock
+# cost as the first.
 COVERAGE_FILE := coverage.out
 coverage:
-	go test ./... -coverprofile=$(COVERAGE_FILE) -covermode=atomic
+	@go test ./... -cover -count=1 2>&1 \
+	  | grep -E 'coverage: [0-9.]+% of statements' \
+	  | awk '{ for (i=1; i<=NF; i++) if ($$i == "coverage:") {pct=$$(i+1); gsub(/%/, "", pct)} for (i=1; i<=NF; i++) if ($$i ~ /\//) {pkg=$$i; sub(/:[0-9.]+s$$/, "", pkg)} print pct "\t" pkg }' \
+	  | sort -t'	' -k1,1n \
+	  | awk -F'\t' 'BEGIN {print "    COVER   PACKAGE"} {printf "    %5.1f%%  %s\n", $$1, $$2}'
 	@echo
+	@go test ./... -coverprofile=$(COVERAGE_FILE) -covermode=atomic -count=1 >/dev/null
 	@echo "=== Project total ==="
 	@go tool cover -func=$(COVERAGE_FILE) | tail -1
+	@echo
+	@echo "Coverage profile: $(COVERAGE_FILE)"
+	@echo "Open an annotated HTML report with: make coverage-html"
 
 coverage-html: coverage
 	go tool cover -html=$(COVERAGE_FILE) -o coverage.html
