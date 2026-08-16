@@ -558,9 +558,9 @@ func TestPruneInstance_pruneCacheIncludesDockerPrune(t *testing.T) {
 // error and NOT run the destructive `docker system prune -af --volumes`.
 //
 // As of the 2026-08-10 single-SSH fold the probe and prune run inside one
-// docker exec call: the host-side `if ! docker info ...; then exit 1` keeps
-// the destructive prune from running when the inner dockerd is down. The
-// real `runWithCapture` helper in internal/host/exec.go appends the
+// docker exec call: the in-container `if ! docker info ...; then exit 1`
+// keeps the destructive prune from running when the inner dockerd is down.
+// The real `runWithCapture` helper in internal/host/exec.go appends the
 // captured stderr to the returned error, so the "inner dockerd not
 // responding" message reaches the caller through the wrapped err. The
 // MockExecutor used here doesn't capture stderr, so the test injects the
@@ -588,6 +588,9 @@ func TestPruneInnerDockerCache_innerDockerDown(t *testing.T) {
 	if len(calls) != 1 {
 		t.Errorf("expected 1 SSH call (folded probe+prune), got %d: %v", len(calls), calls)
 	}
+	if len(calls) == 1 && !strings.Contains(calls[0], `docker exec "gh-sr-my-1" sh -c '`) {
+		t.Errorf("folded probe+prune must run under docker exec sh -c, got %q", calls[0])
+	}
 }
 
 // TestPruneInnerDockerCache_happyPath covers the happy path: probe
@@ -613,6 +616,9 @@ func TestPruneInnerDockerCache_happyPath(t *testing.T) {
 	}
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 SSH call (folded probe+prune), got %d: %v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], `docker exec "gh-sr-my-1" sh -c '`) {
+		t.Errorf("single SSH call must run under docker exec sh -c, got %q", calls[0])
 	}
 	if !strings.Contains(calls[0], "docker info") {
 		t.Errorf("single SSH call should include the probe, got %q", calls[0])

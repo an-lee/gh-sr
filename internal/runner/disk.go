@@ -890,7 +890,8 @@ docker system prune -af --volumes
 }
 
 func pruneInnerDockerCache(h *host.Host, containerName string) error {
-	_, err := h.Run(DockerExecCommand(containerName, pruneInnerDockerCacheScript(containerName)))
+	innerCmd := "sh -c " + hostshell.PosixSingleQuote(pruneInnerDockerCacheScript(containerName))
+	_, err := h.Run(DockerExecCommand(containerName, innerCmd))
 	if err != nil {
 		// The script's stderr includes the descriptive "inner dockerd not
 		// responding" line on the probe-down path; for every other error
