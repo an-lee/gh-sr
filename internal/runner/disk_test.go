@@ -744,6 +744,30 @@ func TestClearWorkTempPOSIX_nativePruneCache_skipsPruneBlock(t *testing.T) {
 	}
 }
 
+// TestClearWorkTempPOSIX_containerPruneCache_wrapsPruneScriptInSh_c pins
+// the 2026-08-17 safety property that the folded prune block wraps the inner
+// prune script in `sh -c '…'`. Without the sh -c boundary, DockerExecCommand
+// concatenates `docker exec <name> <multi-line-script>` and the host-side
+// shell (which is parsing clearWorkTempPOSIX) consumes the if/then/fi
+// branches and the `docker system prune` line itself, running them against
+// the host's dockerd instead of the container's. PR #412 applies the same
+// fix to the standalone pruneInnerDockerCache; this test guards the folded
+// variant.
+func TestClearWorkTempPOSIX_containerPruneCache_wrapsPruneScriptInSh_c(t *testing.T) {
+	t.Parallel()
+	script := clearWorkTempPOSIX("rune-agentic-3", true, true)
+	// The prune docker exec must wrap the inner script in `sh -c '…'`.
+	// The inner script's leading byte is a newline (it starts with
+	// "\nif ! docker info …"), so we look for the boundary between the
+	// exec invocation and the sh -c wrapper rather than for an immediately-
+	// adjacent `sh -c 'docker info`. The literal `sh -c '` followed by a
+	// newline is unambiguous: no host-side shell construct in the clear
+	// body emits that exact sequence.
+	if !strings.Contains(script, "sh -c '\n") {
+		t.Fatalf("prune docker exec must wrap inner script in sh -c, got: %s", script)
+	}
+}
+
 func TestContainerEscalation_quotesContainerAndCommand(t *testing.T) {
 	t.Parallel()
 	script := containerEscalation("gh-sr-rune-1", `for sub in _work _temp; do rm -rf "$sub"; done`)

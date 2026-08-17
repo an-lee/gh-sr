@@ -861,12 +861,21 @@ done
 // <name>: failed" line keeps the pre-fold wrapper prefix reachable to
 // callers and tests that pattern-match on it.
 //
+// The inner script is wrapped in `sh -c '<script>'` because DockerExecCommand
+// only concatenates `docker exec <name> ` — it does not wrap raw multi-line
+// shell scripts. Without the sh -c boundary the host-side shell (which is
+// parsing the surrounding clearWorkTempPOSIX script) would consume the
+// if/then/fi branches and the `docker system prune` line itself, running
+// them against the host's dockerd instead of the container's. See PR #412
+// for the same fix applied to the pre-fold standalone pruneInnerDockerCache.
+//
 // Folded into clearWorkTempPOSIX so the disk-prune orchestrator spends
 // only one SSH per container-mode prune-with-cache instance.
 func pruneInnerDockerCacheExec(containerName string) string {
 	q := QuoteContainerName(containerName)
+	innerCmd := "sh -c " + hostshell.PosixSingleQuote(pruneInnerDockerCacheScript(containerName))
 	return fmt.Sprintf(`%s || { echo "inner docker cache prune in %s: failed" >&2; exit 1; }`,
-		DockerExecCommand(containerName, pruneInnerDockerCacheScript(containerName)), q)
+		DockerExecCommand(containerName, innerCmd), q)
 }
 
 func removeDirTree(h *host.Host, instance string) error {
