@@ -2,12 +2,14 @@ package host
 
 import (
 	"encoding/base64"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"unicode/utf16"
 
 	"github.com/an-lee/gh-sr/internal/config"
+	"github.com/an-lee/gh-sr/internal/testutil"
 )
 
 func Test_normalizeArch(t *testing.T) {
@@ -253,5 +255,42 @@ func TestHost_paths(t *testing.T) {
 	}
 	if ln.PathSep() != "/" {
 		t.Errorf("linux sep: %q", ln.PathSep())
+	}
+}
+
+// TestHost_Upload_delegatesToConn covers the Host.Upload wrapper: the
+// injected Executor must observe the (localPath, remotePath) pair and
+// any error it returns must surface unchanged. SetConn is used to skip
+// the SSH dial path so the test stays hermetic.
+func TestHost_Upload_delegatesToConn(t *testing.T) {
+	t.Parallel()
+	mock := &testutil.MockExecutor{}
+	h := NewHost("h", config.HostConfig{Addr: "u@h", OS: "linux", Arch: "amd64"})
+	h.SetConn(mock)
+
+	if err := h.Upload("/local/src.txt", "/remote/dst.txt"); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if !mock.UploadCalled {
+		t.Fatal("Executor.Upload was not invoked")
+	}
+	if mock.LastUpload.Local != "/local/src.txt" || mock.LastUpload.Remote != "/remote/dst.txt" {
+		t.Errorf("uploaded paths: got (%q, %q), want (/local/src.txt, /remote/dst.txt)",
+			mock.LastUpload.Local, mock.LastUpload.Remote)
+	}
+}
+
+// TestHost_Upload_propagatesError covers the error-surfacing branch:
+// the Executor.Upload error must reach the Host.Upload caller verbatim
+// so call sites can match on errors.Is for retry/deadline decisions.
+func TestHost_Upload_propagatesError(t *testing.T) {
+	t.Parallel()
+	want := errors.New("scp timed out")
+	mock := &testutil.MockExecutor{UploadErr: want}
+	h := NewHost("h", config.HostConfig{Addr: "u@h", OS: "linux", Arch: "amd64"})
+	h.SetConn(mock)
+
+	if err := h.Upload("/local/src.txt", "/remote/dst.txt"); !errors.Is(err, want) {
+		t.Fatalf("Upload error: got %v, want wraps %v", err, want)
 	}
 }
