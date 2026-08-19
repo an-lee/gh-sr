@@ -131,15 +131,22 @@ func (m *dashboardModel) viewMain() tea.View {
 	return newAltView(b.String())
 }
 
+// footerMainIdle and footerMainLoading are the two pre-built help-line
+// renderings footerMain returns. The body of the line is identical in both
+// states — the only difference is the trailing "  (refreshing…)" indicator
+// during a refresh tick. Pre-rendering once at package init avoids a
+// per-View() fmt.Sprintf (reflection + []interface{} boxing) for a string
+// with exactly two possible states. footerMain just picks the right one.
+var (
+	footerMainIdle    = helpStyle.Render("\n  j/k: move  enter: runner actions  g: global menu  h: host metrics  f: filters  r: refresh  ?: help  q: quit")
+	footerMainLoading = helpStyle.Render("\n  j/k: move  enter: runner actions  g: global menu  h: host metrics  f: filters  r: refresh  ?: help  q: quit  (refreshing…)")
+)
+
 func (m *dashboardModel) footerMain() string {
-	loadingIndicator := ""
 	if m.loading {
-		loadingIndicator = "  (refreshing…)"
+		return footerMainLoading
 	}
-	return helpStyle.Render(fmt.Sprintf(
-		"\n  j/k: move  enter: runner actions  g: global menu  h: host metrics  f: filters  r: refresh  ?: help  q: quit%s",
-		loadingIndicator,
-	))
+	return footerMainIdle
 }
 
 func helpOverlay() string {
