@@ -735,21 +735,25 @@ func (m *Manager) PruneInstance(h *host.Host, hostName, instance string, rc *con
 
 	workAction := fmt.Sprintf("clear %s/_work and %s/_temp", dir, dir)
 	res.Actions = append(res.Actions, workAction)
-	if !opts.DryRun {
-		if err := clearWorkTemp(h, instance, containerPruneMode(rc)); err != nil {
-			res.Err = err
-			return res
-		}
-	}
 
-	if containerPruneMode(rc) && opts.PruneCache {
+	containerMode := containerPruneMode(rc)
+	if containerMode && opts.PruneCache {
 		cname := ContainerDockerName(instance)
 		cacheAction := fmt.Sprintf("inner docker cache prune in %s", cname)
 		res.Actions = append(res.Actions, cacheAction)
-		if !opts.DryRun {
-			if err := pruneInnerDockerCache(h, cname); err != nil {
-				res.Err = err
-			}
+	}
+
+	if !opts.DryRun {
+		// Pass PruneCache through to clearWorkTemp so the inner docker prune
+		// runs inside the same SSH round-trip as the clear. Saves 1 SSH per
+		// container-mode prune-with-cache instance — the previous code path
+		// issued clearWorkTemp + pruneInnerDockerCache as two separate
+		// h.Run calls. Behaviour contract preserved: clear failure still
+		// short-circuits the prune (clearWorkTempPOSIX puts the prune block
+		// after the "files remain" final check).
+		if err := clearWorkTemp(h, instance, containerMode, opts.PruneCache); err != nil {
+			res.Err = err
+			return res
 		}
 	}
 
@@ -761,7 +765,7 @@ func containerPruneMode(rc *config.RunnerConfig) bool {
 	return rc != nil && rc.IsContainerMode()
 }
 
-func clearWorkTemp(h *host.Host, instance string, containerMode bool) error {
+func clearWorkTemp(h *host.Host, instance string, containerMode, pruneCache bool) error {
 	_, err := runOnHostOS(h,
 		func() (struct{}, error) {
 			dirExpr := h.RunnerDirPS(instance)
@@ -777,7 +781,7 @@ foreach ($sub in @('_work','_temp')) {
 			return struct{}{}, ierr
 		},
 		func() (struct{}, error) {
-			_, ierr := h.Run(clearWorkTempPOSIX(instance, containerMode))
+			_, ierr := h.Run(clearWorkTempPOSIX(instance, containerMode, pruneCache))
 			return struct{}{}, ierr
 		},
 	)
@@ -787,13 +791,29 @@ foreach ($sub in @('_work','_temp')) {
 // clearWorkTempPOSIX removes job scratch under _work and _temp. CI jobs often leave
 // root-owned files on the host bind mount; we escalate via docker exec (container
 // runners) or passwordless host sudo when a plain rm is not enough.
-func clearWorkTempPOSIX(instance string, containerMode bool) string {
+//
+// When containerMode and pruneCache are both true, the script ALSO runs the inner
+// docker cache prune (probe + `docker system prune -af --volumes`) inside the
+// container via a second `docker exec`. Folding this into the same SSH
+// round-trip as the clear saves 1 SSH per container-mode prune-with-cache
+// instance — PruneInstance previously issued two SSHs (clear + prune) per
+// such instance.
+//
+// The prune block sits AFTER the final-check that confirms _work and _temp are
+// empty. If the clear step fails (the final check exits 1 with "cannot remove
+// files"), the prune block never runs — preserving the pre-fold behaviour where
+// PruneInstance returned immediately on clear failure and skipped the prune.
+func clearWorkTempPOSIX(instance string, containerMode, pruneCache bool) string {
 	var containerBlock string
 	if containerMode {
 		containerBlock = containerEscalation(
 			ContainerDockerName(instance),
 			`for sub in _work _temp; do p="/runner-state/$sub"; if [ -d "$p" ]; then find "$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} +; fi; done`,
 		)
+	}
+	var pruneBlock string
+	if containerMode && pruneCache {
+		pruneBlock = pruneInnerDockerCacheExec(ContainerDockerName(instance))
 	}
 	return fmt.Sprintf(`
 %s
@@ -826,7 +846,27 @@ for sub in _work _temp; do
     exit 1
   fi
 done
-`, posixScriptHeader(instance), containerBlock, passwordlessSudo())
+%s
+`, posixScriptHeader(instance), containerBlock, passwordlessSudo(), pruneBlock)
+}
+
+// pruneInnerDockerCacheExec returns the host-side command that runs the
+// prune script (probe + destructive prune) inside the container via
+// `docker exec`. The `|| { ... exit 1; }` wrapper preserves the "Err set when
+// the cache is not pruned" contract: if the inner docker exec fails for any
+// reason (SSH flake, inner dockerd down, prune failure), the outer shell
+// aborts with exit 1 and the captured stderr — which carries the inner
+// script's descriptive "inner dockerd not responding" message — reaches
+// the caller via h.Run. The wrapper's own "inner docker cache prune in
+// <name>: failed" line keeps the pre-fold wrapper prefix reachable to
+// callers and tests that pattern-match on it.
+//
+// Folded into clearWorkTempPOSIX so the disk-prune orchestrator spends
+// only one SSH per container-mode prune-with-cache instance.
+func pruneInnerDockerCacheExec(containerName string) string {
+	q := QuoteContainerName(containerName)
+	return fmt.Sprintf(`%s || { echo "inner docker cache prune in %s: failed" >&2; exit 1; }`,
+		DockerExecCommand(containerName, pruneInnerDockerCacheScript(containerName)), q)
 }
 
 func removeDirTree(h *host.Host, instance string) error {
@@ -887,21 +927,6 @@ if ! docker info >/dev/null 2>&1; then
 fi
 docker system prune -af --volumes
 `, q)
-}
-
-func pruneInnerDockerCache(h *host.Host, containerName string) error {
-	innerCmd := "sh -c " + hostshell.PosixSingleQuote(pruneInnerDockerCacheScript(containerName))
-	_, err := h.Run(DockerExecCommand(containerName, innerCmd))
-	if err != nil {
-		// The script's stderr includes the descriptive "inner dockerd not
-		// responding" line on the probe-down path; for every other error
-		// path (SSH failure, prune failure) the wrapper error below keeps
-		// the call-site contract ("Err set when the cache is not pruned")
-		// intact. Returning the raw err keeps the underlying diagnostic
-		// (e.g. ssh: connection reset) reachable to the caller.
-		return fmt.Errorf("inner docker cache prune in %s: %w", containerName, err)
-	}
-	return nil
 }
 
 // FormatBytesHuman formats bytes as GiB/MiB/KiB/B for display.

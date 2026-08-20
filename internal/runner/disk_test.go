@@ -299,7 +299,7 @@ func TestClearWorkTemp_posixDispatchesToRunnerDir(t *testing.T) {
 		},
 	}
 	h := diskMockHost("linux", mock)
-	if err := clearWorkTemp(h, "ci-1", false); err != nil {
+	if err := clearWorkTemp(h, "ci-1", false, false); err != nil {
 		t.Fatalf("clearWorkTemp: %v", err)
 	}
 	if len(calls) != 1 {
@@ -324,7 +324,7 @@ func TestClearWorkTemp_posixPropagatesRunnerError(t *testing.T) {
 		return "", sentinel
 	}}
 	h := diskMockHost("linux", mock)
-	err := clearWorkTemp(h, "ci-1", false)
+	err := clearWorkTemp(h, "ci-1", false, false)
 	if err == nil {
 		t.Fatal("clearWorkTemp POSIX: expected propagated error, got nil")
 	}
@@ -350,7 +350,7 @@ func TestClearWorkTemp_windowsBranch(t *testing.T) {
 	}
 	h := host.NewHost("win", config.HostConfig{Addr: "runner@vps", OS: "windows", Arch: "amd64"})
 	h.SetConn(mock)
-	if err := clearWorkTemp(h, "win-ci-1", false); err != nil {
+	if err := clearWorkTemp(h, "win-ci-1", false, false); err != nil {
 		t.Fatalf("clearWorkTemp Windows: %v", err)
 	}
 	if len(calls) != 1 {
@@ -458,7 +458,7 @@ func TestDiskDispatchers_unsupportedHostOS(t *testing.T) {
 	if _, _, _, _, err := dirSizes(h, "ci-1"); err == nil {
 		t.Fatal("dirSizes: expected unsupported-host-OS error, got nil")
 	}
-	if err := clearWorkTemp(h, "ci-1", false); err == nil {
+	if err := clearWorkTemp(h, "ci-1", false, false); err == nil {
 		t.Fatal("clearWorkTemp: expected unsupported-host-OS error, got nil")
 	}
 	if err := removeDirTree(h, "ci-1"); err == nil {
@@ -469,7 +469,7 @@ func TestDiskDispatchers_unsupportedHostOS(t *testing.T) {
 	}
 	for _, err := range []error{
 		func() error { _, _, _, _, e := dirSizes(h, "ci-1"); return e }(),
-		clearWorkTemp(h, "ci-1", false),
+		clearWorkTemp(h, "ci-1", false, false),
 		removeDirTree(h, "ci-1"),
 	} {
 		if !strings.Contains(err.Error(), "freebsd") {
@@ -482,7 +482,7 @@ func TestPOSIXScripts_includeSetE(t *testing.T) {
 	t.Parallel()
 	for name, script := range map[string]string{
 		"dirSizes":      buildDirSizesPOSIXScript("ci-1"),
-		"clearWorkTemp": clearWorkTempPOSIX("ci-1", false),
+		"clearWorkTemp": clearWorkTempPOSIX("ci-1", false, false),
 		"removeDir":     removeDirTreePOSIX("ci-1"),
 	} {
 		if !strings.Contains(script, "set -e") {
@@ -553,40 +553,43 @@ func TestPruneInstance_pruneCacheIncludesDockerPrune(t *testing.T) {
 }
 
 // TestPruneInnerDockerCache_innerDockerDown covers the guard branch:
-// pruneInnerDockerCache runs `docker info` first; if the inner dockerd
-// isn't responding, the function must short-circuit with a descriptive
-// error and NOT run the destructive `docker system prune -af --volumes`.
+// clearWorkTempPOSIX's appended prune block runs `docker info` first;
+// if the inner dockerd isn't responding, the script must short-circuit
+// with a descriptive error and NOT run the destructive
+// `docker system prune -af --volumes`.
 //
-// As of the 2026-08-10 single-SSH fold the probe and prune run inside one
-// docker exec call: the in-container `if ! docker info ...; then exit 1`
-// keeps the destructive prune from running when the inner dockerd is down.
-// The real `runWithCapture` helper in internal/host/exec.go appends the
-// captured stderr to the returned error, so the "inner dockerd not
-// responding" message reaches the caller through the wrapped err. The
-// MockExecutor used here doesn't capture stderr, so the test injects the
-// descriptive message directly via the returned error to mirror the
-// production stderr surface.
+// As of the 2026-08-15 clear+prune fold the clear and prune run inside
+// one SSH round-trip; the inner `docker info` probe keeps the destructive
+// prune from running when the inner dockerd is down. The real
+// `runWithCapture` helper in internal/host/exec.go appends the captured
+// stderr to the returned error, so the "inner dockerd not responding"
+// message reaches the caller through the wrapped err. The MockExecutor
+// used here doesn't capture stderr, so the test injects the descriptive
+// message directly via the returned error to mirror the production
+// stderr surface.
 func TestPruneInnerDockerCache_innerDockerDown(t *testing.T) {
 	t.Parallel()
 	var calls []string
 	h := diskMockHost("linux", &testutil.MockExecutor{
 		RunFn: func(cmd string) (string, error) {
 			calls = append(calls, cmd)
-			// Single docker exec call: probe fails (exit 1). The error
-			// embeds the descriptive message to mirror production stderr
-			// capture — see MockExecutor's stderr note above.
+			// Single combined clear+prune SSH call: probe fails (exit 1).
+			// The error embeds the descriptive message to mirror
+			// production stderr capture.
 			return "", errors.New("exit status 1: inner dockerd not responding in gh-sr-my-1; skipped cache prune")
 		},
 	})
-	err := pruneInnerDockerCache(h, "gh-sr-my-1")
-	if err == nil {
+	m := NewManager("")
+	rc := config.RunnerConfig{Name: "ag", Count: 1, Profile: "agentic"}
+	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{PruneCache: true})
+	if res.Err == nil {
 		t.Fatal("expected error when inner dockerd is down")
 	}
-	if !strings.Contains(err.Error(), "inner dockerd not responding") {
-		t.Errorf("expected descriptive error, got %v", err)
+	if !strings.Contains(res.Err.Error(), "inner dockerd not responding") {
+		t.Errorf("expected descriptive error, got %v", res.Err)
 	}
 	if len(calls) != 1 {
-		t.Errorf("expected 1 SSH call (folded probe+prune), got %d: %v", len(calls), calls)
+		t.Errorf("expected 1 SSH call (folded clear+prune), got %d: %v", len(calls), calls)
 	}
 	if len(calls) == 1 && !strings.Contains(calls[0], `docker exec "gh-sr-my-1" sh -c '`) {
 		t.Errorf("folded probe+prune must run under docker exec sh -c, got %q", calls[0])
@@ -594,28 +597,31 @@ func TestPruneInnerDockerCache_innerDockerDown(t *testing.T) {
 }
 
 // TestPruneInnerDockerCache_happyPath covers the happy path: probe
-// returns "ok" so the destructive prune runs. After the 2026-08-10
-// single-SSH fold, both the probe and prune live inside one docker exec
-// invocation; the test verifies the function returns nil on success and
+// returns "ok" so the destructive prune runs. After the 2026-08-15
+// clear+prune fold, the clear AND the probe+prune live inside one SSH
+// round-trip. The test verifies PruneInstance returns nil on success and
 // that the single SSH call carries both `docker info` and
-// `docker system prune`.
+// `docker system prune` (alongside the clear script's `clear_one` body).
 func TestPruneInnerDockerCache_happyPath(t *testing.T) {
 	t.Parallel()
 	var calls []string
 	h := diskMockHost("linux", &testutil.MockExecutor{
 		RunFn: func(cmd string) (string, error) {
 			calls = append(calls, cmd)
-			if strings.Contains(cmd, "docker info") && strings.Contains(cmd, "docker system prune") {
-				return "", nil
-			}
 			return "", nil
 		},
 	})
-	if err := pruneInnerDockerCache(h, "gh-sr-my-1"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	m := NewManager("")
+	rc := config.RunnerConfig{Name: "ag", Count: 1, Profile: "agentic"}
+	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{PruneCache: true})
+	if res.Err != nil {
+		t.Fatalf("unexpected error: %v", res.Err)
 	}
 	if len(calls) != 1 {
-		t.Fatalf("expected 1 SSH call (folded probe+prune), got %d: %v", len(calls), calls)
+		t.Fatalf("expected 1 SSH call (folded clear+prune), got %d: %v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], "clear_one") {
+		t.Errorf("single SSH call should include the clear body, got %q", calls[0])
 	}
 	if !strings.Contains(calls[0], `docker exec "gh-sr-my-1" sh -c '`) {
 		t.Errorf("single SSH call must run under docker exec sh -c, got %q", calls[0])
@@ -629,10 +635,18 @@ func TestPruneInnerDockerCache_happyPath(t *testing.T) {
 }
 
 // TestPruneInnerDockerCache_probeError covers the case where the underlying
-// SSH call fails (e.g. host unreachable). The function must surface a
+// SSH call fails (e.g. host unreachable). PruneInstance must surface a
 // non-nil error and must not silently succeed — destructive `docker system
 // prune` lives behind the probe branch on the remote side, so the same
 // script handles probe-error and prune-error uniformly.
+//
+// After the 2026-08-15 clear+prune fold, the "inner docker cache prune in
+// <name>:" wrapper prefix lives inside the script body. When SSH itself
+// fails (this case), the script never runs and the wrapper prefix is not
+// emitted — only the raw SSH error reaches the caller. The test asserts
+// the non-nil error; the script-side wrapper is exercised by
+// TestPruneInnerDockerCache_innerDockerDown which probes a healthy SSH
+// with a deliberately-failing inner command.
 func TestPruneInnerDockerCache_probeError(t *testing.T) {
 	t.Parallel()
 	h := diskMockHost("linux", &testutil.MockExecutor{
@@ -640,18 +654,20 @@ func TestPruneInnerDockerCache_probeError(t *testing.T) {
 			return "", errors.New("ssh: connection reset")
 		},
 	})
-	err := pruneInnerDockerCache(h, "gh-sr-my-1")
-	if err == nil {
+	m := NewManager("")
+	rc := config.RunnerConfig{Name: "ag", Count: 1, Profile: "agentic"}
+	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{PruneCache: true})
+	if res.Err == nil {
 		t.Fatal("expected error when SSH fails")
 	}
-	if !strings.Contains(err.Error(), "inner docker cache prune") {
-		t.Errorf("err = %v, want descriptive wrapper", err)
+	if !strings.Contains(res.Err.Error(), "ssh: connection reset") {
+		t.Errorf("err = %v, want raw SSH error surfaced", res.Err)
 	}
 }
 
 func TestClearWorkTempPOSIX_escalatesForContainerMode(t *testing.T) {
 	t.Parallel()
-	script := clearWorkTempPOSIX("rune-agentic-3", true)
+	script := clearWorkTempPOSIX("rune-agentic-3", true, false)
 	if !strings.Contains(script, "docker exec") {
 		t.Fatal("container mode should try docker exec for root-owned _work files")
 	}
@@ -665,12 +681,65 @@ func TestClearWorkTempPOSIX_escalatesForContainerMode(t *testing.T) {
 
 func TestClearWorkTempPOSIX_nativeSkipsDockerExec(t *testing.T) {
 	t.Parallel()
-	script := clearWorkTempPOSIX("ci-1", false)
+	script := clearWorkTempPOSIX("ci-1", false, false)
 	if strings.Contains(script, "docker exec") {
 		t.Fatal("native mode should not use docker exec")
 	}
 	if !strings.Contains(script, "sudo -n") {
 		t.Fatal("expected host sudo fallback")
+	}
+}
+
+// TestClearWorkTempPOSIX_containerPruneCache_emitsPruneBlock pins the
+// 2026-08-15 clear+prune fold: when both containerMode and pruneCache are
+// true, the generated script carries the inner docker prune block (probe +
+// `docker system prune`) in addition to the clear body — all inside one
+// SSH round-trip. The single-SSH invariant matters on
+// `gh sr prune --prune-cache` against a fleet of container-mode runners.
+func TestClearWorkTempPOSIX_containerPruneCache_emitsPruneBlock(t *testing.T) {
+	t.Parallel()
+	script := clearWorkTempPOSIX("rune-agentic-3", true, true)
+	if !strings.Contains(script, "clear_one") {
+		t.Fatal("expected clear body in script")
+	}
+	if !strings.Contains(script, "docker info") {
+		t.Fatal("expected inner dockerd probe in prune block")
+	}
+	if !strings.Contains(script, "docker system prune") {
+		t.Fatal("expected destructive prune in prune block")
+	}
+	if !strings.Contains(script, "gh-sr-rune-agentic-3") {
+		t.Fatal("expected container name in script")
+	}
+}
+
+// TestClearWorkTempPOSIX_containerNoPruneCache_skipsPruneBlock guards
+// against an over-eager fold: when pruneCache is false the script must NOT
+// emit the inner docker prune block, even on container-mode runners.
+// Otherwise a default `gh sr prune` against agentic runners would
+// accidentally drop the inner docker cache — the explicit --prune-cache
+// gate is what preserves the "default keeps cache" behaviour that
+// `TestPruneInstance_defaultKeepsDockerCache` pins at the Go level.
+func TestClearWorkTempPOSIX_containerNoPruneCache_skipsPruneBlock(t *testing.T) {
+	t.Parallel()
+	script := clearWorkTempPOSIX("rune-agentic-3", true, false)
+	if strings.Contains(script, "docker system prune") {
+		t.Fatal("container mode without pruneCache must not emit the destructive prune")
+	}
+}
+
+// TestClearWorkTempPOSIX_nativePruneCache_skipsPruneBlock covers the
+// shape mismatch where the caller asks for pruneCache on a native (not
+// container-mode) runner: pruneCache is only meaningful when the inner
+// dockerd is reachable, so the script must NOT emit the prune block.
+// The Go-level PruneInstance already guards containerMode &&
+// opts.PruneCache before reaching this code path; the test pins that the
+// script generator respects the same gate.
+func TestClearWorkTempPOSIX_nativePruneCache_skipsPruneBlock(t *testing.T) {
+	t.Parallel()
+	script := clearWorkTempPOSIX("ci-1", false, true)
+	if strings.Contains(script, "docker system prune") {
+		t.Fatal("native mode with pruneCache must not emit the destructive prune")
 	}
 }
 
