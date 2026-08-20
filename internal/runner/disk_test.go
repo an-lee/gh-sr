@@ -591,7 +591,7 @@ func TestPruneInnerDockerCache_innerDockerDown(t *testing.T) {
 	if len(calls) != 1 {
 		t.Errorf("expected 1 SSH call (folded clear+prune), got %d: %v", len(calls), calls)
 	}
-	if len(calls) == 1 && !strings.Contains(calls[0], `docker exec "gh-sr-my-1" sh -c '`) {
+	if len(calls) == 1 && !strings.Contains(calls[0], `docker exec "gh-sr-ci-1" sh -c '`) {
 		t.Errorf("folded probe+prune must run under docker exec sh -c, got %q", calls[0])
 	}
 }
@@ -623,7 +623,7 @@ func TestPruneInnerDockerCache_happyPath(t *testing.T) {
 	if !strings.Contains(calls[0], "clear_one") {
 		t.Errorf("single SSH call should include the clear body, got %q", calls[0])
 	}
-	if !strings.Contains(calls[0], `docker exec "gh-sr-my-1" sh -c '`) {
+	if !strings.Contains(calls[0], `docker exec "gh-sr-ci-1" sh -c '`) {
 		t.Errorf("single SSH call must run under docker exec sh -c, got %q", calls[0])
 	}
 	if !strings.Contains(calls[0], "docker info") {
