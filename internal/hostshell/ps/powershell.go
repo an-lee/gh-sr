@@ -12,6 +12,10 @@ const exe = "powershell.exe"
 
 var stdFlags = []string{"-NoProfile", "-NonInteractive", "-Command"}
 
+// runCmd is the exec.Command constructor used by Exec and CombinedOutput.
+// Tests override it to capture argv without spawning powershell.exe.
+var runCmd = exec.Command
+
 // CommandArgs returns argv for exec.Command to run script via powershell.exe.
 func CommandArgs(script string) []string {
 	args := make([]string, 0, 1+len(stdFlags)+1)
@@ -24,13 +28,13 @@ func CommandArgs(script string) []string {
 // Exec runs script via powershell.exe and returns stdout.
 func Exec(script string) ([]byte, error) {
 	args := CommandArgs(script)
-	return exec.Command(args[0], args[1:]...).Output()
+	return runCmd(args[0], args[1:]...).Output()
 }
 
 // CombinedOutput runs script via powershell.exe and returns combined stdout+stderr.
 func CombinedOutput(script string) ([]byte, error) {
 	args := CommandArgs(script)
-	return exec.Command(args[0], args[1:]...).CombinedOutput()
+	return runCmd(args[0], args[1:]...).CombinedOutput()
 }
 
 // CommandLine builds a full command string suitable for host.Host.Run on Windows.
