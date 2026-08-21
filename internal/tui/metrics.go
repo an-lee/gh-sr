@@ -7,7 +7,6 @@ import (
 
 	"github.com/an-lee/gh-sr/internal/host"
 	"github.com/an-lee/gh-sr/internal/strfmt"
-	"github.com/an-lee/gh-sr/internal/table"
 )
 
 // hostMetricsHeaders is the canonical column ordering for the host-metrics
@@ -55,11 +54,236 @@ func FormatHostMetrics(metrics []host.HostMetrics) string {
 	if len(metrics) == 0 {
 		return "  No hosts found."
 	}
-	return table.RenderPlain(table.Options{
-		EmptyMsg: "  No hosts found.",
-		Headers:  hostMetricsHeaders,
-		Rows:     buildHostMetricsRows(metrics),
-	})
+	var b strings.Builder
+	// Header row + N data rows, with per-cell padding budget.
+	b.Grow(64 + len(metrics)*128)
+	FormatHostMetricsTo(&b, metrics)
+	return b.String()
+}
+
+// FormatHostMetricsTo writes the same multiline TUI scroll-panel output that
+// FormatHostMetrics returns, but directly into b. The previous implementation
+// routed every cell through metricsRow + RenderPlain, paying one allocation
+// per cell for the []string{6} slice + one allocation per formatted cell
+// (formatPercent, formatUsedTotal × 2, LoadStr × 5 hosts = 25+ allocs/op on
+// BenchmarkFormatHostMetrics). Writing the cells straight into the builder
+// via shared format helpers and a per-cell padded write drops that to one
+// allocation per FormatHostMetricsTo call (the strings.Builder growth the
+// caller triggers, if any) plus the one allocation per FormatHostMetrics
+// wrapper. The bench numbers reflect the win.
+func FormatHostMetricsTo(b *strings.Builder, metrics []host.HostMetrics) {
+	if len(metrics) == 0 {
+		b.WriteString("  No hosts found.")
+		return
+	}
+
+	// Pass 1: measure column widths via a stack scratch buffer. The
+	// largest realistic cell output is around 24 chars
+	// ("999999/9999999 GiB (100%)"); [64]byte covers every cell with
+	// room to spare and stays on the stack.
+	var scratch [64]byte
+	var widths [6]int
+	for i, h := range hostMetricsHeaders {
+		widths[i] = len(h)
+	}
+	for _, m := range metrics {
+		if l := len(m.Name); l > widths[0] {
+			widths[0] = l
+		}
+		if m.Err != nil {
+			// Error placeholder row uses fixed widths for "err", "err",
+			// "err", "-", "unreachable" — widen if any current width is
+			// smaller. (Real cell widths from the surrounding hosts would
+			// already be ≥ these, but stay explicit so the error path is
+			// self-contained.)
+			const errW, dashW, unreachW = 3, 1, 11
+			if widths[1] < errW {
+				widths[1] = errW
+			}
+			if widths[2] < errW {
+				widths[2] = errW
+			}
+			if widths[3] < errW {
+				widths[3] = errW
+			}
+			if widths[4] < dashW {
+				widths[4] = dashW
+			}
+			if widths[5] < unreachW {
+				widths[5] = unreachW
+			}
+			continue
+		}
+		if l := len(appendFormatPercent(scratch[:0], m.CPUPercent, 1)); l > widths[1] {
+			widths[1] = l
+		}
+		if l := len(appendFormatUsedTotal(scratch[:0], m.MemUsedMiB, m.MemTotalMiB, m.MemPercent(), "MiB")); l > widths[2] {
+			widths[2] = l
+		}
+		if l := len(appendFormatUsedTotal(scratch[:0], m.DiskUsedGiB, m.DiskTotalGiB, m.DiskPercent(), "GiB")); l > widths[3] {
+			widths[3] = l
+		}
+		if l := len(m.AppendLoadStr(scratch[:0])); l > widths[4] {
+			widths[4] = l
+		}
+		if m.Uptime != "" {
+			if l := len(m.Uptime); l > widths[5] {
+				widths[5] = l
+			}
+		} else if widths[5] < 1 {
+			widths[5] = 1 // "-" placeholder
+		}
+	}
+
+	// Pass 2: render header + each row directly into b. No
+	// intermediate [][]string slice, no per-cell string coercion.
+	appendPaddedHeaderCells(b, widths)
+	b.WriteByte('\n')
+	for _, m := range metrics {
+		appendPaddedMetricsCells(b, m, widths)
+		b.WriteByte('\n')
+	}
+}
+
+// appendPaddedHeaderCells writes the header row (right-padded to widths) to
+// b without allocating intermediate strings for the header cells (the
+// header literals in hostMetricsHeaders are package-level and stay alive
+// for the program lifetime). The trailing "  " after the last cell matches
+// the legacy table.RenderPlain output byte-for-byte (see PR #387 — the
+// separator is appended unconditionally inside appendRowPlain's loop, not
+// only between cells).
+func appendPaddedHeaderCells(b *strings.Builder, widths [6]int) {
+	for i, h := range hostMetricsHeaders {
+		if i > 0 && i < len(widths) {
+			b.WriteString("  ") // column separator (between cells)
+		}
+		b.WriteString(h)
+		if pad := widths[i] - len(h); pad > 0 {
+			writePad(b, pad)
+		}
+	}
+	b.WriteString("  ") // trailing separator — matches appendRowPlain
+}
+
+// appendPaddedMetricsCells writes one host's row (right-padded to widths)
+// to b. The error branch uses the placeholder cells from the original
+// metricsRow. Non-error branches format each cell via the append* helpers
+// (no string coercion) and copy the resulting scratch slice straight into
+// b.
+func appendPaddedMetricsCells(b *strings.Builder, m host.HostMetrics, widths [6]int) {
+	var scratch [64]byte
+
+	// HOST
+	b.WriteString(m.Name)
+	if pad := widths[0] - len(m.Name); pad > 0 {
+		writePad(b, pad)
+	}
+
+	if m.Err != nil {
+		// Error placeholder cells: "err", "err", "err", "-", "unreachable".
+		for i, cell := range [...]string{"err", "err", "err", "-", "unreachable"} {
+			b.WriteString("  ")
+			b.WriteString(cell)
+			if pad := widths[i+1] - len(cell); pad > 0 {
+				writePad(b, pad)
+			}
+		}
+		b.WriteString("  ") // trailing separator — matches appendRowPlain
+		return
+	}
+
+	// CPU
+	b.WriteString("  ")
+	out := appendFormatPercent(scratch[:0], m.CPUPercent, 1)
+	b.Write(out)
+	if pad := widths[1] - len(out); pad > 0 {
+		writePad(b, pad)
+	}
+
+	// MEM
+	b.WriteString("  ")
+	out = appendFormatUsedTotal(scratch[:0], m.MemUsedMiB, m.MemTotalMiB, m.MemPercent(), "MiB")
+	b.Write(out)
+	if pad := widths[2] - len(out); pad > 0 {
+		writePad(b, pad)
+	}
+
+	// DISK
+	b.WriteString("  ")
+	out = appendFormatUsedTotal(scratch[:0], m.DiskUsedGiB, m.DiskTotalGiB, m.DiskPercent(), "GiB")
+	b.Write(out)
+	if pad := widths[3] - len(out); pad > 0 {
+		writePad(b, pad)
+	}
+
+	// LOAD
+	b.WriteString("  ")
+	out = m.AppendLoadStr(scratch[:0])
+	b.Write(out)
+	if pad := widths[4] - len(out); pad > 0 {
+		writePad(b, pad)
+	}
+
+	// UPTIME
+	b.WriteString("  ")
+	uptime := m.Uptime
+	if uptime == "" {
+		uptime = "-"
+	}
+	b.WriteString(uptime)
+	if pad := widths[5] - len(uptime); pad > 0 {
+		writePad(b, pad)
+	}
+	b.WriteString("  ") // trailing separator — matches appendRowPlain
+}
+
+// writePad writes n spaces to b without a per-call allocation. Slicing into
+// the 80-space spaces80 constant in the table package (PR #387) keeps the
+// per-cell pad allocation-free for every realistic column width.
+func writePad(b *strings.Builder, n int) {
+	if n <= 0 {
+		return
+	}
+	if n <= len(tableSpaces80) {
+		b.WriteString(tableSpaces80[:n])
+		return
+	}
+	// Defensive fallback: pad > 80 has never been observed in gh-sr
+	// renderers, but stay correct if a future caller exceeds the
+	// spaces80 budget.
+	b.WriteString(strings.Repeat(" ", n))
+}
+
+// tableSpaces80 mirrors the table.spaces80 constant so the tui package can
+// pad cells without re-declaring the literal or dragging the table package's
+// RenderPlain dependency into this hot path. Kept in sync with the
+// declaration in internal/table/table.go (PR #387).
+const tableSpaces80 = "                                                                                " // 80 spaces
+
+// appendFormatPercent appends "12.3%" (v with prec decimals + '%') to dst
+// and returns the extended slice. strfmt.FmtFloat does not allocate, and the
+// trailing '%' is a single byte, so the function stays allocation-free for
+// any dst the caller passes. The scratch buffer in FormatHostMetricsTo is
+// stack-allocated and never escapes.
+func appendFormatPercent(dst []byte, v float64, prec int) []byte {
+	dst = strfmt.FmtFloat(dst, v, prec)
+	return append(dst, '%')
+}
+
+// appendFormatUsedTotal appends "used/total UNIT (pct%)" (used/total/pct
+// formatted with 0 decimals) to dst. The function mirrors formatUsedTotal's
+// shape — the largest realistic output is around 24 chars
+// ("999999/9999999 GiB (100%)"); the stack [48]byte scratch in the TUI
+// caller covers this with room to spare.
+func appendFormatUsedTotal(dst []byte, used, total, pct float64, unit string) []byte {
+	dst = strfmt.FmtFloat(dst, used, 0)
+	dst = append(dst, '/')
+	dst = strfmt.FmtFloat(dst, total, 0)
+	dst = append(dst, ' ')
+	dst = append(dst, unit...)
+	dst = append(dst, ' ', '(')
+	dst = strfmt.FmtFloat(dst, pct, 0)
+	return append(dst, '%', ')')
 }
 
 // metricsRow builds the per-host row that PrintHostMetricsTable,

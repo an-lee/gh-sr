@@ -74,6 +74,28 @@ func (m HostMetrics) LoadStr() string {
 	return string(b)
 }
 
+// AppendLoadStr is the builder-style sibling of LoadStr: it appends the
+// three-load-average representation ("l1 l5 l15" with 2-decimal precision, or
+// "-" when all three are zero) to dst and returns the extended slice. The
+// output stays entirely on the caller's dst slice — no heap allocation is
+// incurred for the formatted text, which is what FormatHostMetricsTo needs
+// to write the load cell directly into its strings.Builder without going
+// through a string round-trip.
+//
+// [40]byte is comfortably larger than the worst-case 17-char output, so the
+// typical usage pattern (FormatHostMetricsTo passes a stack-allocated
+// scratch buffer) never escapes to the heap.
+func (m HostMetrics) AppendLoadStr(dst []byte) []byte {
+	if m.Load1 == 0 && m.Load5 == 0 && m.Load15 == 0 {
+		return append(dst, '-')
+	}
+	dst = strfmt.FmtFloat(dst, m.Load1, 2)
+	dst = append(dst, ' ')
+	dst = strfmt.FmtFloat(dst, m.Load5, 2)
+	dst = append(dst, ' ')
+	return strfmt.FmtFloat(dst, m.Load15, 2)
+}
+
 // CollectMetrics gathers resource usage from the host.
 // It runs a single compound shell command to minimise round-trips.
 func (h *Host) CollectMetrics() HostMetrics {
