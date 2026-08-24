@@ -82,10 +82,10 @@ func BenchmarkMetricsRow(b *testing.B) {
 	}
 }
 
-// BenchmarkFormatHostMetrics measures the full FormatHostMetrics path: the
-// per-row metricsRow + per-cell padding work that produces the TUI
-// scroll-panel string. It runs once per host-metric refresh tick per
-// View() call, so its alloc count compounds across long sessions.
+// BenchmarkFormatHostMetrics measures the full FormatHostMetricsTo path: the
+// per-cell padding work that produces the TUI scroll-panel string. It runs
+// once per host-metric refresh tick per View() call, so its alloc count
+// compounds across long sessions.
 func BenchmarkFormatHostMetrics(b *testing.B) {
 	samples := []host.HostMetrics{
 		{Name: "h1", CPUPercent: 12.3, MemUsedMiB: 1024, MemTotalMiB: 4096, DiskUsedGiB: 50, DiskTotalGiB: 200, Load1: 0.5, Load5: 0.4, Load15: 0.3, Uptime: "5d"},
@@ -97,7 +97,9 @@ func BenchmarkFormatHostMetrics(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = FormatHostMetrics(samples)
+		var sb strings.Builder
+		sb.Grow(64 + len(samples)*128)
+		FormatHostMetricsTo(&sb, samples)
 	}
 }
 
@@ -143,10 +145,13 @@ func TestFormatHostMetrics(t *testing.T) {
 		{Name: "h2", CPUPercent: 78.9, MemUsedMiB: 8192, MemTotalMiB: 16384, DiskUsedGiB: 100, DiskTotalGiB: 250, Load1: 2.5, Load5: 2.1, Load15: 1.8, Uptime: "12d"},
 		{Name: "h3", Err: errSynthetic("ssh: handshake timeout")},
 	}
-	got := FormatHostMetrics(metrics)
+	var b strings.Builder
+	b.Grow(64 + len(metrics)*128)
+	FormatHostMetricsTo(&b, metrics)
+	got := b.String()
 	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
 	if len(lines) != 4 { // 1 header + 3 data rows
-		t.Fatalf("FormatHostMetrics: got %d lines, want 4 (1 header + 3 data rows). Output:\n%s", len(lines), got)
+		t.Fatalf("FormatHostMetricsTo: got %d lines, want 4 (1 header + 3 data rows). Output:\n%s", len(lines), got)
 	}
 	if !strings.HasSuffix(got, "\n") {
 		t.Errorf("output should end with newline, got: %q", got[len(got)-5:])
@@ -165,7 +170,9 @@ func TestFormatHostMetrics(t *testing.T) {
 	}
 
 	// Empty input → "No hosts found." (matches old behavior).
-	empty := FormatHostMetrics(nil)
+	var emptyB strings.Builder
+	FormatHostMetricsTo(&emptyB, nil)
+	empty := emptyB.String()
 	if empty != "  No hosts found." {
 		t.Errorf("empty input: got %q, want %q", empty, "  No hosts found.")
 	}
@@ -184,7 +191,10 @@ func TestFormatHostMetrics_ColumnAlignment(t *testing.T) {
 	metrics := []host.HostMetrics{
 		{Name: "h1", CPUPercent: 12.3, MemUsedMiB: 1024, MemTotalMiB: 4096, DiskUsedGiB: 50, DiskTotalGiB: 200, Load1: 0.5, Load5: 0.4, Load15: 0.3, Uptime: "5d"},
 	}
-	got := FormatHostMetrics(metrics)
+	var b strings.Builder
+	b.Grow(64 + len(metrics)*128)
+	FormatHostMetricsTo(&b, metrics)
+	got := b.String()
 	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
 	data := lines[1]
 	if !strings.HasPrefix(data, "h1 ") {

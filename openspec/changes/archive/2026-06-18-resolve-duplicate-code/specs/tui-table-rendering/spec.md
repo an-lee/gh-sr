@@ -6,7 +6,7 @@ The TUI package SHALL provide `computeColumnWidths(headers []string, rows [][]st
 
 #### Scenario: Host metrics table uses shared width helper
 
-- **WHEN** `PrintHostMetricsTable` or `FormatHostMetrics` renders a metrics table
+- **WHEN** `PrintHostMetricsTable` or `FormatHostMetricsTo` renders a metrics table
 - **THEN** column widths MUST be computed via `computeColumnWidths`
 
 #### Scenario: Runner status table uses shared width helper

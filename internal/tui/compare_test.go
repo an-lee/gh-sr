@@ -10,7 +10,7 @@ import (
 )
 
 // TestFormatHostMetrics_NewPath_ByteIdentical compares the new builder-direct
-// FormatHostMetrics path output against the legacy RenderPlain path output
+// FormatHostMetricsTo path output against the legacy RenderPlain path output
 // for a representative set of metrics. The two paths must produce the
 // exact same string for every input.
 func TestFormatHostMetrics_NewPath_ByteIdentical(t *testing.T) {
@@ -63,7 +63,10 @@ func TestFormatHostMetrics_NewPath_ByteIdentical(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := FormatHostMetrics(tc.metrics)
+			var sb strings.Builder
+			sb.Grow(64 + len(tc.metrics)*128)
+			FormatHostMetricsTo(&sb, tc.metrics)
+			got := sb.String()
 
 			// Re-derive the expected output via the legacy path
 			// (buildHostMetricsRows + table.RenderPlain). This locks
@@ -82,7 +85,7 @@ func TestFormatHostMetrics_NewPath_ByteIdentical(t *testing.T) {
 			}
 
 			if got != legacy {
-				t.Errorf("FormatHostMetrics byte-mismatch with legacy RenderPlain path.\n--- new ---\n%s\n--- legacy ---\n%s\n--- diff ---\n%s",
+				t.Errorf("FormatHostMetricsTo byte-mismatch with legacy RenderPlain path.\n--- new ---\n%s\n--- legacy ---\n%s\n--- diff ---\n%s",
 					got, legacy, diffLines(got, legacy))
 			}
 		})
