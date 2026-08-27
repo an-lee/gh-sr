@@ -713,6 +713,55 @@ func TestClearWorkTempPOSIX_containerPruneCache_emitsPruneBlock(t *testing.T) {
 	}
 }
 
+// TestClearWorkTempPOSIX_containerPruneCache_runsAfterPlainClear catches the
+// control-flow case where _work/_temp were already clearable by the host user:
+// the script must still run the requested inner Docker prune instead of
+// returning success immediately after the clear loop.
+func TestClearWorkTempPOSIX_containerPruneCache_runsAfterPlainClear(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	runnerDir := filepath.Join(home, ".gh-sr", "runners", "ci-1")
+	if err := os.MkdirAll(filepath.Join(runnerDir, "_work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(runnerDir, "_temp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	dockerLog := filepath.Join(t.TempDir(), "docker.log")
+	dockerPath := filepath.Join(binDir, "docker")
+	dockerScript := `#!/bin/sh
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+exit 0
+`
+	if err := os.WriteFile(dockerPath, []byte(dockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sh", "-c", clearWorkTempPOSIX("ci-1", true, true))
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"DOCKER_LOG="+dockerLog,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+
+	log, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "exec gh-sr-ci-1 sh -c") {
+		t.Fatalf("expected prune docker exec after plain clear, log:\n%s", log)
+	}
+	if !strings.Contains(string(log), "docker system prune") {
+		t.Fatalf("expected inner prune script in docker exec args, log:\n%s", log)
+	}
+}
+
 // TestClearWorkTempPOSIX_containerNoPruneCache_skipsPruneBlock guards
 // against an over-eager fold: when pruneCache is false the script must NOT
 // emit the inner docker prune block, even on container-mode runners.

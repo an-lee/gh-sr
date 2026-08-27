@@ -828,24 +828,25 @@ need_elev=0
 for sub in _work _temp; do
   clear_one "$dir/$sub" || need_elev=1
 done
-if [ "$need_elev" -eq 0 ]; then exit 0; fi
+if [ "$need_elev" -ne 0 ]; then
 %s
 %s
-if [ -n "$SUDO" ] || [ "$(id -u)" -eq 0 ]; then
+  if [ -n "$SUDO" ] || [ "$(id -u)" -eq 0 ]; then
+    for sub in _work _temp; do
+      p="$dir/$sub"
+      if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
+        find "$p" -mindepth 1 -maxdepth 1 -exec $SUDO rm -rf {} + 2>/dev/null || true
+      fi
+    done
+  fi
   for sub in _work _temp; do
     p="$dir/$sub"
     if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
-      find "$p" -mindepth 1 -maxdepth 1 -exec $SUDO rm -rf {} + 2>/dev/null || true
+      echo "disk prune: cannot remove files in $p (permission denied); for container runners ensure the container is running or use passwordless sudo on the host" >&2
+      exit 1
     fi
   done
 fi
-for sub in _work _temp; do
-  p="$dir/$sub"
-  if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
-    echo "disk prune: cannot remove files in $p (permission denied); for container runners ensure the container is running or use passwordless sudo on the host" >&2
-    exit 1
-  fi
-done
 %s
 `, posixScriptHeader(instance), containerBlock, passwordlessSudo(), pruneBlock)
 }
