@@ -95,6 +95,64 @@ func RemoteBoolCheck(h *host.Host, condCmd string) (bool, error) {
 	return strings.TrimSpace(out) == "yes", nil
 }
 
+// PowerShellRunner is the function signature shared by h.RunShell (remote)
+// and local PowerShell exec adapters. It runs a PowerShell script and returns
+// the string output. Defined so the Windows helpers below work for both local
+// (diskschedule) and remote (autostart, runner) callers.
+type PowerShellRunner func(script string) (string, error)
+
+// PowerShellBoolCheck is the Windows/PowerShell counterpart of RemoteBoolCheck.
+// It wraps condPS in the canonical `if (condPS) { 'yes' } else { 'no' }`
+// idiom, runs it via run, and returns whether the output was "yes".
+// condPS must be a complete PowerShell condition expression (e.g.
+// `Get-ScheduledTask -TaskName 'foo' -ErrorAction SilentlyContinue`).
+func PowerShellBoolCheck(run PowerShellRunner, condPS string) (bool, error) {
+	out, err := run(fmt.Sprintf(`if (%s) { 'yes' } else { 'no' }`, condPS))
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "yes", nil
+}
+
+// ScheduledTaskExists reports whether a Windows scheduled task with the given
+// name exists on the target host. The name is escaped via
+// PowerShellSingleQuote. Works for both local and remote callers — pass
+// hostshell.PowerShellExec adapted to PowerShellRunner for local, or
+// h.RunShell for remote.
+func ScheduledTaskExists(run PowerShellRunner, name string) (bool, error) {
+	cond := fmt.Sprintf(`Get-ScheduledTask -TaskName %s -ErrorAction SilentlyContinue`, PowerShellSingleQuote(name))
+	return PowerShellBoolCheck(run, cond)
+}
+
+// ScheduledTaskState returns the raw State property (e.g. "Ready", "Running")
+// of the named Windows scheduled task. Returns an error if the task does not
+// exist or the query fails. The name is escaped via PowerShellSingleQuote.
+func ScheduledTaskState(run PowerShellRunner, name string) (string, error) {
+	out, err := run(fmt.Sprintf(
+		`(Get-ScheduledTask -TaskName %s -ErrorAction SilentlyContinue | Select-Object -ExpandProperty State)`,
+		PowerShellSingleQuote(name),
+	))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// RemoteWindowsDirExists reports whether a directory exists at path on a
+// Windows host. It is the Windows counterpart of RemoteDirExists, using
+// `Test-Path -LiteralPath ... -PathType Container`. The path is escaped via
+// PowerShellSingleQuote.
+func RemoteWindowsDirExists(h *host.Host, path string) (bool, error) {
+	out, err := h.RunShell(fmt.Sprintf(
+		`if (Test-Path -LiteralPath %s -PathType Container) { 'yes' } else { 'no' }`,
+		PowerShellSingleQuote(path),
+	))
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "yes", nil
+}
+
 // WriteRemoteBytes writes data to a remote path using base64 (POSIX) or PowerShell (Windows).
 // Parent directories are created on the host.
 func WriteRemoteBytes(h *host.Host, remotePath string, data []byte) error {

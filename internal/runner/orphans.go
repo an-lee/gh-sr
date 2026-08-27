@@ -3,7 +3,6 @@ package runner
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/an-lee/gh-sr/internal/autostart"
 	"github.com/an-lee/gh-sr/internal/config"
@@ -160,15 +159,11 @@ func (m *Manager) CleanupOrphanInstance(h *host.Host, instance string, dryRun bo
 }
 
 func instanceDirectoryExists(h *host.Host, instance string) (bool, error) {
-	dir := h.RunnerDir(instance)
 	if h.OS == "windows" {
-		out, err := h.RunShell(fmt.Sprintf("if (Test-Path -LiteralPath %s -PathType Container) { 'yes' } else { 'no' }", h.RunnerDirPS(instance)))
-		if err != nil {
-			return false, err
-		}
-		return strings.TrimSpace(out) == "yes", nil
+		return hostshell.RemoteWindowsDirExists(h, h.RunnerDir(instance))
 	}
 	// dir carries a literal $HOME that the remote sh must expand; pass it raw
 	// (RemoteDirExists would PosixSingleQuote it and freeze $HOME).
+	dir := h.RunnerDir(instance)
 	return hostshell.RemoteBoolCheck(h, "test -d "+dir)
 }
