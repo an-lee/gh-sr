@@ -131,9 +131,10 @@ func TestRenderPlain_rows(t *testing.T) {
 	}
 }
 
-// TestRenderPlain_ragged pins the contract that callers (FormatHostMetrics)
-// rely on: ragged rows (cells beyond len(widths)) are truncated at the
-// widths boundary instead of panicking. Mirrors TestPrintRow's behavior.
+// TestRenderPlain_ragged pins the contract that callers (FormatHostMetricsTo,
+// PrintHostMetricsTable, disk-usage tables) rely on: ragged rows (cells beyond
+// len(widths)) are truncated at the widths boundary instead of panicking.
+// Mirrors TestPrintRow's behavior.
 func TestRenderPlain_ragged(t *testing.T) {
 	t.Parallel()
 	got := RenderPlain(Options{

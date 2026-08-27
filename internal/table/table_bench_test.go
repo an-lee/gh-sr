@@ -2,7 +2,7 @@ package table
 
 import "testing"
 
-// renderPlainRows mirrors the FormatHostMetrics row shape (6 columns) so
+// renderPlainRows mirrors the FormatHostMetricsTo row shape (6 columns) so
 // the bench exercises the same padding workload as the TUI host-metrics
 // render path. Realistic cell widths are uneven so most cells trigger
 // the right-pad branch.

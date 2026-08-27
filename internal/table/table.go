@@ -87,7 +87,7 @@ func RenderPlain(opts Options) string {
 
 // spaces80 is a 80-space string used by appendRowPlain to right-pad cells
 // without allocating per cell. The maximum realistic column width in the
-// gh-sr renderers (FormatHostMetrics, PrintHostMetricsTable, disk-usage
+// gh-sr renderers (FormatHostMetricsTo, PrintHostMetricsTable, disk-usage
 // tables) is well under 80 bytes, so slicing into spaces80 covers every
 // observed cell without ever needing strings.Repeat. If a caller ever
 // exceeds 80, appendRowPlain falls back to strings.Repeat for the excess.

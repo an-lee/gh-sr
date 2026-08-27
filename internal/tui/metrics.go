@@ -10,14 +10,14 @@ import (
 )
 
 // hostMetricsHeaders is the canonical column ordering for the host-metrics
-// table shared by PrintHostMetricsTable, FormatHostMetrics, and viewHostMetrics.
+// table shared by PrintHostMetricsTable and viewHostMetrics.
 // Keep this slice in sync with metricsRow so a column rename does not silently
-// misalign the three renderers.
+// misalign the two renderers.
 var hostMetricsHeaders = []string{"HOST", "CPU", "MEMORY", "DISK", "LOAD AVG", "UPTIME"}
 
-// buildHostMetricsRows maps metrics → the per-row string slices used by all
-// three host-metrics renderers. Centralising the row construction keeps the
-// header literal and metricsRow call in one place.
+// buildHostMetricsRows maps metrics → the per-row string slices used by both
+// host-metrics renderers. Centralising the row construction keeps the header
+// literal and metricsRow call in one place.
 func buildHostMetricsRows(metrics []host.HostMetrics) [][]string {
 	rows := make([][]string, len(metrics))
 	for i, m := range metrics {
@@ -28,9 +28,8 @@ func buildHostMetricsRows(metrics []host.HostMetrics) [][]string {
 
 // hostMetricsColorize highlights CPU/MEMORY/DISK percentage cells (columns
 // 1..3) using colorizePercent. Non-percentage cells pass through unchanged.
-// Shared by the styled host-metrics renderers (PrintHostMetricsTable +
-// viewHostMetrics); the plain-text renderer FormatHostMetrics does not apply
-// colorization since table.RenderPlain has no Colorize hook.
+// Shared by both host-metrics renderers (PrintHostMetricsTable +
+// viewHostMetrics).
 func hostMetricsColorize(col int, cell string) string {
 	if col >= 1 && col <= 3 {
 		return colorizePercent(cell)
@@ -49,28 +48,14 @@ func PrintHostMetricsTable(metrics []host.HostMetrics) {
 	})
 }
 
-// FormatHostMetrics returns a styled multiline string suitable for the TUI scroll panel.
-func FormatHostMetrics(metrics []host.HostMetrics) string {
-	if len(metrics) == 0 {
-		return "  No hosts found."
-	}
-	var b strings.Builder
-	// Header row + N data rows, with per-cell padding budget.
-	b.Grow(64 + len(metrics)*128)
-	FormatHostMetricsTo(&b, metrics)
-	return b.String()
-}
-
-// FormatHostMetricsTo writes the same multiline TUI scroll-panel output that
-// FormatHostMetrics returns, but directly into b. The previous implementation
-// routed every cell through metricsRow + RenderPlain, paying one allocation
-// per cell for the []string{6} slice + one allocation per formatted cell
-// (formatPercent, formatUsedTotal × 2, LoadStr × 5 hosts = 25+ allocs/op on
-// BenchmarkFormatHostMetrics). Writing the cells straight into the builder
-// via shared format helpers and a per-cell padded write drops that to one
-// allocation per FormatHostMetricsTo call (the strings.Builder growth the
-// caller triggers, if any) plus the one allocation per FormatHostMetrics
-// wrapper. The bench numbers reflect the win.
+// FormatHostMetricsTo writes the host-metrics table directly into b without
+// routing cells through metricsRow + RenderPlain (which would allocate a
+// []string{6} slice per cell + a fresh string per formatted cell — ~25+
+// allocs/op on the previous BenchmarkFormatHostMetrics). Writing each cell
+// via the shared append* helpers and a per-cell padded write keeps the
+// allocation count at one strings.Builder growth per call (the buffer
+// pre-sizing done by the caller, if any) plus whatever the helper functions
+// allocate internally. The bench numbers reflect the win.
 func FormatHostMetricsTo(b *strings.Builder, metrics []host.HostMetrics) {
 	if len(metrics) == 0 {
 		b.WriteString("  No hosts found.")
@@ -286,10 +271,9 @@ func appendFormatUsedTotal(dst []byte, used, total, pct float64, unit string) []
 	return append(dst, '%', ')')
 }
 
-// metricsRow builds the per-host row that PrintHostMetricsTable,
-// FormatHostMetrics, and viewHostMetrics all render. The error branch
-// produces a recognizable placeholder row so a single unreachable host
-// does not blank the table.
+// metricsRow builds the per-host row that PrintHostMetricsTable and
+// viewHostMetrics both render. The error branch produces a recognizable
+// placeholder row so a single unreachable host does not blank the table.
 func metricsRow(m host.HostMetrics) []string {
 	if m.Err != nil {
 		return []string{m.Name, "err", "err", "err", "-", "unreachable"}
