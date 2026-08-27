@@ -111,6 +111,10 @@ make bench    # run all benchmarks with memory stats
 
 Repository layout is described in [docs/reference/file-structure.md](docs/reference/file-structure.md).
 
+### Git blame
+
+The repo ships with a [`.git-blame-ignore-revs`](.git-blame-ignore-revs) file so `git blame` skips large code-movement commits (refactors, helper extractions, SSH round-trip folds) and surfaces the original author. Run `make blame-ignore` once to configure your local repo. GitHub's web UI picks up the file automatically.
+
 ## Publishing documentation (maintainers)
 
 Documentation deploys to GitHub Pages via **GitHub Actions** when changes land on `main`. In the GitHub repo, enable **Settings → Pages → Build and deployment → Source: GitHub Actions** once (no branch-based `/docs` hosting required for the built site).
