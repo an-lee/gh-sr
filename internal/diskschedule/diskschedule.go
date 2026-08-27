@@ -38,6 +38,16 @@ var (
 	powerShellCombinedOutput = hostshell.PowerShellCombinedOutput
 )
 
+// localPSRunner adapts a ([]byte, error) PowerShell executor to the
+// hostshell.PowerShellRunner (string, error) signature so the hostshell
+// Windows helpers can be used for local execution.
+func localPSRunner(exec func(string) ([]byte, error)) hostshell.PowerShellRunner {
+	return func(script string) (string, error) {
+		out, err := exec(script)
+		return string(out), err
+	}
+}
+
 // ScheduleKind describes how disk prune scheduling is installed locally.
 type ScheduleKind string
 
@@ -80,11 +90,11 @@ func Detect() (ScheduleKind, error) {
 		}
 		return KindNone, nil
 	case "windows":
-		out, err := powerShellExec(fmt.Sprintf(`if (Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }`, serviceBase))
+		exists, err := hostshell.ScheduledTaskExists(localPSRunner(powerShellExec), serviceBase)
 		if err != nil {
 			return KindNone, err
 		}
-		if strings.TrimSpace(string(out)) == "yes" {
+		if exists {
 			return KindWindowsTask, nil
 		}
 		return KindNone, nil
@@ -159,11 +169,11 @@ func Status() (ScheduleKind, string, error) {
 	case KindLaunchd:
 		return kind, "installed (launchd): " + labelBase + ".plist", nil
 	case KindWindowsTask:
-		out, err := powerShellExec(fmt.Sprintf(`(Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty State)`, serviceBase))
+		state, err := hostshell.ScheduledTaskState(localPSRunner(powerShellExec), serviceBase)
 		if err != nil {
 			return kind, "installed (task): error " + err.Error(), nil
 		}
-		return kind, "installed (task): " + strings.TrimSpace(string(out)), nil
+		return kind, "installed (task): " + state, nil
 	default:
 		return kind, string(kind), nil
 	}

@@ -1,6 +1,7 @@
 package hostshell
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -154,4 +155,139 @@ func TestLinuxElevatePreludeSoft(t *testing.T) {
 			t.Errorf("LinuxElevatePreludeSoft must not contain %q (strict-variant behaviour) but got:\n%s", banned, got)
 		}
 	}
+}
+
+func TestPowerShellBoolCheck(t *testing.T) {
+	t.Parallel()
+	t.Run("yes output returns true", func(t *testing.T) {
+		t.Parallel()
+		var gotScript string
+		runner := func(script string) (string, error) {
+			gotScript = script
+			return "yes\n", nil
+		}
+		ok, err := PowerShellBoolCheck(runner, "Get-Something -Name 'foo'")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal("expected true")
+		}
+		if !strings.Contains(gotScript, "if (") || !strings.Contains(gotScript, "Get-Something") {
+			t.Fatalf("script = %q; want wrapped condition", gotScript)
+		}
+	})
+	t.Run("no output returns false", func(t *testing.T) {
+		t.Parallel()
+		runner := func(string) (string, error) { return "no\r\n", nil }
+		ok, err := PowerShellBoolCheck(runner, "cond")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatal("expected false")
+		}
+	})
+	t.Run("error propagates", func(t *testing.T) {
+		t.Parallel()
+		runner := func(string) (string, error) { return "", errors.New("boom") }
+		_, err := PowerShellBoolCheck(runner, "cond")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestScheduledTaskExists(t *testing.T) {
+	t.Parallel()
+	t.Run("task present", func(t *testing.T) {
+		t.Parallel()
+		var gotScript string
+		runner := func(script string) (string, error) {
+			gotScript = script
+			return "yes", nil
+		}
+		ok, err := ScheduledTaskExists(runner, "my-task")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal("expected true")
+		}
+		if !strings.Contains(gotScript, "Get-ScheduledTask") || !strings.Contains(gotScript, "-TaskName") {
+			t.Fatalf("script = %q; want Get-ScheduledTask probe", gotScript)
+		}
+		// Name must be single-quoted (PowerShellSingleQuote).
+		if !strings.Contains(gotScript, "'my-task'") {
+			t.Fatalf("script = %q; name not properly quoted", gotScript)
+		}
+	})
+	t.Run("task absent", func(t *testing.T) {
+		t.Parallel()
+		runner := func(string) (string, error) { return "no", nil }
+		ok, err := ScheduledTaskExists(runner, "gone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatal("expected false")
+		}
+	})
+	t.Run("apostrophe in name is safely quoted", func(t *testing.T) {
+		t.Parallel()
+		var gotScript string
+		runner := func(script string) (string, error) {
+			gotScript = script
+			return "yes", nil
+		}
+		_, err := ScheduledTaskExists(runner, "O'Brien")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// PowerShellSingleQuote doubles apostrophes: O'Brien → 'O''Brien'
+		if !strings.Contains(gotScript, "'O''Brien'") {
+			t.Fatalf("script = %q; apostrophe not safely escaped", gotScript)
+		}
+	})
+	t.Run("error propagates", func(t *testing.T) {
+		t.Parallel()
+		runner := func(string) (string, error) { return "", errors.New("ps failed") }
+		_, err := ScheduledTaskExists(runner, "task")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestScheduledTaskState(t *testing.T) {
+	t.Parallel()
+	t.Run("returns trimmed state", func(t *testing.T) {
+		t.Parallel()
+		var gotScript string
+		runner := func(script string) (string, error) {
+			gotScript = script
+			return "Ready\r\n", nil
+		}
+		state, err := ScheduledTaskState(runner, "my-task")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state != "Ready" {
+			t.Fatalf("state = %q; want Ready", state)
+		}
+		if !strings.Contains(gotScript, "Select-Object -ExpandProperty State") {
+			t.Fatalf("script = %q; missing state extraction", gotScript)
+		}
+		if !strings.Contains(gotScript, "'my-task'") {
+			t.Fatalf("script = %q; name not properly quoted", gotScript)
+		}
+	})
+	t.Run("error propagates", func(t *testing.T) {
+		t.Parallel()
+		runner := func(string) (string, error) { return "", errors.New("state failed") }
+		_, err := ScheduledTaskState(runner, "task")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
 }

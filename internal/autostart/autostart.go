@@ -104,12 +104,11 @@ func Detect(h *host.Host, instance string) (Kind, error) {
 
 	case "windows":
 		name := WindowsTaskName(san)
-		ps := fmt.Sprintf(`if (Get-ScheduledTask -TaskName %s -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }`, hostshell.PowerShellSingleQuote(name))
-		out, err := h.RunShell(ps)
+		exists, err := hostshell.ScheduledTaskExists(h.RunShell, name)
 		if err != nil {
 			return KindNone, err
 		}
-		if strings.TrimSpace(out) == "yes" {
+		if exists {
 			return KindWindowsTask, nil
 		}
 		return KindNone, nil

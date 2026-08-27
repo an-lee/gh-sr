@@ -34,11 +34,7 @@ $SUDO systemctl is-active %s.service 2>/dev/null || echo inactive
 
 	case KindWindowsTask:
 		name := WindowsTaskName(san)
-		ps := fmt.Sprintf(
-			`(Get-ScheduledTask -TaskName %s -ErrorAction SilentlyContinue | Select-Object -ExpandProperty State)`,
-			hostshell.PowerShellSingleQuote(name),
-		)
-		return h.RunShell(ps)
+		return hostshell.ScheduledTaskState(h.RunShell, name)
 	}
 	return "", nil
 }
