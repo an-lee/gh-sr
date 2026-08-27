@@ -1,0 +1,55 @@
+# .git-blame-ignore-revs
+#
+# Skip large code-movement commits in `git blame` so the output points at the
+# original author instead of an intermediate refactor.
+#
+# Local setup (one-time):
+#   git config --local blame.ignoreRevsFile .git-blame-ignore-revs
+#   # or simply:  make blame-ignore
+#
+# GitHub's web UI reads this file automatically once it exists on the default
+# branch — no per-user configuration needed there.
+#
+# Convention: oldest-first. Append new entries at the bottom.
+
+# refactor(tui): dedupe runner-status headers + colorize callback (#346) (#348)
+30b739d3c0c5e88e70becd4e15c9ca930fa88c56
+
+# refactor(tui): dedupe updateFilterHost and updateFilterRepo (#351)
+41fed0d37246b62f612ebfd801bf62f2a57aae57
+
+# perf(tui): zero-alloc extractTrailingPercent + docs cleanup (#340)
+b3c26c5a432a7ec3ed5e93648bc868018d6846b7
+
+# refactor(runner): collapse nil-positive accessor envelope into nilPositiveInt helper (#319)
+48988eab286d0eff0752a88b7f592dccfb2d5b6b
+
+# refactor(runner): mirror windowsNativeConfigScript with nativeShellConfigScript (#320)
+830505aec8da1313f700aff41b02cb3d3ab152c6
+
+# perf(strfmt): share zero-alloc FmtFloat across tui + runner (#347) (#349)
+15d2ac1fffdaf7a7ee1b4ccaf860ae1793bc3dfb
+
+# perf(runner): share posixInstanceEscaper + drop Sprintf in posixRunnerDirVar (#353)
+98e085cfa7ec095db4e115db867415159ecc59dc
+
+# perf(host): zero-alloc LoadStr via stack buffer + AppendFloat (#355)
+4f98414f331f96d4f2d9fc81d49857fcb03e786f
+
+# refactor(agentic): consolidate container probe metadata into single source of truth
+a5405b92b44bc6432eab1d4fa9152a72551ca505
+
+# refactor(doctor): consolidate GitHub-API repo/org check + print loops
+ef6dbbccd071dd635f2045b895407305a1dfbf71
+
+# perf(runner): fold PlanOrphanCleanup 3 SSH probes into 1 on Linux (#358)
+9becca6b8a974d1aa2ef9b539dacaa914de86ca3
+
+# perf(runner): combine Start/Stop svc+autostart probe into 1 SSH round-trip (#361)
+e774249d02a0ece326e2057ebd4ca00d69270357
+
+# refactor(benchstat): remove dead FormatDelta API (#375)
+8da99f8a8094e5a823ed165fff1ea81de347ccfe
+
+# refactor(tui): remove dead FormatHostMetrics wrapper
+20a1ddfb4b022dbf70802203bbbfec0d33214a94

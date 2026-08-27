@@ -14,7 +14,7 @@ CMD_DIR := ./cmd/gh-sr
 
 GIT_TAG := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: all build test bench bench-save coverage coverage-html vet fmt tidy ci check clean install uninstall
+.PHONY: all build test bench bench-save coverage coverage-html vet fmt tidy ci check clean install uninstall blame-ignore
 
 all: build
 
@@ -114,3 +114,9 @@ install: build
 
 uninstall:
 	gh extension remove gh-sr
+
+# blame-ignore configures the local Git repo to skip large code-movement
+# commits in `git blame` output (see .git-blame-ignore-revs).
+blame-ignore:
+	@git config --local blame.ignoreRevsFile .git-blame-ignore-revs
+	@echo "Configured: git blame now ignores refactors listed in .git-blame-ignore-revs"
