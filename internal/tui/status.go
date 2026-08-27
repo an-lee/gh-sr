@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/an-lee/gh-sr/internal/config"
@@ -35,7 +36,14 @@ func FormatConfig(cfg *config.Config) string {
 	if tokErr == nil {
 		tokenDisplay = "(from gh CLI)"
 	}
-	b.WriteString(fmt.Sprintf("  %s %s\n\n", configKey.Render("Token:"), configVal.Render(tokenDisplay)))
+	// Token line: "  <styled "Token:"> <styled display>\n\n"
+	// Direct concat avoids the fmt.Sprintf reflection + []interface{}
+	// boxing round-trip (one alloc saved per call).
+	b.WriteString("  ")
+	b.WriteString(configKey.Render("Token:"))
+	b.WriteByte(' ')
+	b.WriteString(configVal.Render(tokenDisplay))
+	b.WriteString("\n\n")
 
 	b.WriteString(configKey.Render("Hosts:"))
 	b.WriteString("\n")
@@ -46,20 +54,42 @@ func FormatConfig(cfg *config.Config) string {
 	sort.Strings(hostNames)
 	for _, name := range hostNames {
 		h := cfg.Hosts[name]
-		b.WriteString(fmt.Sprintf("  %s  addr=%s  os=%s  arch=%s\n",
-			configVal.Render(name), h.Addr, h.OS, h.Arch))
+		// Host line: "  <styled name>  addr=<addr>  os=<os>  arch=<arch>\n"
+		// 4 string args + 4 interface{} boxing allocs avoided.
+		b.WriteString("  ")
+		b.WriteString(configVal.Render(name))
+		b.WriteString("  addr=")
+		b.WriteString(h.Addr)
+		b.WriteString("  os=")
+		b.WriteString(h.OS)
+		b.WriteString("  arch=")
+		b.WriteString(h.Arch)
+		b.WriteByte('\n')
 	}
 
 	b.WriteString("\n")
 	b.WriteString(configKey.Render("Runners:"))
 	b.WriteString("\n")
 	for _, r := range cfg.Runners {
-		extra := ""
+		// Runner line: "  <styled name>  target=<target>  host=<host>  count=<n>  mode=<m>  labels=[<l>][  ephemeral]\n"
+		// 7 string args + 1 int arg = 8 interface{} boxing allocs avoided.
+		b.WriteString("  ")
+		b.WriteString(configVal.Render(r.Name))
+		b.WriteString("  target=")
+		b.WriteString(r.DisplayTarget())
+		b.WriteString("  host=")
+		b.WriteString(r.Host)
+		b.WriteString("  count=")
+		b.WriteString(strconv.Itoa(r.Count))
+		b.WriteString("  mode=")
+		b.WriteString(r.EffectiveRunnerMode())
+		b.WriteString("  labels=[")
+		b.WriteString(strings.Join(r.Labels, ", "))
+		b.WriteByte(']')
 		if r.Ephemeral {
-			extra += "  ephemeral"
+			b.WriteString("  ephemeral")
 		}
-		b.WriteString(fmt.Sprintf("  %s  target=%s  host=%s  count=%d  mode=%s  labels=[%s]%s\n",
-			configVal.Render(r.Name), r.DisplayTarget(), r.Host, r.Count, r.EffectiveRunnerMode(), strings.Join(r.Labels, ", "), extra))
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
