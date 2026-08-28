@@ -31,9 +31,12 @@ func FormatConfig(cfg *config.Config) string {
 	b.WriteString(titleStyle.Render("Resolved Configuration"))
 	b.WriteString("\n")
 
-	_, tokErr := config.ResolveToken(cfg)
+	// Use the memoized availability probe rather than ResolveToken: we only
+	// need the (none) vs (from gh CLI) hint, and the underlying gh CLI
+	// round-trip (os/exec.LookPath + `gh auth token`) dominates the per-call
+	// cost (50%+ of BenchmarkFormatConfig) without changing visible output.
 	tokenDisplay := "(none)"
-	if tokErr == nil {
+	if config.IsTokenAvailable() {
 		tokenDisplay = "(from gh CLI)"
 	}
 	// Token line: "  <styled "Token:"> <styled display>\n\n"
