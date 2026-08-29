@@ -437,6 +437,69 @@ func TestRemoteBoolCheck_AcceptsArbitraryCondition(t *testing.T) {
 	}
 }
 
+// TestRemoteWindowsDirExists verifies the Windows counterpart of
+// RemoteDirExists: it must emit a single `Test-Path -LiteralPath ... -PathType
+// Container` probe via h.RunShell, escape the path via PowerShellSingleQuote
+// (so apostrophes round-trip safely), and parse a "yes" reply as true. This
+// helper was added in the same commit that closed duplicate-code #426
+// (refactor(hostshell): deduplicate Windows PowerShell scheduled-task probes)
+// to mirror the existing POSIX helpers, so the test mirrors the POSIX table
+// in TestRemotePathExists_Posix.
+func TestRemoteWindowsDirExists(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		path  string
+		reply string
+		want  bool
+	}{
+		{"dir present returns true", `C:\gh-sr\runners\r1`, "yes\n", true},
+		{"dir absent returns false", `C:\gh-sr\runners\gone`, "no\n", false},
+		{"dir absent with whitespace reply", `C:\gh-sr\runners\gone`, "   \n", false},
+		// Path with apostrophe must round-trip through PowerShellSingleQuote
+		// (apostrophe is doubled inside the single-quoted run).
+		{"dir path with apostrophe", `C:\Users\O'Brien\gh-sr`, "yes\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rec := &recordingExecutor{runReplyFn: func(string) (string, error) { return tc.reply, nil }}
+			h := newLocalMockHost(t, "windows", rec)
+			got, err := RemoteWindowsDirExists(h, tc.path)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+			if len(rec.runs) != 1 {
+				t.Fatalf("expected 1 Run call, got %d", len(rec.runs))
+			}
+			wantScript := `if (Test-Path -LiteralPath ` + PowerShellSingleQuote(tc.path) + ` -PathType Container) { 'yes' } else { 'no' }`
+			if rec.runs[0] != wantScript {
+				t.Errorf("probe = %q, want %q", rec.runs[0], wantScript)
+			}
+		})
+	}
+}
+
+// TestRemoteWindowsDirExists_PropagatesError verifies a non-nil error from
+// the executor surfaces and yields false. Mirrors the POSIX
+// TestRemoteBoolCheck_PropagatesError contract.
+func TestRemoteWindowsDirExists_PropagatesError(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("ps boom")
+	rec := &recordingExecutor{runErr: sentinel}
+	h := newLocalMockHost(t, "windows", rec)
+	got, err := RemoteWindowsDirExists(h, `C:\gh-sr\runners\r1`)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want %v", err, sentinel)
+	}
+	if got {
+		t.Errorf("got true on error, want false")
+	}
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
