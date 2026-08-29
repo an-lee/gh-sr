@@ -19,8 +19,8 @@ import (
 //
 // The fake clock MUST NOT be used in tests that run with t.Parallel(): the
 // package-level nowFn / sleepFn are global, and parallel tests would race on
-// them (the same constraint the diskschedule package imposes on its OS
-// seams — see [[testing-notes]]).
+// them — the same constraint that t.Setenv-based seams (e.g. HOME in the
+// diskschedule tests) impose.
 type fakeClock struct {
 	now time.Time
 }
@@ -147,8 +147,9 @@ func TestContainerAwaitHealthy_agenticDNSFailureExpiresDeadline(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	fc := installFakeClock(t, start)
 
-	// timeout = 4s; the loop sleeps 2s per iteration, so it runs 3 iterations
-	// (T0, T0+2, T0+4) before the deadline check returns true at T0+6.
+	// timeout = 4s; the loop probes at T0, T0+2, T0+4 (the deadline check is
+	// not strictly-after at T0+4) and returns from the T0+6 probe, so the
+	// deadline branch is genuinely exercised rather than short-circuited.
 	err := containerAwaitHealthy(h, "aw-1", true, 4*time.Second)
 	if err == nil {
 		t.Fatalf("containerAwaitHealthy(agentic-dns-fail) = nil, want error")
