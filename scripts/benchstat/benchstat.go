@@ -66,7 +66,7 @@ func ParseFile(path string) (map[string]Result, error) {
 	}
 	defer f.Close()
 
-	samples := make(map[string][]Result)
+	samples := make(map[string]*benchAgg)
 	pkg := ""
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -84,7 +84,8 @@ func ParseFile(path string) (map[string]Result, error) {
 		if err != nil {
 			continue
 		}
-		r := Result{Name: name, Package: pkg, N: n}
+		var r Result
+		r.Name, r.Package, r.N = name, pkg, n
 		fields := strings.Fields(m[3])
 		for i := 0; i+1 < len(fields); i += 2 {
 			val, err := strconv.ParseFloat(fields[i], 64)
@@ -100,34 +101,49 @@ func ParseFile(path string) (map[string]Result, error) {
 				r.AllocsPerOp = val
 			}
 		}
-		samples[name] = append(samples[name], r)
+		a := samples[name]
+		if a == nil {
+			a = &benchAgg{first: r}
+			samples[name] = a
+		}
+		a.add(r)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 
 	results := make(map[string]Result, len(samples))
-	for name, rs := range samples {
-		agg := rs[0]
-		agg.NsPerOp = median(metricColumn(rs, func(r Result) float64 { return r.NsPerOp }))
-		agg.BPerOp = median(metricColumn(rs, func(r Result) float64 { return r.BPerOp }))
-		agg.AllocsPerOp = median(metricColumn(rs, func(r Result) float64 { return r.AllocsPerOp }))
+	for name, a := range samples {
+		agg := a.first
+		agg.NsPerOp = median(a.ns)
+		agg.BPerOp = median(a.b)
+		agg.AllocsPerOp = median(a.all)
 		results[name] = agg
 	}
 	return results, nil
 }
 
-// metricColumn extracts one metric from every repetition, skipping zero
-// values (metrics the run did not print). Never returns an empty slice when
-// called on a non-empty sample set, since reps[0] always exists for ns/op.
-func metricColumn(reps []Result, get func(Result) float64) []float64 {
-	vals := make([]float64, 0, len(reps))
-	for _, r := range reps {
-		if v := get(r); v > 0 {
-			vals = append(vals, v)
-		}
+// benchAgg accumulates the per-repetition metric columns for one benchmark
+// name. Columns skip zero values (metrics the run did not print); `go test`
+// prints the same column set for every repetition of a run, so the three
+// columns always grow in lockstep.
+type benchAgg struct {
+	first Result // first repetition; carries Name/Package/N untouched
+	ns    []float64
+	b     []float64
+	all   []float64
+}
+
+func (a *benchAgg) add(r Result) {
+	if r.NsPerOp > 0 {
+		a.ns = append(a.ns, r.NsPerOp)
 	}
-	return vals
+	if r.BPerOp > 0 {
+		a.b = append(a.b, r.BPerOp)
+	}
+	if r.AllocsPerOp > 0 {
+		a.all = append(a.all, r.AllocsPerOp)
+	}
 }
 
 // median returns the median of vals; for an even count it averages the two
