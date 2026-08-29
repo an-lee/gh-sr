@@ -956,32 +956,33 @@ docker system prune -af --volumes
 // branch needs at most ~3 bytes for a 0-999 value plus " B", comfortably under
 // [16]byte.
 func FormatBytesHuman(b int64) string {
+	var buf [24]byte
+	return string(appendFormatBytesHuman(buf[:0], b))
+}
+
+// appendFormatBytesHuman appends the human-readable representation of b to
+// dst and returns the resulting slice. The caller can use it when building
+// output in an existing buffer and avoid the string conversion performed by
+// FormatBytesHuman.
+func appendFormatBytesHuman(dst []byte, b int64) []byte {
 	if b < 0 {
 		b = 0
 	}
 	const gib = 1024 * 1024 * 1024
 	const mib = 1024 * 1024
-	var buf [24]byte
 	switch {
 	case b >= gib:
-		out := buf[:0]
-		out = strfmt.FmtFloat(out, float64(b)/float64(gib), 1)
-		out = append(out, ' ', 'G', 'i', 'B')
-		return string(out)
+		dst = strfmt.FmtFloat(dst, float64(b)/float64(gib), 1)
+		dst = append(dst, ' ', 'G', 'i', 'B')
 	case b >= mib:
-		out := buf[:0]
-		out = strfmt.FmtFloat(out, float64(b)/float64(mib), 1)
-		out = append(out, ' ', 'M', 'i', 'B')
-		return string(out)
+		dst = strfmt.FmtFloat(dst, float64(b)/float64(mib), 1)
+		dst = append(dst, ' ', 'M', 'i', 'B')
 	case b >= 1024:
-		out := buf[:0]
-		out = strfmt.FmtFloat(out, float64(b)/1024, 1)
-		out = append(out, ' ', 'K', 'i', 'B')
-		return string(out)
+		dst = strfmt.FmtFloat(dst, float64(b)/1024, 1)
+		dst = append(dst, ' ', 'K', 'i', 'B')
 	default:
-		var sbuf [16]byte
-		out := strconv.AppendInt(sbuf[:0], b, 10)
-		out = append(out, ' ', 'B')
-		return string(out)
+		dst = strconv.AppendInt(dst, b, 10)
+		dst = append(dst, ' ', 'B')
 	}
+	return dst
 }

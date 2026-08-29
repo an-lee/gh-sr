@@ -925,6 +925,31 @@ func TestFormatBytesHuman(t *testing.T) {
 	}
 }
 
+func TestAppendFormatBytesHuman(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{1024, "1.0 KiB"},
+		{1024 * 1024, "1.0 MiB"},
+		{1024 * 1024 * 1024, "1.0 GiB"},
+		{-1, "0 B"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(fmt.Sprintf("%d_to_%s", tc.in, tc.want), func(t *testing.T) {
+			t.Parallel()
+			got := string(appendFormatBytesHuman(nil, tc.in))
+			if got != tc.want {
+				t.Errorf("appendFormatBytesHuman(%d) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // BenchmarkFormatBytesHuman exercises the per-row size formatter that runs
 // 5× per runner instance per `gh sr disk` listing plus once per host for the
 // doctor disk-entry path. Per-call alloc drops compound across listings with
@@ -939,6 +964,21 @@ func BenchmarkFormatBytesHuman(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		for _, sz := range samples {
 			_ = FormatBytesHuman(sz)
+		}
+	}
+}
+
+func BenchmarkAppendFormatBytesHuman(b *testing.B) {
+	samples := []int64{
+		0, 512, 2 * 1024, 5 * 1024 * 1024, 500 * 1024 * 1024,
+		2 * 1024 * 1024 * 1024, 50 * 1024 * 1024 * 1024,
+	}
+	dst := make([]byte, 0, 24)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, sz := range samples {
+			dst = appendFormatBytesHuman(dst[:0], sz)
 		}
 	}
 }
