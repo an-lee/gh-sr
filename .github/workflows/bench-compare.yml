@@ -16,6 +16,19 @@ permissions:
 # markdown comment tagged with `<!-- benchstat-report -->`. Exit code is
 # non-zero on fail-level regressions, so the PR check fails loudly.
 #
+# Noise hardening (each guards a real false-failure mode this workflow hit):
+#   - Benchmarks run with -count=3 and benchstat takes the per-metric MEDIAN.
+#     With -count=1 on the shared self-hosted runner, unchanged code flapped
+#     ±30-66% between consecutive runs of the same PR (test/bench job
+#     contention) and flagged random sub-microsecond benchmarks.
+#   - Only packages touched by the diff gate the exit code (benchstat
+#     -packages). Cross-runner noise previously "regressed" benchmarks in
+#     packages the PR never opened; they are still reported, as ⚪.
+#   - The PR is checked out via refs/pull/N/head instead of refs/pull/N/merge.
+#     The merge ref is cached by GitHub: reruns of a PR whose base moved kept
+#     fetching a pre-merge snapshot and compared stale code against fresh
+#     main (it reported #432's own speedup as a +153000% regression).
+#
 # Self-deactivates when no main artifact is available yet (first PR after
 # this workflow lands) — the comment will say so and the job will pass.
 jobs:
@@ -24,14 +37,32 @@ jobs:
     runs-on: [self-hosted, linux]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25.x"
           cache-dependency-path: go.sum
 
+      - name: Detect changed packages
+        id: pkgs
+        run: |
+          git fetch --no-tags origin main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          echo "changed Go packages vs $(git rev-parse --short "$base"):"
+          dirs=$(git diff --name-only "$base" HEAD -- '*.go' | xargs -r -n1 dirname | sort -u)
+          echo "$dirs"
+          # Root-level .go files affect everything — don't scope.
+          if echo "$dirs" | grep -qx '\.'; then
+            echo "packages=" >> "$GITHUB_OUTPUT"
+          else
+            echo "packages=$(echo "$dirs" | paste -sd,)" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Benchmark PR
-        run: go test ./... -run='^$' -bench=. -benchmem -count=1 | tee bench-pr.txt
+        run: go test ./... -run='^$' -bench=. -benchmem -count=3 -benchtime=500ms | tee bench-pr.txt
 
       - name: Fetch main benchmark artifact
         id: fetch-main
@@ -100,6 +131,7 @@ jobs:
             -head bench-pr.txt \
             -base-ref "${{ steps.fetch-main.outputs.main-sha }}" \
             -head-ref "${{ github.event.pull_request.head.label }}" \
+            -packages "${{ steps.pkgs.outputs.packages }}" \
             -output comment.md
           ec=$?
           echo "exit-code=$ec" >> "$GITHUB_OUTPUT"

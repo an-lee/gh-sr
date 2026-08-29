@@ -38,6 +38,11 @@ jobs:
   bench:
     name: bench
     runs-on: [self-hosted, linux]
+    # Only on push: bench-compare.yml already benchmarks every PR (with
+    # per-PR package scoping), and this job's artifact is only consumed from
+    # main runs — running it on PRs too just doubles bench load on the one
+    # self-hosted runner and adds the contention that makes timings flap.
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v6
 
@@ -46,8 +51,13 @@ jobs:
           go-version: "1.25.x"
           cache-dependency-path: go.sum
 
+      # -count=3 + median aggregation (in scripts/benchstat) must match
+      # bench-compare.yml exactly: this artifact is the comparison BASELINE,
+      # and a single-sample baseline flaps ±30-66% under runner contention.
+      # -benchtime=500ms keeps the 3× repetition cost at ~1.5× the old
+      # single 1s-per-benchmark run.
       - name: Benchmark
-        run: go test ./... -run='^$' -bench=. -benchmem -count=1 | tee bench.txt
+        run: go test ./... -run='^$' -bench=. -benchmem -count=3 -benchtime=500ms | tee bench.txt
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4

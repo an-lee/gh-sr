@@ -14,9 +14,12 @@ import (
 	"strings"
 )
 
-// Result is a single benchmark measurement.
+// Result is a single benchmark measurement. When the producing `go test`
+// run used -count>1, the per-metric values are medians across the
+// repetitions (see ParseFile).
 type Result struct {
 	Name        string
+	Package     string // import path from the "pkg:" header, "" if absent
 	N           int64
 	NsPerOp     float64
 	BPerOp      float64
@@ -41,11 +44,21 @@ func DefaultThresholds() Thresholds {
 	}
 }
 
-var benchRe = regexp.MustCompile(`^Benchmark(\w+)(?:-\d+)?\s+(\d+)\s+(.*)$`)
+var (
+	benchRe = regexp.MustCompile(`^Benchmark(\w+)(?:-\d+)?\s+(\d+)\s+(.*)$`)
+	pkgRe   = regexp.MustCompile(`^pkg:\s+(\S+)`)
+)
 
 // ParseFile reads `go test -bench` output and returns one Result per
 // benchmark name. Names without `-N` suffix or with various metric columns
 // (ns/op only, ns/op + B/op, ns/op + B/op + allocs/op) are all accepted.
+//
+// With -count>1 the same benchmark name appears once per repetition. The
+// returned Result aggregates the repetitions by taking the per-metric
+// MEDIAN — the single-sample last-write-wins behaviour this function had
+// before made CI comparisons on the shared self-hosted runner flap by
+// ±30-66% on sub-microsecond benchmarks (runner contention from concurrent
+// test/bench jobs). The median discards those one-off outliers.
 func ParseFile(path string) (map[string]Result, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -53,10 +66,15 @@ func ParseFile(path string) (map[string]Result, error) {
 	}
 	defer f.Close()
 
-	results := make(map[string]Result)
+	samples := make(map[string][]Result)
+	pkg := ""
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if m := pkgRe.FindStringSubmatch(line); m != nil {
+			pkg = m[1]
+			continue
+		}
 		m := benchRe.FindStringSubmatch(line)
 		if m == nil {
 			continue
@@ -66,7 +84,7 @@ func ParseFile(path string) (map[string]Result, error) {
 		if err != nil {
 			continue
 		}
-		r := Result{Name: name, N: n}
+		r := Result{Name: name, Package: pkg, N: n}
 		fields := strings.Fields(m[3])
 		for i := 0; i+1 < len(fields); i += 2 {
 			val, err := strconv.ParseFloat(fields[i], 64)
@@ -82,29 +100,72 @@ func ParseFile(path string) (map[string]Result, error) {
 				r.AllocsPerOp = val
 			}
 		}
-		results[name] = r
+		samples[name] = append(samples[name], r)
 	}
-	return results, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	results := make(map[string]Result, len(samples))
+	for name, rs := range samples {
+		agg := rs[0]
+		agg.NsPerOp = median(metricColumn(rs, func(r Result) float64 { return r.NsPerOp }))
+		agg.BPerOp = median(metricColumn(rs, func(r Result) float64 { return r.BPerOp }))
+		agg.AllocsPerOp = median(metricColumn(rs, func(r Result) float64 { return r.AllocsPerOp }))
+		results[name] = agg
+	}
+	return results, nil
+}
+
+// metricColumn extracts one metric from every repetition, skipping zero
+// values (metrics the run did not print). Never returns an empty slice when
+// called on a non-empty sample set, since reps[0] always exists for ns/op.
+func metricColumn(reps []Result, get func(Result) float64) []float64 {
+	vals := make([]float64, 0, len(reps))
+	for _, r := range reps {
+		if v := get(r); v > 0 {
+			vals = append(vals, v)
+		}
+	}
+	return vals
+}
+
+// median returns the median of vals; for an even count it averages the two
+// middle values. Zero-length input returns 0 (no samples printed the metric).
+func median(vals []float64) float64 {
+	switch len(vals) {
+	case 0:
+		return 0
+	case 1:
+		return vals[0]
+	}
+	sort.Float64s(vals)
+	mid := len(vals) / 2
+	if len(vals)%2 == 1 {
+		return vals[mid]
+	}
+	return (vals[mid-1] + vals[mid]) / 2
 }
 
 // Row is one benchmark's status in the comparison.
 type Row struct {
-	Name   string
-	Status string // "ok", "warn", "fail", "new", "removed"
-	Base   Result
-	Head   Result
-	HasNs  bool
-	HasB   bool
-	HasAll bool
-	NsD    float64
-	BD     float64
-	AllD   float64
-	NsF    bool
-	NsW    bool
-	BF     bool
-	BW     bool
-	AllF   bool
-	AllW   bool
+	Name    string
+	Package string
+	Status  string // "ok", "warn", "fail", "new", "removed", "ungated"
+	Base    Result
+	Head    Result
+	HasNs   bool
+	HasB    bool
+	HasAll  bool
+	NsD     float64
+	BD      float64
+	AllD    float64
+	NsF     bool
+	NsW     bool
+	BF      bool
+	BW      bool
+	AllF    bool
+	AllW    bool
 }
 
 // Compare returns rows comparing head to base. Rows are sorted by severity
@@ -116,11 +177,11 @@ func Compare(base, head map[string]Result, t Thresholds) []Row {
 	for name, h := range head {
 		b, ok := base[name]
 		if !ok {
-			rows = append(rows, Row{Name: name, Status: "new", Head: h})
+			rows = append(rows, Row{Name: name, Package: h.Package, Status: "new", Head: h})
 			seen[name] = true
 			continue
 		}
-		r := Row{Name: name, Base: b, Head: h}
+		r := Row{Name: name, Package: h.Package, Base: b, Head: h}
 		if b.NsPerOp > 0 {
 			r.HasNs = true
 			r.NsD = (h.NsPerOp - b.NsPerOp) / b.NsPerOp * 100
@@ -172,7 +233,7 @@ func Compare(base, head map[string]Result, t Thresholds) []Row {
 
 	for name, b := range base {
 		if !seen[name] {
-			rows = append(rows, Row{Name: name, Status: "removed", Base: b})
+			rows = append(rows, Row{Name: name, Package: b.Package, Status: "removed", Base: b})
 		}
 	}
 
@@ -204,6 +265,51 @@ func Compare(base, head map[string]Result, t Thresholds) []Row {
 func HasFail(rows []Row) bool {
 	for _, r := range rows {
 		if r.Status == "fail" {
+			return true
+		}
+	}
+	return false
+}
+
+// ApplyPackageScope demotes rows whose benchmark lives outside pkgs to
+// "ungated" status: they stay in the report with their deltas visible, but
+// they no longer count toward HasFail/HasWarn. A PR that only touches
+// package A should not fail because an unrelated micro-benchmark in package
+// B flapped — on the shared self-hosted runner, unchanged code moved
+// ±30-66% between consecutive runs of the same PR.
+//
+// pkgs holds directory-style import paths as produced by
+// `git diff --name-only | xargs dirname` (e.g. "internal/runner"), matched
+// against full import paths with a path-boundary rule so "internal/runner"
+// also gates subpackages but never "internal/runnerx". An empty pkgs gates
+// everything (pre-scope behaviour). Returns (gated, ungated) row counts and
+// reorders rows so gated rows stay first, preserving Compare's ordering
+// within each group.
+func ApplyPackageScope(rows []Row, pkgs []string) (gated, ungated int) {
+	if len(pkgs) == 0 {
+		return len(rows), 0
+	}
+	gatedRows := make([]Row, 0, len(rows))
+	var ungatedRows []Row
+	for _, r := range rows {
+		if packageMatches(r.Package, pkgs) {
+			gatedRows = append(gatedRows, r)
+		} else {
+			r.Status = "ungated"
+			ungatedRows = append(ungatedRows, r)
+		}
+	}
+	out := append(gatedRows, ungatedRows...)
+	copy(rows, out)
+	return len(gatedRows), len(ungatedRows)
+}
+
+// packageMatches reports whether the import path pkg is covered by any of
+// the directory-style filters. "internal/runner" matches the package itself,
+// its subpackages, and is never confused with "internal/runnerx".
+func packageMatches(pkg string, pkgs []string) bool {
+	for _, f := range pkgs {
+		if pkg == f || strings.HasSuffix(pkg, "/"+f) || strings.Contains(pkg, f+"/") {
 			return true
 		}
 	}
@@ -252,13 +358,15 @@ func RenderMarkdown(rows []Row, baseRef, headRef string) string {
 	sb.WriteString(baseRef)
 	sb.WriteString("`\n\n")
 
-	hasFail, hasWarn := false, false
+	hasFail, hasWarn, hasUngated := false, false, false
 	for _, r := range rows {
-		if r.Status == "fail" {
+		switch r.Status {
+		case "fail":
 			hasFail = true
-		}
-		if r.Status == "warn" {
+		case "warn":
 			hasWarn = true
+		case "ungated":
+			hasUngated = true
 		}
 	}
 
@@ -267,6 +375,8 @@ func RenderMarkdown(rows []Row, baseRef, headRef string) string {
 		sb.WriteString("🔥 **Fail-level regression(s) detected.** Job exits non-zero.\n\n")
 	case hasWarn:
 		sb.WriteString("⚠️ Warn-level regression(s) detected.\n\n")
+	case hasUngated:
+		sb.WriteString("✅ No regressions in the packages this PR changes.\n\n")
 	default:
 		sb.WriteString("✅ No regressions detected.\n\n")
 	}
@@ -288,7 +398,10 @@ func RenderMarkdown(rows []Row, baseRef, headRef string) string {
 		sb.WriteString(" |\n")
 	}
 
-	sb.WriteString("\n_Thresholds: ns/op ±10%/30%, B/op ±15%/50%, allocs/op ±10%/25% (warn/fail)._\n")
+	sb.WriteString("\n_Thresholds: ns/op ±10%/30%, B/op ±15%/50%, allocs/op ±10%/25% (warn/fail). Each value is the median of the -count repetitions._\n")
+	if hasUngated {
+		sb.WriteString("\n_⚪ rows live in packages this PR does not change — shown for visibility, but they do not fail the job (unchanged code moved ±30-66% between runs on the shared runner)._\n")
+	}
 	return sb.String()
 }
 
@@ -302,6 +415,8 @@ func rowStatus(s string) string {
 		return "🆕"
 	case "removed":
 		return "🗑️"
+	case "ungated":
+		return "⚪"
 	default:
 		return "✅"
 	}

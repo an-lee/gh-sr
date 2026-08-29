@@ -392,3 +392,223 @@ func keys(m map[string]Result) []string {
 	}
 	return out
 }
+
+// TestParseFile_MedianAcrossRepetitions pins the -count>1 aggregation: the
+// same benchmark repeated 3× collapses to one Result whose metrics are the
+// per-metric medians, so a single contention-spiked repetition (5000 vs
+// ~1000 ns) cannot manufacture a fake regression.
+func TestParseFile_MedianAcrossRepetitions(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := writeBench(t, dir, "bench.txt", `BenchmarkNoisy-8   	1000	     5000 ns/op	     100 B/op	       4 allocs/op
+BenchmarkNoisy-8   	1000	     1200 ns/op	     100 B/op	       4 allocs/op
+BenchmarkNoisy-8   	1000	     1000 ns/op	     100 B/op	       4 allocs/op
+`)
+
+	got, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 aggregated benchmark, got %d", len(got))
+	}
+	r := got["Noisy"]
+	if r.NsPerOp != 1200 {
+		t.Errorf("NsPerOp = %v, want median 1200", r.NsPerOp)
+	}
+	if r.BPerOp != 100 || r.AllocsPerOp != 4 {
+		t.Errorf("B/allocs = %v/%v, want 100/4", r.BPerOp, r.AllocsPerOp)
+	}
+}
+
+// TestParseFile_MedianEvenCount covers the even-length median (average of
+// the two middle values).
+func TestParseFile_MedianEvenCount(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := writeBench(t, dir, "bench.txt", "BenchmarkA-8   	1000	     100 ns/op\nBenchmarkA-8   	1000	     200 ns/op\nBenchmarkB-8   	1000	     100 ns/op\nBenchmarkB-8   	1000	     300 ns/op\n")
+
+	got, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if got["A"].NsPerOp != 150 {
+		t.Errorf("A.NsPerOp = %v, want 150", got["A"].NsPerOp)
+	}
+	if got["B"].NsPerOp != 200 {
+		t.Errorf("B.NsPerOp = %v, want 200", got["B"].NsPerOp)
+	}
+}
+
+// TestParseFile_CapturesPackage pins the pkg: header tracking — needed by
+// ApplyPackageScope to tell which package a benchmark belongs to. A
+// benchmark must inherit the most recent header above it.
+func TestParseFile_CapturesPackage(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := writeBench(t, dir, "bench.txt", `goos: linux
+pkg: github.com/an-lee/gh-sr/internal/runner
+BenchmarkRunnerThing-8   	1000	     100 ns/op
+pkg: github.com/an-lee/gh-sr/internal/config
+BenchmarkConfigThing-8   	1000	     100 ns/op
+`)
+
+	got, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if got["RunnerThing"].Package != "github.com/an-lee/gh-sr/internal/runner" {
+		t.Errorf("RunnerThing.Package = %q", got["RunnerThing"].Package)
+	}
+	if got["ConfigThing"].Package != "github.com/an-lee/gh-sr/internal/config" {
+		t.Errorf("ConfigThing.Package = %q", got["ConfigThing"].Package)
+	}
+}
+
+// TestPackageMatches covers the path-boundary rule: a filter gates the
+// package itself and its subpackages, but never a sibling that merely shares
+// a prefix.
+func TestPackageMatches(t *testing.T) {
+	t.Parallel()
+
+	pkgs := []string{"internal/runner"}
+	cases := []struct {
+		pkg  string
+		want bool
+	}{
+		{"github.com/an-lee/gh-sr/internal/runner", true},
+		{"github.com/an-lee/gh-sr/internal/runner/sub", true},
+		{"github.com/an-lee/gh-sr/internal/runnerx", false},
+		{"github.com/an-lee/gh-sr/internal/config", false},
+		{"internal/runner", true}, // already an import path
+	}
+	for _, tc := range cases {
+		if got := packageMatches(tc.pkg, pkgs); got != tc.want {
+			t.Errorf("packageMatches(%q) = %v, want %v", tc.pkg, got, tc.want)
+		}
+	}
+}
+
+// TestApplyPackageScope_DemotesUntouched pins the gating contract: rows in
+// unchanged packages become "ungated" (so HasFail ignores them) but keep
+// their fail/warn metric flags for the report, and gated rows sort first.
+func TestApplyPackageScope_DemotesUntouched(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{
+		{Name: "RunnerBench", Package: "github.com/an-lee/gh-sr/internal/runner", Status: "ok"},
+		{Name: "ConfigBench", Package: "github.com/an-lee/gh-sr/internal/config", Status: "fail", NsF: true},
+		{Name: "HostBench", Package: "github.com/an-lee/gh-sr/internal/host", Status: "warn", NsW: true},
+	}
+	gated, ungated := ApplyPackageScope(rows, []string{"internal/runner"})
+	if gated != 1 || ungated != 2 {
+		t.Fatalf("gated=%d ungated=%d, want 1/2", gated, ungated)
+	}
+	// Gated rows first, preserving Compare's ordering.
+	if rows[0].Name != "RunnerBench" || rows[0].Status != "ok" {
+		t.Errorf("rows[0] = %s/%s, want RunnerBench/ok", rows[0].Name, rows[0].Status)
+	}
+	for _, r := range rows[1:] {
+		if r.Status != "ungated" {
+			t.Errorf("%s status = %q, want ungated", r.Name, r.Status)
+		}
+	}
+	if !rows[1].NsF {
+		t.Errorf("ungated row should keep its fail metric flag for the report")
+	}
+	if HasFail(rows) {
+		t.Errorf("untouched-package fail must not gate the job")
+	}
+}
+
+// TestApplyPackageScope_EmptyGatesAll pins the fallback: no detected
+// packages (docs-only PR, root-level changes) gates everything — the
+// pre-scope behaviour.
+func TestApplyPackageScope_EmptyGatesAll(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{{Name: "A", Status: "fail"}}
+	gated, ungated := ApplyPackageScope(rows, nil)
+	if gated != 1 || ungated != 0 {
+		t.Fatalf("gated=%d ungated=%d, want 1/0", gated, ungated)
+	}
+	if rows[0].Status != "fail" || !HasFail(rows) {
+		t.Errorf("empty scope must leave rows gated")
+	}
+}
+
+// TestApplyPackageScope_SubpackageInheritance: a change to internal/runner
+// gates benchmarks in its subpackages too (they import the changed code).
+func TestApplyPackageScope_SubpackageInheritance(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{
+		{Name: "Sub", Package: "github.com/an-lee/gh-sr/internal/runner/diskschedule", Status: "fail"},
+	}
+	gated, _ := ApplyPackageScope(rows, []string{"internal/runner"})
+	if gated != 1 {
+		t.Fatalf("gated=%d, want 1 (subpackage of a changed package)", gated)
+	}
+}
+
+// TestEndToEnd_ScopeSilencesUnrelatedNoise replays the failure that
+// motivated scoping: an untouched package's micro-benchmark doubles while
+// the PR only touches another package. Full pipeline must exit 0.
+func TestEndToEnd_ScopeSilencesUnrelatedNoise(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	basePath := writeBench(t, dir, "base.txt", `pkg: github.com/an-lee/gh-sr/internal/config
+BenchmarkDefaultLabels-8   	1000	     50 ns/op
+pkg: github.com/an-lee/gh-sr/internal/host
+BenchmarkLoadStr-8   	1000	     300 ns/op
+`)
+	headPath := writeBench(t, dir, "head.txt", `pkg: github.com/an-lee/gh-sr/internal/config
+BenchmarkDefaultLabels-8   	1000	     55 ns/op
+pkg: github.com/an-lee/gh-sr/internal/host
+BenchmarkLoadStr-8   	1000	     600 ns/op
+`)
+
+	base, _ := ParseFile(basePath)
+	head, _ := ParseFile(headPath)
+	rows := Compare(base, head, DefaultThresholds())
+	ApplyPackageScope(rows, []string{"internal/config"})
+	if HasFail(rows) {
+		t.Errorf("LoadStr (+100%%) is in an untouched package and must not fail the job")
+	}
+}
+
+// TestRenderMarkdown_Ungated pins the scoped report: ⚪ status cells, a
+// scope-aware success line, and the explanatory footer.
+func TestRenderMarkdown_Ungated(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{
+		{
+			Name: "Gated", Package: "github.com/an-lee/gh-sr/internal/runner", Status: "ok",
+			Head: Result{NsPerOp: 100}, Base: Result{NsPerOp: 100}, HasNs: true,
+		},
+		{
+			Name: "Noisy", Package: "github.com/an-lee/gh-sr/internal/host", Status: "ungated",
+			Head: Result{NsPerOp: 600}, Base: Result{NsPerOp: 300}, HasNs: true, NsD: 100, NsF: true,
+		},
+	}
+	md := RenderMarkdown(rows, "main", "PR")
+	for _, want := range []string{
+		"✅ No regressions in the packages this PR changes",
+		"| Noisy ",
+		"⚪",
+		"do not fail the job",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("markdown missing %q\nfull output:\n%s", want, md)
+		}
+	}
+	// The ungated row keeps its regression visible.
+	if !strings.Contains(md, "+100.0%") {
+		t.Errorf("ungated row should still show its +100%% delta\n%s", md)
+	}
+}
