@@ -265,3 +265,121 @@ func assertCalledError() error {
 type calledError struct{}
 
 func (calledError) Error() string { return "called" }
+
+func TestProbeWindowsShell(t *testing.T) {
+	t.Parallel()
+
+	yes := func(string) bool { return true }
+	containsWin := func(s string) bool { return strings.Contains(strings.ToLower(s), "win") }
+
+	cases := []struct {
+		name   string
+		mock   *testutil.MockExecutor
+		cmd    string
+		match  func(string) bool
+		want   string
+		wantOK bool
+	}{
+		{
+			name: "primary probe succeeds and matches",
+			mock: &testutil.MockExecutor{
+				RunFn: func(cmd string) (string, error) {
+					if strings.Contains(cmd, "powershell") {
+						return "WIN32\n", nil
+					}
+					return "", assertCalledError() // pwsh must not be called
+				},
+			},
+			cmd:    "[Environment]::OSVersion.Platform",
+			match:  containsWin,
+			want:   "WIN32",
+			wantOK: true,
+		},
+		{
+			name: "primary probe succeeds but does not match; pwsh fallback matches",
+			mock: &testutil.MockExecutor{
+				RunFn: func(cmd string) (string, error) {
+					if strings.Contains(cmd, "powershell") {
+						return "Unix\n", nil // present but doesn't match
+					}
+					if strings.Contains(cmd, "pwsh") {
+						return "Win32NT\n", nil
+					}
+					return "", assertCalledError()
+				},
+			},
+			cmd:    "[Environment]::OSVersion.Platform",
+			match:  containsWin,
+			want:   "Win32NT",
+			wantOK: true,
+		},
+		{
+			name: "primary probe errors; pwsh fallback matches",
+			mock: &testutil.MockExecutor{
+				RunFn: func(cmd string) (string, error) {
+					if strings.Contains(cmd, "powershell") {
+						return "", assertCalledError()
+					}
+					if strings.Contains(cmd, "pwsh") {
+						return "ARM64\n", nil
+					}
+					return "", assertCalledError()
+				},
+			},
+			cmd:    "$env:PROCESSOR_ARCHITECTURE",
+			match:  yes,
+			want:   "ARM64",
+			wantOK: true,
+		},
+		{
+			name: "primary probe errors; pwsh fallback also errors",
+			mock: &testutil.MockExecutor{
+				RunFn: func(string) (string, error) {
+					return "", assertCalledError()
+				},
+			},
+			cmd:    "[Environment]::OSVersion.Platform",
+			match:  containsWin,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name: "primary and pwsh both succeed but neither matches",
+			mock: &testutil.MockExecutor{
+				RunFn: func(string) (string, error) {
+					return "Linux\n", nil
+				},
+			},
+			cmd:    "[Environment]::OSVersion.Platform",
+			match:  containsWin,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name: "trims whitespace before matching",
+			mock: &testutil.MockExecutor{
+				RunFn: func(string) (string, error) {
+					return "  WIN32  \n", nil
+				},
+			},
+			cmd:    "[Environment]::OSVersion.Platform",
+			match:  containsWin,
+			want:   "WIN32",
+			wantOK: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newMockHost("test", config.HostConfig{OS: "windows"}, tc.mock)
+			got, ok := probeWindowsShell(h, tc.cmd, tc.match)
+			if ok != tc.wantOK {
+				t.Errorf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if got != tc.want {
+				t.Errorf("output = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
