@@ -80,6 +80,53 @@ func TestCleanupOrphanInstanceDryRun(t *testing.T) {
 	}
 }
 
+// TestInstanceDirectoryExists_Windows pins the Windows branch of
+// instanceDirectoryExists: it must call hostshell.RemoteWindowsDirExists with
+// h.RunnerDir(instance) as the path. The Linux branch is exercised end-to-end
+// via TestServiceCleanup_OrphanWithDirectoryInOps (test -d probe). The
+// Windows-only helper landed in the same commit that closed duplicate-code
+// #426 (refactor(hostshell): deduplicate Windows PowerShell scheduled-task
+// probes), so we add a focused unit test to lock the wiring.
+//
+// Addr is set to "local" so config.IsLocalAddr reports true and
+// host.Host.wrapCommand is a no-op — the mock sees the literal PowerShell
+// script that RemoteWindowsDirExists emitted.
+func TestInstanceDirectoryExists_Windows(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		instance string
+		reply    string
+		want     bool
+	}{
+		{"dir present", "r1", "yes\r\n", true},
+		{"dir absent", "gone", "no\r\n", false},
+		{"dir absent whitespace", "gone", "   \r\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			mock := &testutil.MockExecutor{
+				RunFn: func(cmd string) (string, error) {
+					if !strings.Contains(cmd, "Test-Path") || !strings.Contains(cmd, "-PathType Container") {
+						t.Errorf("expected Test-Path -PathType Container probe, got: %q", cmd)
+					}
+					return tc.reply, nil
+				},
+			}
+			h := host.NewHost("windows", config.HostConfig{OS: "windows", Addr: "local"})
+			h.SetConn(mock)
+			got, err := instanceDirectoryExists(h, tc.instance)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestOrphanLinuxPlanProbe pins the combined-probe parsing for the Linux
 // orphan-plan path: D (dir), S (svc.sh), U (user systemd unit), Y (system
 // systemd unit) markers are mapped to the matching flags/kind. Asserts a
