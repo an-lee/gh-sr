@@ -6,7 +6,8 @@
 // Usage:
 //
 //	go run scripts/benchstat/main.go -base bench-main.txt -head bench-pr.txt \
-//	    -base-ref main -head-ref pr -output bench-diff.md
+//	    -base-ref main -head-ref pr -output bench-diff.md \
+//	    -packages internal/runner,internal/host
 //
 // Exit codes:
 //
@@ -19,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/an-lee/gh-sr/scripts/benchstat"
 )
@@ -29,6 +31,7 @@ func main() {
 	baseRef := flag.String("base-ref", "main", "base ref label")
 	headRef := flag.String("head-ref", "PR", "head ref label")
 	output := flag.String("output", "", "optional output file (default: stdout)")
+	packages := flag.String("packages", "", "comma-separated directory-style import paths (e.g. internal/runner) whose benchmarks gate the exit code; empty gates everything")
 	flag.Parse()
 
 	if *basePath == "" || *headPath == "" {
@@ -48,6 +51,16 @@ func main() {
 	}
 
 	rows := benchstat.Compare(base, head, benchstat.DefaultThresholds())
+	var pkgs []string
+	if *packages != "" {
+		for _, p := range strings.Split(*packages, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				pkgs = append(pkgs, p)
+			}
+		}
+	}
+	gated, ungated := benchstat.ApplyPackageScope(rows, pkgs)
+	fmt.Fprintf(os.Stderr, "scope: gating %d benchmark(s) in changed packages, %d ungated\n", gated, ungated)
 	md := benchstat.RenderMarkdown(rows, *baseRef, *headRef)
 
 	if *output != "" {
