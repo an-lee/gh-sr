@@ -41,6 +41,18 @@ type Environment interface {
 // become ready before reporting a (non-fatal) warning.
 const defaultContainerHealthTimeout = 90 * time.Second
 
+// Time-injection seams for containerAwaitHealthy's polling loop. Tests swap
+// these with a fake clock so the deadline-expiration branches can be exercised
+// deterministically without sleeping in real time. Production callers always
+// see the real clock. Do not call these from anywhere else — they exist solely
+// to make the deadline / sleep pair in containerAwaitHealthy testable, and a
+// future refactor that moves the polling loop to a different file should move
+// the seams with it.
+var (
+	nowFn   = time.Now
+	sleepFn = func(d time.Duration) { time.Sleep(d) }
+)
+
 // ContainerEnvironment is the privileged Docker-in-Docker backend: one gh-sr-<instance>
 // container per runner instance, each with its own inner dockerd, network namespace,
 // MCP gateway port, and /tmp/gh-aw.
@@ -127,7 +139,7 @@ func innerHostDockerInternalReadyCommand(instanceName string) string {
 func containerAwaitHealthy(h *host.Host, instanceName string, agentic bool, timeout time.Duration) error {
 	cname := containerName(instanceName)
 	dnsCmd := innerHostDockerInternalReadyCommand(instanceName)
-	deadline := time.Now().Add(timeout)
+	deadline := nowFn().Add(timeout)
 	lastErr := fmt.Errorf("container %s not ready", cname)
 
 	for {
@@ -152,9 +164,9 @@ func containerAwaitHealthy(h *host.Host, instanceName string, agentic bool, time
 		default:
 			lastErr = fmt.Errorf("container %s state is %q", cname, rep.State)
 		}
-		if time.Now().After(deadline) {
+		if nowFn().After(deadline) {
 			return lastErr
 		}
-		time.Sleep(2 * time.Second)
+		sleepFn(2 * time.Second)
 	}
 }
