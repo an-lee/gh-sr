@@ -3,8 +3,6 @@ package host
 import (
 	"fmt"
 	"strings"
-
-	"github.com/an-lee/gh-sr/internal/hostshell/ps"
 )
 
 // probeWindowsShell runs cmd on h via powershell.exe, falling back to
@@ -15,19 +13,24 @@ import (
 // powershell.exe → pwsh.exe fallback that DetectOS and DetectArch both
 // need — keeping the duplication from drifting (see PR #430 for the
 // scheduled-task analogue in hostshell).
+//
+// Both probes go through -EncodedCommand rather than -Command "...". During
+// detection h's default shell is unknown: OpenSSH on Windows executes each
+// command with the DefaultShell, which may be cmd.exe, Windows PowerShell 5.1,
+// or pwsh. A double-quoted -Command argument is re-parsed by that outer shell
+// first — PS 5.1/7 interpolates `$env:PROCESSOR_ARCHITECTURE` inside the
+// quotes before the inner powershell.exe ever runs, so the probe degrades to
+// executing the expanded value ("AMD64") as a command. -EncodedCommand is a
+// single literal argv token (base64 UTF-16LE) that no outer shell rewrites.
 func probeWindowsShell(h *Host, cmd string, match func(string) bool) (string, bool) {
-	out, err := h.Run(ps.CommandLine(cmd))
-	if err == nil {
-		trimmed := strings.TrimSpace(out)
-		if match(trimmed) {
-			return trimmed, true
-		}
-	}
-	out, err = h.Run(`pwsh.exe -NoProfile -NonInteractive -Command "` + cmd + `"`)
-	if err == nil {
-		trimmed := strings.TrimSpace(out)
-		if match(trimmed) {
-			return trimmed, true
+	enc := encodePowerShellScript(cmd)
+	for _, exe := range []string{"powershell.exe", "pwsh.exe"} {
+		out, err := h.Run(exe + " -NoProfile -NonInteractive -EncodedCommand " + enc)
+		if err == nil {
+			trimmed := strings.TrimSpace(out)
+			if match(trimmed) {
+				return trimmed, true
+			}
 		}
 	}
 	return "", false
@@ -60,8 +63,15 @@ func DetectOS(h *Host) (string, error) {
 // DetectArch probes the remote host for its CPU architecture and returns "amd64" or "arm64".
 func DetectArch(h *Host) (string, error) {
 	out, err := h.Run(`uname -m 2>/dev/null || echo UNKNOWN`)
-	if err == nil {
+	// "UNKNOWN" is the sentinel the probe prints when uname doesn't exist —
+	// e.g. Windows with cmd.exe as the SSH DefaultShell, where uname fails but
+	// `|| echo UNKNOWN` still exits 0. Treat it like a failed probe so the
+	// PowerShell fallback below gets its turn.
+	if err == nil && strings.TrimSpace(out) != "UNKNOWN" {
 		return normalizeArch(strings.TrimSpace(out))
+	}
+	if err == nil {
+		err = fmt.Errorf("uname unavailable (returned %q)", strings.TrimSpace(out))
 	}
 
 	// Try PowerShell for Windows. match is `true` for any non-error probe —
