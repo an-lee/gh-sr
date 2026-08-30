@@ -1,8 +1,10 @@
 package host
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/testutil"
@@ -162,6 +164,26 @@ func TestDetectArch(t *testing.T) {
 			want: "arm64",
 		},
 		{
+			name: "uname UNKNOWN sentinel falls through to powershell",
+			// Windows host with cmd.exe as SSH DefaultShell: uname doesn't
+			// exist, so the probe's `|| echo UNKNOWN` exits 0 with the
+			// sentinel instead of erroring. Arch must still be detected via
+			// the PowerShell fallback.
+			cfg: config.HostConfig{OS: "windows"},
+			mock: &testutil.MockExecutor{
+				RunFn: func(cmd string) (string, error) {
+					if strings.Contains(cmd, "uname") {
+						return "UNKNOWN", nil
+					}
+					if strings.Contains(cmd, "powershell") {
+						return "AMD64", nil
+					}
+					return "", nil
+				},
+			},
+			want: "amd64",
+		},
+		{
 			name: "unsupported arch",
 			cfg:  config.HostConfig{OS: "linux"},
 			mock: &testutil.MockExecutor{Output: "i386"},
@@ -265,6 +287,64 @@ func assertCalledError() error {
 type calledError struct{}
 
 func (calledError) Error() string { return "called" }
+
+// TestProbeWindowsShellUsesEncodedCommand pins the wire format of the
+// Windows fallback probes: they must go through -EncodedCommand (base64
+// UTF-16LE), never -Command "...". During detection the SSH DefaultShell is
+// unknown, and a PowerShell DefaultShell interpolates $-expressions inside a
+// double-quoted -Command argument before the inner powershell.exe runs — so
+// `$env:PROCESSOR_ARCHITECTURE` reached the inner shell as the expanded value
+// ("AMD64"), which then failed as an unknown command (the bug behind `gh sr
+// setup` arch detection failing on Windows hosts).
+func TestProbeWindowsShellUsesEncodedCommand(t *testing.T) {
+	t.Parallel()
+
+	var gotCmd string
+	mock := &testutil.MockExecutor{
+		RunFn: func(cmd string) (string, error) {
+			if strings.Contains(cmd, "powershell") {
+				gotCmd = cmd
+				return "AMD64", nil
+			}
+			return "", nil
+		},
+	}
+	h := newMockHost("test", config.HostConfig{OS: "windows"}, mock)
+
+	got, ok := probeWindowsShell(h, "$env:PROCESSOR_ARCHITECTURE", func(string) bool { return true })
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if got != "AMD64" {
+		t.Errorf("output = %q, want %q", got, "AMD64")
+	}
+	if strings.Contains(gotCmd, `-Command "`) {
+		t.Errorf("probe command %q embeds the script in -Command quotes", gotCmd)
+	}
+	if !strings.Contains(gotCmd, "-EncodedCommand ") {
+		t.Fatalf("probe command %q does not use -EncodedCommand", gotCmd)
+	}
+	payload := gotCmd[strings.LastIndex(gotCmd, " ")+1:]
+	decoded, err := decodeUTF16LEBase64(payload)
+	if err != nil {
+		t.Fatalf("decoding payload %q: %v", payload, err)
+	}
+	if decoded != "$env:PROCESSOR_ARCHITECTURE" {
+		t.Errorf("decoded script = %q, want %q", decoded, "$env:PROCESSOR_ARCHITECTURE")
+	}
+}
+
+func decodeUTF16LEBase64(s string) (string, error) {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return "", err
+	}
+	u16 := make([]uint16, len(b)/2)
+	for i := range u16 {
+		u16[i] = uint16(b[i*2]) | uint16(b[i*2+1])<<8
+	}
+	return string(utf16.Decode(u16)), nil
+}
 
 func TestProbeWindowsShell(t *testing.T) {
 	t.Parallel()
