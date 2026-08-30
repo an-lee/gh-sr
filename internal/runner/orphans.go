@@ -160,7 +160,13 @@ func (m *Manager) CleanupOrphanInstance(h *host.Host, instance string, dryRun bo
 
 func instanceDirectoryExists(h *host.Host, instance string) (bool, error) {
 	if h.OS == "windows" {
-		return hostshell.RemoteWindowsDirExists(h, h.RunnerDir(instance))
+		// RunnerDirPS is a PowerShell expression rooted at $env:USERPROFILE.
+		// Do not pass RunnerDir through RemoteWindowsDirExists here: that helper
+		// single-quotes literal paths, which would freeze the environment variable.
+		return hostshell.PowerShellBoolCheck(
+			h.RunShell,
+			fmt.Sprintf("Test-Path -LiteralPath (%s) -PathType Container", h.RunnerDirPS(instance)),
+		)
 	}
 	// dir carries a literal $HOME that the remote sh must expand; pass it raw
 	// (RemoteDirExists would PosixSingleQuote it and freeze $HOME).
