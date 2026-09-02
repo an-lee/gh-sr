@@ -142,7 +142,6 @@ func BenchmarkManager_Status(b *testing.B) {
 		Host:       "h",
 		Count:      10,
 		Labels:     []string{"self-hosted", "Linux", "X64"},
-		Profile:    "agentic",
 		RunnerMode: "container",
 	}
 	b.ReportAllocs()

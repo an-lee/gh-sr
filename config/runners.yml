@@ -64,14 +64,14 @@ runners:
   #   count: 1
   #   labels: [self-hosted, Linux, X64]
   #
-  # Agentic Workflow runner (GitHub Agentic Workflows with gh-aw):
-  # profile: agentic always runs in container mode (DinD): each instance is isolated
-  # and every job runs from a pristine inner state. The host only needs Docker (with
-  # privileged-container support); gh-aw and all dependencies live inside the image
-  # gh sr builds. Use count: N for N concurrent agentic jobs.
+  # Container-mode runner for workflows that use `services:` (postgres, redis, etc.):
+  # Each instance is a privileged Docker-in-Docker container with its own inner
+  # `dockerd`, providing filesystem and network isolation between concurrent jobs
+  # on the same host. The host only needs Docker (with privileged-container support).
   #
-  # - name: agentic-runner
+  # - name: ci-shard-runners
   #   repo: owner/repo
   #   host: vps-1
-  #   count: 3
-  #   profile: agentic   # implies runner_mode: container; "agentic" label auto-added
+  #   count: 4
+  #   runner_mode: container
+  #   labels: [self-hosted, Linux, X64]

@@ -388,11 +388,6 @@ func (m *Manager) setupNative(h *host.Host, rc config.RunnerConfig) error {
 		}
 	}
 
-	// Note: profile: agentic always runs in container mode (see EffectiveRunnerMode),
-	// so setupNative is only reached for non-agentic native runners. The former
-	// native-agentic host mutations (dnsmasq, sudoers, /opt/hostedtoolcache bind mount,
-	// gh-aw install, image pre-pull) lived inside the runner image instead and have
-	// been removed from the host path.
 	return nil
 }
 

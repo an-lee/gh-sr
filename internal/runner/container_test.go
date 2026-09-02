@@ -7,9 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -55,13 +52,12 @@ func TestDockerRunArgShape(t *testing.T) {
 		Repo:       "owner/repo",
 		Host:       "h",
 		Count:      1,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 	instanceName := rc.InstanceNames()[0] // "agentic-1"
 	cName := containerName(instanceName)
 	stateDir := containerStateDir(h, instanceName)
-	imageTag := AgenticRunnerImageTag + ":2.999.0"
+	imageTag := ContainerRunnerImageTag + ":2.999.0"
 
 	// Build the expected docker create command manually (mirrors setupContainer logic).
 	labels := rc.EffectiveLabelsForInstance(h.OS, h.Arch, 0)
@@ -119,10 +115,10 @@ func TestDockerRunArgShape(t *testing.T) {
 	}
 }
 
-// TestAgenticRunnerImageTag verifies the image tag format used by container mode.
-func TestAgenticRunnerImageTag(t *testing.T) {
+// TestContainerRunnerImageTag verifies the image tag format used by container mode.
+func TestContainerRunnerImageTag(t *testing.T) {
 	t.Parallel()
-	tag := AgenticRunnerImageTag
+	tag := ContainerRunnerImageTag
 	if !strings.HasPrefix(tag, "gh-sr/") {
 		t.Errorf("image tag should start with gh-sr/, got %q", tag)
 	}
@@ -133,25 +129,25 @@ func TestAgenticRunnerImageTag(t *testing.T) {
 	}
 }
 
-func TestContainerRunnerImageTag(t *testing.T) {
+func TestBuildContainerRunnerImageTag(t *testing.T) {
 	t.Parallel()
-	base := AgenticRunnerImageTag + ":2.320.0"
-	if got := ContainerRunnerImageTag("2.320.0", nil); got != base {
+	base := ContainerRunnerImageTag + ":2.320.0"
+	if got := buildContainerRunnerImageTag("2.320.0", nil); got != base {
 		t.Errorf("empty extras: got %q want %q", got, base)
 	}
-	if got := ContainerRunnerImageTag("2.320.0", []string{}); got != base {
+	if got := buildContainerRunnerImageTag("2.320.0", []string{}); got != base {
 		t.Errorf("empty slice: got %q want %q", got, base)
 	}
-	a := ContainerRunnerImageTag("2.320.0", []string{"sqlite3", "ffmpeg"})
-	b := ContainerRunnerImageTag("2.320.0", []string{"ffmpeg", "sqlite3"})
+	a := buildContainerRunnerImageTag("2.320.0", []string{"sqlite3", "ffmpeg"})
+	b := buildContainerRunnerImageTag("2.320.0", []string{"ffmpeg", "sqlite3"})
 	if a != b {
 		t.Errorf("order should not matter: %q vs %q", a, b)
 	}
 	if want := base + "-x908d9db2"; a != want {
 		t.Errorf("tag with extras: got %q want %q", a, want)
 	}
-	dup := ContainerRunnerImageTag("1.0.0", []string{"curl", "curl"})
-	once := ContainerRunnerImageTag("1.0.0", []string{"curl"})
+	dup := buildContainerRunnerImageTag("1.0.0", []string{"curl", "curl"})
+	once := buildContainerRunnerImageTag("1.0.0", []string{"curl"})
 	if dup != once {
 		t.Errorf("duplicates should be ignored: got %q vs %q", dup, once)
 	}
@@ -160,508 +156,6 @@ func TestContainerRunnerImageTag(t *testing.T) {
 // TestAgenticRunnerDockerWrapperIsMinimalShim verifies the redesigned docker shim
 // only injects the MCP gateway --hostname and has dropped the old racy supervisor /
 // MCP-URL rewriter / AWF add-host injection (now handled by baked DNS + job hooks).
-func TestAgenticRunnerDockerWrapperIsMinimalShim(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"is_mcpg_invocation",
-		"has_hostname_arg",
-		"has_name_arg",
-		"--hostname gh-aw-mcpg",
-		"--name \"gh-aw-mcpg-ghsr-",
-		"GH_SR_DOCKER_WRAPPER_REAL",
-		"ghcr.io/github/gh-aw-mcpg:",
-	} {
-		if !strings.Contains(agenticRunnerDockerWrapper, want) {
-			t.Fatalf("docker-wrapper must contain %q", want)
-		}
-	}
-	// The heavy supervisor / URL-rewriter must stay gone (naming is just a flag, not a supervisor).
-	for _, forbidden := range []string{
-		"rewrite_claude_mcp_gateway_urls",
-		"cleanup_mcpg_container",
-		"mcpg_docker_child_pid",
-		"GH_SR_MCP_REWRITE_TARGET_IP",
-		"needs_awf_agent_bridge_host",
-		"resolve_awf_host_route_target",
-		"--cidfile",
-		"mktemp",
-		"watcher_start",
-	} {
-		if strings.Contains(agenticRunnerDockerWrapper, forbidden) {
-			t.Fatalf("docker-wrapper must no longer contain removed shim logic %q", forbidden)
-		}
-	}
-}
-
-func TestAgenticRunnerDockerWrapperHeaderDocumentsHooks(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"runner_mode: container",
-		"/opt/gh-sr/docker-shim/docker",
-		"job-started.sh",
-		"job-completed.sh",
-	} {
-		if !strings.Contains(agenticRunnerDockerWrapper, want) {
-			t.Fatalf("docker-wrapper header should mention %q", want)
-		}
-	}
-}
-
-// TestAgenticRunnerInnerDockerDNSBaked verifies host.docker.internal DNS is baked
-// into the image (daemon.json + dnsmasq config), not rewritten at runtime, and that
-// inner containers never use loopback DNS (which would point at the child container).
-func TestAgenticRunnerInnerDockerDNSBaked(t *testing.T) {
-	t.Parallel()
-	if !strings.Contains(agenticRunnerDaemonJSON, `"bip": "10.200.0.1/24"`) {
-		t.Fatalf("daemon.json should pin the default-bridge gateway, got:\n%s", agenticRunnerDaemonJSON)
-	}
-	if !strings.Contains(agenticRunnerDaemonJSON, `"10.200.0.1"`) {
-		t.Fatalf("daemon.json should point inner DNS at the bridge gateway, got:\n%s", agenticRunnerDaemonJSON)
-	}
-	if strings.Contains(agenticRunnerDaemonJSON, "127.0.0.1") {
-		t.Fatal("inner Docker DNS must not be loopback (points at the child container itself)")
-	}
-	// The inner bridge must NOT live on 172.17.x: that is the host's default Docker
-	// bridge subnet the outer runner container sits on, and overlapping it black-holes
-	// the container's outbound traffic (see daemon.json / dnsmasq comments).
-	if strings.Contains(agenticRunnerDaemonJSON, "172.17.0.") {
-		t.Fatalf("daemon.json bip must not overlap the host default bridge (172.17.0.0/16), got:\n%s", agenticRunnerDaemonJSON)
-	}
-	if !strings.Contains(agenticRunnerDnsmasqConf, "address=/host.docker.internal/10.200.0.1") {
-		t.Fatalf("dnsmasq config should answer host.docker.internal with the bridge gateway, got:\n%s", agenticRunnerDnsmasqConf)
-	}
-	// Inspect only the active directives (ignore explanatory comments) to ensure the
-	// bridge does not overlap the host default bridge 172.17.0.0/16.
-	for _, line := range strings.Split(agenticRunnerDnsmasqConf, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
-			continue
-		}
-		if strings.Contains(line, "172.17.0.") {
-			t.Fatalf("dnsmasq directive must not overlap the host default bridge (172.17.0.0/16): %q", line)
-		}
-	}
-}
-
-// TestAgenticRunnerEntrypointStartsDockerdOnce guards against re-introducing the
-// dockerd RESTART dance (a key instability source): write daemon.json, then kill and
-// restart dockerd to pick it up. The entrypoint MAY adjust the baked daemon.json for
-// collision avoidance, but only ONCE and strictly BEFORE the single dockerd start, so
-// the daemon reads the final config on its one and only start.
-func TestAgenticRunnerEntrypointStartsDockerdOnce(t *testing.T) {
-	t.Parallel()
-	// Exactly one dockerd invocation is the strong guard against the restart dance: a
-	// restart would require a second `dockerd \` launch. (We intentionally do NOT match
-	// the substring "restart dockerd" here — the entrypoint's own comments explain why
-	// the historical restart dance is forbidden, and matching that text would be a
-	// false positive.)
-	if c := strings.Count(agenticRunnerEntrypoint, "dockerd \\"); c != 1 {
-		t.Fatalf("entrypoint should start dockerd exactly once, found %d invocations", c)
-	}
-	// Any daemon.json write must precede the single dockerd start (no post-start
-	// rewrite + restart). Compare the position of the write redirection to the dockerd
-	// invocation; the comment block mentions daemon.json too, so anchor on the actual
-	// `> /etc/docker/daemon.json` redirect rather than a bare path reference.
-	dockerdIdx := strings.Index(agenticRunnerEntrypoint, "dockerd \\")
-	if writeIdx := strings.Index(agenticRunnerEntrypoint, "> /etc/docker/daemon.json"); writeIdx >= 0 {
-		if dockerdIdx < 0 || writeIdx > dockerdIdx {
-			t.Fatal("daemon.json may only be written BEFORE the single dockerd start (no post-start rewrite/restart)")
-		}
-	}
-}
-
-// TestAgenticRunnerEntrypointUnlinksStaleDockerdPid guards against re-introducing the
-// host-side hard-kill failure mode where /var/run/docker.pid is left behind on the
-// container's overlay writable layer and the next dockerd refuses to start with
-// "process with PID … is still running". The cleanup must run on every entrypoint
-// invocation and must precede the single dockerd start (it does not need to be the
-// very first line of the script — only ordered before the daemon).
-func TestAgenticRunnerEntrypointUnlinksStaleDockerdPid(t *testing.T) {
-	t.Parallel()
-	const cleanupLine = "rm -f /var/run/docker.pid"
-	if !strings.Contains(agenticRunnerEntrypoint, cleanupLine) {
-		t.Fatalf("entrypoint must unlink the stale /var/run/docker.pid before starting dockerd (missing %q)", cleanupLine)
-	}
-	cleanupIdx := strings.Index(agenticRunnerEntrypoint, cleanupLine)
-	dockerdIdx := strings.Index(agenticRunnerEntrypoint, "dockerd \\")
-	if dockerdIdx < 0 {
-		t.Fatal("entrypoint has no dockerd invocation; test setup is wrong")
-	}
-	if cleanupIdx > dockerdIdx {
-		t.Fatal("stale-pid cleanup must precede the single dockerd start (a daemon written by a later shell invocation cannot read it)")
-	}
-}
-
-// TestAgenticRunnerEntrypointWiresJobHooks verifies the per-job reset hooks are wired
-// into the runner .env so the Actions runner invokes them before/after every job.
-func TestAgenticRunnerEntrypointWiresJobHooks(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/gh-sr/hooks/job-started.sh",
-		"ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/gh-sr/hooks/job-completed.sh",
-	} {
-		if !strings.Contains(agenticRunnerEntrypoint, want) {
-			t.Fatalf("entrypoint should wire %q into .env", want)
-		}
-	}
-}
-
-// TestAgenticRunnerJobHooksReset verifies the per-job reset hooks perform the
-// deterministic teardown (containers, networks, AWF iptables, /tmp/gh-aw) and that
-// the completed hook always exits 0.
-func TestAgenticRunnerJobHooksReset(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"docker network prune -f",
-		"iptables -F DOCKER-USER",
-		"rm -rf /tmp/gh-aw",
-		"name=gh-aw-mcpg",
-		"name=awf-",
-		"ancestor=$img",
-		"ghcr.io/github/gh-aw-firewall/agent",
-		"exit 0",
-	} {
-		if !strings.Contains(agenticRunnerJobCompletedHook, want) {
-			t.Fatalf("job-completed hook must contain %q", want)
-		}
-	}
-	for _, want := range []string{
-		"docker ps -aq",
-		"docker network prune -f",
-		"chown -R runner:runner",
-		"PREROUTING",
-		"172.30.0.0/24",
-		"docker info",
-	} {
-		if !strings.Contains(agenticRunnerJobStartedHook, want) {
-			t.Fatalf("job-started hook must contain %q", want)
-		}
-	}
-}
-
-// TestAgenticRunnerJobHooksPreserveImageCache ensures per-job resets never invalidate
-// the inner Docker image-layer cache (the whole point of cache/state separation).
-func TestAgenticRunnerJobHooksPreserveImageCache(t *testing.T) {
-	t.Parallel()
-	hooks := map[string]string{
-		"job-started.sh":   agenticRunnerJobStartedHook,
-		"job-completed.sh": agenticRunnerJobCompletedHook,
-	}
-	for name, hook := range hooks {
-		for _, forbidden := range []string{
-			"docker image prune",
-			"docker system prune",
-			"docker volume prune",
-			"docker builder prune",
-			"docker rmi",
-		} {
-			if strings.Contains(hook, forbidden) {
-				t.Fatalf("%s must not invalidate the image cache with %q", name, forbidden)
-			}
-		}
-	}
-}
-
-// TestDockerWrapperInjection runs docker-wrapper.sh with GH_SR_DOCKER_WRAPPER_REAL=/bin/echo
-// so argv transformations are observable without a Docker daemon.
-func TestDockerWrapperInjection(t *testing.T) {
-	t.Parallel()
-	wrapper := filepath.Join("agentic-runner-image", "docker-wrapper.sh")
-	if _, err := os.Stat(wrapper); err != nil {
-		t.Fatalf("docker-wrapper.sh: %v", err)
-	}
-
-	echoWrap := func(t *testing.T, args ...string) string {
-		t.Helper()
-		cmd := exec.Command("bash", append([]string{wrapper}, args...)...)
-		cmd.Env = append(os.Environ(), "GH_SR_DOCKER_WRAPPER_REAL=/bin/echo")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("bash %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-
-	t.Run("mcpg_run_injects_hostname_and_name", func(t *testing.T) {
-		t.Parallel()
-		// run gets both --hostname and a deterministic gh-aw-mcpg-ghsr-* name (random
-		// suffix), and the caller's original args are preserved after the injected flags.
-		got := echoWrap(t, "run", "-i", "--rm", "--network", "host", "ghcr.io/github/gh-aw-mcpg:1.0.0")
-		if !strings.HasPrefix(got, "run --hostname gh-aw-mcpg --name gh-aw-mcpg-ghsr-") {
-			t.Fatalf("got %q, want prefix 'run --hostname gh-aw-mcpg --name gh-aw-mcpg-ghsr-'", got)
-		}
-		if !strings.HasSuffix(got, " -i --rm --network host ghcr.io/github/gh-aw-mcpg:1.0.0") {
-			t.Fatalf("got %q, original args must be preserved after injected flags", got)
-		}
-	})
-
-	t.Run("mcpg_create_injects_hostname_only", func(t *testing.T) {
-		t.Parallel()
-		// create is not named (gh-aw launches the gateway via run, and a create+start
-		// flow would break if we renamed the created container).
-		got := echoWrap(t, "create", "--network", "host", "ghcr.io/github/gh-aw-mcpg:1.0.0")
-		want := "create --hostname gh-aw-mcpg --network host ghcr.io/github/gh-aw-mcpg:1.0.0"
-		if got != want {
-			t.Fatalf("got %q want %q", got, want)
-		}
-	})
-
-	t.Run("mcpg_run_respects_caller_name", func(t *testing.T) {
-		t.Parallel()
-		got := echoWrap(t, "run", "--name", "custom-gw", "ghcr.io/github/gh-aw-mcpg:1")
-		want := "run --hostname gh-aw-mcpg --name custom-gw ghcr.io/github/gh-aw-mcpg:1"
-		if got != want {
-			t.Fatalf("got %q want %q (must not override caller --name)", got, want)
-		}
-		if strings.Contains(got, "gh-aw-mcpg-ghsr-") {
-			t.Fatalf("got %q, must not inject our name when caller set --name", got)
-		}
-	})
-
-	t.Run("mcpg_hostname_present_passthrough", func(t *testing.T) {
-		t.Parallel()
-		got := echoWrap(t, "run", "--hostname", "custom", "ghcr.io/github/gh-aw-mcpg:1")
-		if strings.Contains(got, "--hostname gh-aw-mcpg") {
-			t.Fatalf("got %q, must not duplicate hostname", got)
-		}
-		if !strings.Contains(got, "--hostname custom") {
-			t.Fatalf("got %q, caller hostname must be preserved", got)
-		}
-		if !strings.Contains(got, "--name gh-aw-mcpg-ghsr-") {
-			t.Fatalf("got %q, run should still get a gh-sr gateway name", got)
-		}
-	})
-
-	t.Run("awf_agent_passthrough_unmodified", func(t *testing.T) {
-		t.Parallel()
-		// Networking is handled by baked DNS now; the shim no longer injects --add-host.
-		got := echoWrap(t, "run", "--rm", "ghcr.io/github/gh-aw-firewall/agent:2.3.4")
-		want := "run --rm ghcr.io/github/gh-aw-firewall/agent:2.3.4"
-		if got != want {
-			t.Fatalf("got %q want %q", got, want)
-		}
-	})
-
-	t.Run("passthrough_non_aw", func(t *testing.T) {
-		t.Parallel()
-		args := []string{"run", "--rm", "alpine:latest", "sh", "-c", "true"}
-		got := echoWrap(t, args...)
-		want := strings.Join(args, " ")
-		if got != want {
-			t.Fatalf("got %q want %q", got, want)
-		}
-	})
-
-	t.Run("mcpg_no_add_host_injected", func(t *testing.T) {
-		t.Parallel()
-		got := echoWrap(t, "run", "ghcr.io/github/gh-aw-mcpg:agent-test")
-		if !strings.Contains(got, "--hostname gh-aw-mcpg") {
-			t.Fatalf("expected mcpg hostname injection, got %q", got)
-		}
-		if strings.Contains(got, "--add-host") {
-			t.Fatalf("shim must not inject --add-host anymore, got %q", got)
-		}
-	})
-}
-
-// TestDockerWrapperMcpgForwardsStdin verifies gh-aw's piped MCP gateway JSON reaches
-// the real docker child. Because the shim `exec`s docker, stdin passes through with no
-// supervisor.
-func TestDockerWrapperMcpgForwardsStdin(t *testing.T) {
-	t.Parallel()
-	tmp := t.TempDir()
-	stdinLog := filepath.Join(tmp, "stdin-captured.txt")
-	fakeDocker := filepath.Join(tmp, "docker")
-	script := `#!/bin/bash
-set -euo pipefail
-cmd=${1:-}
-shift || true
-if [[ "$cmd" == "run" ]]; then
-	cat >"${FAKE_DOCKER_STDIN_LOG:?}"
-fi
-exit 0
-`
-	if err := os.WriteFile(fakeDocker, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	wrapper := filepath.Join("agentic-runner-image", "docker-wrapper.sh")
-	if _, err := os.Stat(wrapper); err != nil {
-		t.Fatalf("docker-wrapper.sh: %v", err)
-	}
-
-	payload := `{"gateway":{"port":80,"domain":"host.docker.internal"}}`
-	cmd := exec.Command("bash", "-c", `printf '%s' "$GHSR_PAYLOAD" | bash "$GHSR_WRAPPER" run -i --rm --network host ghcr.io/github/gh-aw-mcpg:1.0.0`)
-	cmd.Env = append(os.Environ(),
-		"GHSR_PAYLOAD="+payload,
-		"GHSR_WRAPPER="+wrapper,
-		"GH_SR_DOCKER_WRAPPER_REAL="+fakeDocker,
-		"FAKE_DOCKER_STDIN_LOG="+stdinLog,
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("wrapper stdin pipe: %v\n%s", err, out)
-	}
-
-	got, err := os.ReadFile(stdinLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != payload {
-		t.Fatalf("gateway stdin: got %q want %q", got, payload)
-	}
-}
-
-func TestAgenticRunnerDockerfileInstallsAWF(t *testing.T) {
-	t.Parallel()
-
-	for _, want := range []string{
-		"https://raw.githubusercontent.com/github/gh-aw-firewall/main/install.sh",
-		"AWF_FORCE_BINARY=1",
-		"awf --version",
-	} {
-		if !strings.Contains(agenticRunnerDockerfile, want) {
-			t.Fatalf("Dockerfile should install and verify awf with %q, got:\n%s", want, agenticRunnerDockerfile)
-		}
-	}
-}
-
-func TestAgenticRunnerDockerfileInstallsNodeLTS(t *testing.T) {
-	t.Parallel()
-
-	for _, want := range []string{
-		"https://deb.nodesource.com/setup_lts.x",
-		"apt-get install -y --no-install-recommends nodejs",
-		"node -v",
-		"npm -v",
-	} {
-		if !strings.Contains(agenticRunnerDockerfile, want) {
-			t.Fatalf("Dockerfile should install Node.js LTS with %q, got:\n%s", want, agenticRunnerDockerfile)
-		}
-	}
-}
-
-// TestAgenticRunnerDockerfileBakesNetworkAndHooks verifies the Dockerfile bakes the
-// deterministic network config and installs the per-job reset hooks.
-func TestAgenticRunnerDockerfileBakesNetworkAndHooks(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"COPY daemon.json /etc/docker/daemon.json",
-		"COPY dnsmasq-gh-sr.conf /etc/dnsmasq.d/gh-sr.conf",
-		"COPY hooks/job-started.sh /opt/gh-sr/hooks/job-started.sh",
-		"COPY hooks/job-completed.sh /opt/gh-sr/hooks/job-completed.sh",
-	} {
-		if !strings.Contains(agenticRunnerDockerfile, want) {
-			t.Fatalf("Dockerfile should bake %q, got:\n%s", want, agenticRunnerDockerfile)
-		}
-	}
-}
-
-// TestAgenticRunnerDockerfileSymlinksHostedToolCache guards the compatibility shim
-// for actions that hardcode /opt/hostedtoolcache (notably ruby/setup-ruby@v1,
-// which deliberately ignores $RUNNER_TOOL_CACHE when it doesn't detect a
-// self-hosted runner — see issue #405). Without the symlink the runner user's
-// `mkdir /opt/hostedtoolcache/Ruby/...` fails with EACCES because /opt is owned
-// by root and the new image no longer creates /opt/hostedtoolcache.
-func TestAgenticRunnerDockerfileSymlinksHostedToolCache(t *testing.T) {
-	t.Parallel()
-	// Both the new tool-cache root and the symlink must be created in one RUN
-	// so the symlink is guaranteed to resolve to a runner-owned directory at
-	// image-build time.
-	if !strings.Contains(agenticRunnerDockerfile, "ln -s /home/runner/.toolcache /opt/hostedtoolcache") {
-		t.Fatalf("Dockerfile should symlink /opt/hostedtoolcache -> /home/runner/.toolcache, got:\n%s", agenticRunnerDockerfile)
-	}
-	// The chown and the symlink must share the same RUN (single layer) so the
-	// symlink target exists and is owned by runner when the layer is committed.
-	if !strings.Contains(agenticRunnerDockerfile, "mkdir -p /home/runner/.toolcache && chown runner:runner /home/runner/.toolcache \\\n    && ln -s /home/runner/.toolcache /opt/hostedtoolcache") {
-		t.Fatal("symlink and tool-cache mkdir must run in a single RUN layer (chown must precede ln)")
-	}
-	// RUNNER_TOOL_CACHE in the entrypoint must remain /home/runner/.toolcache —
-	// the gh-aw mount guard from 5a8ae78 depends on the env var NOT being
-	// rewritten to /opt/hostedtoolcache.
-	if !strings.Contains(agenticRunnerEntrypoint, `RUNNER_TOOL_CACHE="/home/runner/.toolcache"`) {
-		t.Fatal("entrypoint must keep RUNNER_TOOL_CACHE at /home/runner/.toolcache so the AWF mount guard continues to pass")
-	}
-}
-
-func TestAgenticRunnerDockerfileDockerShimLayout(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"/opt/gh-sr/docker-shim/docker",
-		"COPY docker-wrapper.sh /opt/gh-sr/docker-shim/docker",
-		"/etc/profile.d/gh-sr-docker-shim.sh",
-		"Defaults:runner secure_path=",
-		"/opt/gh-sr/docker-shim:",
-		"visudo -cf /etc/sudoers.d/runner-secure-path",
-	} {
-		if !strings.Contains(agenticRunnerDockerfile, want) {
-			t.Fatalf("Dockerfile should contain %q, got:\n%s", want, agenticRunnerDockerfile)
-		}
-	}
-	if strings.Contains(agenticRunnerDockerfile, "COPY docker-wrapper.sh /usr/local/bin/docker") {
-		t.Fatal("Dockerfile should not install docker-wrapper at /usr/local/bin/docker")
-	}
-}
-
-func TestAgenticRunnerEntrypointPrependsDockerShimPATH(t *testing.T) {
-	t.Parallel()
-	if !strings.Contains(agenticRunnerEntrypoint, "PATH=/opt/gh-sr/docker-shim:\\$PATH") {
-		t.Fatalf("entrypoint RUNNER_ENV should prepend docker shim PATH, got:\n%s", agenticRunnerEntrypoint)
-	}
-}
-
-// TestAgenticRunnerEntrypointPinsMTU verifies the entrypoint pins the inner-bridge MTU
-// (daemon.json), the outer egress interface MTU, and installs an MSS clamp when the
-// host egress MTU (GH_SR_HOST_MTU) is below 1500 — the fix for reduced-MTU host networks
-// that otherwise break large-packet TLS handshakes (e.g. actions/setup-go).
-func TestAgenticRunnerEntrypointPinsMTU(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"GH_SR_HOST_MTU",
-		`"mtu":`,            // injected into daemon.json
-		"write_daemon_json", // single daemon.json emitter (before the one dockerd start)
-		"ip link set dev",   // lower the outer container's egress interface MTU
-		"clamp-mss-to-pmtu", // belt-and-suspenders MSS clamp for forwarded inner traffic
-	} {
-		if !strings.Contains(agenticRunnerEntrypoint, want) {
-			t.Fatalf("entrypoint should pin MTU: missing %q", want)
-		}
-	}
-	// The MTU write must still go through the single pre-dockerd daemon.json path: the
-	// daemon.json redirect lives inside write_daemon_json, before the one dockerd start.
-	// (TestAgenticRunnerEntrypointStartsDockerdOnce enforces the ordering invariant.)
-	if strings.Count(agenticRunnerEntrypoint, "dockerd \\") != 1 {
-		t.Fatal("MTU changes must not add a second dockerd start")
-	}
-}
-
-func TestAgenticRunnerEntrypointDockerdBootstrapResilience(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"GH_SR_DOCKERD_START_TIMEOUT",
-		"GH_SR_BOOTSTRAP_MAX_RETRIES",
-		"DOCKERD_START_TIMEOUT",
-		"BOOTSTRAP_MAX_RETRIES",
-		"dockerd-start-failures",
-		"bootstrap-failed",
-		"exec sleep infinity",
-	} {
-		if !strings.Contains(agenticRunnerEntrypoint, want) {
-			t.Fatalf("entrypoint should implement bootstrap resilience: missing %q", want)
-		}
-	}
-	if strings.Contains(agenticRunnerEntrypoint, "seq 1 30") {
-		t.Fatal("entrypoint must not hard-code a 30s dockerd wait loop")
-	}
-}
-
-// TestContainerRestartPolicy pins the "unless-stopped" choice. This policy
-// restarts the container on every non-explicit exit (crash, OOM, inner
-// process shutdown, Docker daemon restart, host reboot) while still honoring
-// `docker stop` / `gh sr down` — closing the historical "agentic runner just
-// stopped, not restart" failure mode that the old "on-failure:N" policy had
-// (clean exits left the container permanently down). The bootstrap-failure
-// bound is now the entrypoint's `bootstrap-failed` marker + `exec sleep
-// infinity`, not Docker's retry counter.
 func TestContainerRestartPolicy(t *testing.T) {
 	t.Parallel()
 	if got := containerRestartPolicy(); got != "unless-stopped" {
@@ -722,7 +216,7 @@ func TestBuildAgenticRunnerImageCmdShape(t *testing.T) {
 	t.Parallel()
 	version := "2.320.0"
 	arch := "x64"
-	imageTag := AgenticRunnerImageTag + ":" + version
+	imageTag := ContainerRunnerImageTag + ":" + version
 	ghVer := "vtest"
 	rev := ContainerImageLayoutRevision(ghVer, nil)
 	labelRev := hostshell.PosixSingleQuote(dockerLabelImageRevision + "=" + rev)
@@ -1241,7 +735,6 @@ func TestSetupContainer_ContainersPresenceOneSshRoundTrip(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      3,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 	if err := m.setupContainer(h, rc); err != nil {
@@ -1287,7 +780,6 @@ func TestNeedsSetup_ContainerOneSshRoundTrip(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      5,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 	if m.NeedsSetup(h, rc) {
@@ -1576,7 +1068,6 @@ func TestSetupContainer_ensureDockerBeforeImageBuild(t *testing.T) {
 		Name:       "aw-runner",
 		Repo:       "o/r",
 		Host:       "h",
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -1642,7 +1133,6 @@ func TestSetupContainer_emitsBuildProgressMessageWhenImageMissing(t *testing.T) 
 		Name:       "aw-runner",
 		Repo:       "o/r",
 		Host:       "h",
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -1680,7 +1170,6 @@ func TestSetupContainer_propagatesDockerGroupPending(t *testing.T) {
 		Name:       "aw-runner",
 		Repo:       "o/r",
 		Host:       "h",
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -1710,7 +1199,7 @@ func releaseHandler(tag string) http.HandlerFunc {
 
 // TestManager_resolveRunnerImageInputs verifies the resolved (version, arch, imageTag)
 // triple: version comes from GitHub, arch from archForGitHub(h.Arch), imageTag from
-// ContainerRunnerImageTag(version, extraApt). This is the triplicated preamble that
+// buildContainerRunnerImageTag(version, extraApt). This is the triplicated preamble that
 // #228 flagged across setupContainer / rebuildContainerImage / Provision.
 func TestManager_resolveRunnerImageInputs(t *testing.T) {
 	t.Parallel()
@@ -1741,7 +1230,7 @@ func TestManager_resolveRunnerImageInputs(t *testing.T) {
 	if arch != archForGitHub("amd64") {
 		t.Errorf("arch: got %q, want %q", arch, archForGitHub("amd64"))
 	}
-	wantTag := ContainerRunnerImageTag("2.330.0", []string{"sqlite3", "ffmpeg"})
+	wantTag := buildContainerRunnerImageTag("2.330.0", []string{"sqlite3", "ffmpeg"})
 	if imageTag != wantTag {
 		t.Errorf("imageTag: got %q, want %q", imageTag, wantTag)
 	}
@@ -2014,7 +1503,6 @@ func TestRebuildContainerImage_chainsStopAndRemovePerInstance(t *testing.T) {
 		Name:       "aw-runner",
 		Repo:       "o/r",
 		Host:       "h",
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 		Count:      3,
 	}
@@ -2078,7 +1566,6 @@ func TestRemoveContainer_chainsStopAndRemove(t *testing.T) {
 		Name:       "aw-runner",
 		Repo:       "o/r",
 		Host:       "h",
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 		Count:      3,
 	}
@@ -2148,7 +1635,6 @@ func TestRemoveContainer_propagatesChainedTeardownError(t *testing.T) {
 		Name:       "aw-runner",
 		Repo:       "o/r",
 		Host:       "h",
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 		Count:      1,
 	}

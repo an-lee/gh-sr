@@ -65,7 +65,6 @@ func envTestRig(t *testing.T, mock host.Executor, regTokStatus int) *ContainerEn
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      1,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 	return m.NewContainerEnvironment(h, rc, 0, "aw-1")
@@ -91,7 +90,6 @@ func envTestRigVersionFail(t *testing.T, mock host.Executor) *ContainerEnvironme
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      1,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 	return m.NewContainerEnvironment(h, rc, 0, "aw-1")
@@ -114,7 +112,7 @@ func TestContainerEnvironmentProvision_nonLinuxReturnsError(t *testing.T) {
 	h.SetConn(mock)
 
 	m := &Manager{Out: io.Discard}
-	rc := config.RunnerConfig{Name: "aw", Repo: "o/r", Host: "h", Count: 1, Profile: "agentic", RunnerMode: config.RunnerModeContainer}
+	rc := config.RunnerConfig{Name: "aw", Repo: "o/r", Host: "h", Count: 1, RunnerMode: config.RunnerModeContainer}
 	env := m.NewContainerEnvironment(h, rc, 0, "aw-1")
 
 	err := env.Provision()

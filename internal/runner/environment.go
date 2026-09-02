@@ -96,10 +96,9 @@ func (e *ContainerEnvironment) Start() error {
 }
 
 // AwaitHealthy waits until the container is running, the inner dockerd responds, and
-// the actions runner is registered inside it. For agentic runners it additionally
-// requires host.docker.internal to resolve via the baked DNS (the path gh-aw needs).
+// the actions runner is registered inside it.
 func (e *ContainerEnvironment) AwaitHealthy(timeout time.Duration) error {
-	return containerAwaitHealthy(e.h, e.instance, e.rc.IsAgentic(), timeout)
+	return containerAwaitHealthy(e.h, e.instance, timeout)
 }
 
 // Reset runs the per-job teardown inside the container out-of-band. Normally the runner
@@ -119,26 +118,24 @@ func (e *ContainerEnvironment) Destroy() error {
 // innerHostDockerInternalReadyCommand returns a cheap probe (run via docker exec on the
 // runner container) that confirms the bundled dnsmasq answers host.docker.internal with a
 // non-loopback address on the pinned bridge gateway. It queries dnsmasq directly (dig comes
-// from dnsutils in the image), so it needs no child-container image pull. This is the DNS
-// dependency gh-aw's agent containers rely on; gh sr doctor performs the fuller
-// child-container check (see agentic.ValidateContainerInnerNetwork).
+// from dnsutils in the image), so it needs no child-container image pull.
 //
 // The gateway is pinned to 10.200.0.1 (see daemon.json / dnsmasq-gh-sr.conf) — NOT
 // 172.17.0.1, which would collide with the host's default Docker bridge that the outer
 // runner container itself sits on. We resolve the live docker0 gateway at probe time
 // (falling back to 10.200.0.1) so the check stays correct even when the entrypoint's
 // collision-avoidance picked a different candidate subnet for an unusual host network.
+// innerHostDockerInternalReadyCommand is retained for future CI workflows that may need
+// host.docker.internal to resolve; unused by the current readiness check.
 func innerHostDockerInternalReadyCommand(instanceName string) string {
 	return DockerExecCommand(containerName(instanceName), `sh -c 'gw=$(ip -4 -o addr show docker0 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1); [ -n "$gw" ] || gw=10.200.0.1; ip=$(dig +short host.docker.internal @"$gw" 2>/dev/null | head -n1); case "$ip" in "" | 127.* | ::1) exit 1 ;; *) exit 0 ;; esac'`)
 }
 
 // containerAwaitHealthy polls until the runner container is ready to accept jobs or the
 // timeout elapses. Readiness gate: container running + inner dockerd responsive +
-// actions runner registered (.runner present) + (for agentic) host.docker.internal
-// resolving via the baked DNS. Reuses the same signals as gh sr doctor.
-func containerAwaitHealthy(h *host.Host, instanceName string, agentic bool, timeout time.Duration) error {
+// actions runner registered (.runner present).
+func containerAwaitHealthy(h *host.Host, instanceName string, timeout time.Duration) error {
 	cname := containerName(instanceName)
-	dnsCmd := innerHostDockerInternalReadyCommand(instanceName)
 	deadline := nowFn().Add(timeout)
 	lastErr := fmt.Errorf("container %s not ready", cname)
 
@@ -150,12 +147,6 @@ func containerAwaitHealthy(h *host.Host, instanceName string, agentic bool, time
 				lastErr = fmt.Errorf("inner dockerd not responding inside %s", cname)
 			} else if !rep.Registered {
 				lastErr = fmt.Errorf("actions runner not yet registered inside %s", cname)
-			} else if agentic {
-				if _, err := h.Run(dnsCmd); err != nil {
-					lastErr = fmt.Errorf("host.docker.internal not resolving via baked DNS inside %s", cname)
-				} else {
-					return nil
-				}
 			} else {
 				return nil
 			}

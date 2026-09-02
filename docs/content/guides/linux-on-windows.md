@@ -33,20 +33,18 @@ runners:
     mode: docker
     labels: [self-hosted, Linux, X64]
 
-  # Same Linux runner, tuned for GitHub Agentic Workflows (MCP gateway + awf firewall)
-  - name: myapp-linux-agentic
+  # Linux runner in a Docker container for service-container isolation
+  - name: myapp-linux-container
     repo: owner/repo
     host: win-pc
     mode: docker
-    docker_network_mode: host
-    docker_cap_add: [NET_ADMIN]
     labels: [self-hosted, Linux, X64]
 ```
 
 Both runners share a single SSH connection to Windows. The native runner starts `run.cmd` via PowerShell; the Docker runner calls `docker run` the same way, which talks to Docker Desktop's Linux engine.
 
-Docker-mode Linux containers include a bind mount of `/var/run/docker.sock` so jobs can run `docker` against the same engine (GitHub Actions service containers, image pulls, [Agentic Workflows](https://github.github.com/gh-aw/guides/self-hosted-runners/) tooling, and similar). Use **Linux containers** in Docker Desktop (the default); Windows containers mode cannot run the `actions-runner` Linux image.
+Docker-mode Linux containers include a bind mount of `/var/run/docker.sock` so jobs can run `docker` against the same engine (GitHub Actions service containers, image pulls, and similar). Use **Linux containers** in Docker Desktop (the default); Windows containers mode cannot run the `actions-runner` Linux image.
 
 **Docker socket permissions:** Inside Docker Desktop's Linux engine, `/var/run/docker.sock` is often group-restricted (like on Linux). The official `actions-runner` image runs as user `runner` (uid 1001), so **gh sr** probes the socket's owning GID by running a short disposable `docker run` (using the same runner image) and, when it gets a non-zero numeric GID, passes **`--group-add`** on `docker run` for your runner container (the same fix as on bare Linux hosts, without needing Unix `stat` on the Windows side). If the probe fails, gh sr still bind-mounts the socket (mount-only fallback). No `docker_socket` override is needed or supported on Windows hosts.
 
-**GitHub Agentic Workflows:** Use **`docker_network_mode: host`** and **`docker_cap_add: [NET_ADMIN]`** so jobs can reach the MCP gateway on `localhost` and run the Agent Workflow Firewall (`awf`), which needs `iptables` inside the runner container. See [Host setup — GitHub Agentic Workflows](../host-setup.md#github-agentic-workflows-gh-aw).
+**Service containers:** For workflows using `services:`, the container mode provides an inner Docker daemon that service containers attach to. Use **`runner_mode: container`** (or in this guide's `mode: docker` form, leave the default DinD setup). See [Host setup](../host-setup.md#container-mode).

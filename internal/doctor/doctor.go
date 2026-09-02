@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/an-lee/gh-sr/internal/agentic"
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/host"
 	"github.com/an-lee/gh-sr/internal/runner"
@@ -292,8 +291,7 @@ func printAPIFailures(w io.Writer, r *Result, results []apiResult) {
 
 // installTargetsForHost lists (instanceName, runnerConfigName) pairs for
 // runners on hostName that satisfy predicate. The predicate is the single
-// place the caller expresses mode/profile policy (native vs container vs
-// container+agentic vs any future bucket).
+// place the caller expresses mode policy (native vs container).
 func installTargetsForHost(runners []config.RunnerConfig, hostName string, predicate func(*config.RunnerConfig) bool) [][2]string {
 	var out [][2]string
 	for i := range runners {
@@ -349,12 +347,8 @@ func runHostChecks(w io.Writer, hostName string, h *host.Host, runners []config.
 		}
 	}
 	if hasContainerModeRunners(hostRunners) {
-		checkContainerHostPrereqs(w, hostName, h, r)
 		if h.OS == "linux" {
 			checkContainerRunnerInstall(w, hostName, h, runners, r)
-			if hasContainerAgenticRunners(hostRunners) {
-				checkContainerAgenticInnerHygiene(w, hostName, h, runners, r)
-			}
 		}
 	}
 	if h.OS == "linux" || h.OS == "darwin" || h.OS == "windows" {
@@ -448,65 +442,6 @@ func checkLinuxSudo(w io.Writer, hostName string, h *host.Host, r *Result) {
 	printLine(w, sevOK, hostName, "linux: non-root user has passwordless sudo")
 }
 
-// hasContainerAgenticRunners returns true if any runner uses agentic profile in container mode.
-func hasContainerAgenticRunners(runners []config.RunnerConfig) bool {
-	for _, rc := range runners {
-		if rc.IsAgentic() && rc.IsContainerMode() {
-			return true
-		}
-	}
-	return false
-}
-
-// printAgenticFailures renders a slice of agentic failures against the doctor
-// output, classifying each by severity and emitting remediation lines + doc-ref.
-// defaultSev governs the severity for any failure whose Severity is neither
-// SeverityError nor SeverityWarning (call sites use it to bias toward
-// fail-by-default for host-prereqs vs. warn-by-default for inner-hygiene).
-// Each failure increments either r.Fail or r.Warn as it is rendered.
-func printAgenticFailures(w io.Writer, hostName string, r *Result, defaultSev, prefix string, failures []agentic.PrereqFailure) {
-	for _, f := range failures {
-		sev := defaultSev
-		switch f.Severity {
-		case agentic.SeverityError:
-			sev = sevFail
-			r.Fail++
-		case agentic.SeverityWarning:
-			sev = sevWarn
-			r.Warn++
-		default:
-			if defaultSev == sevWarn {
-				r.Warn++
-			} else {
-				r.Fail++
-			}
-		}
-		printLine(w, sev, hostName, prefix+f.Message)
-		if f.Remediation != "" {
-			for _, line := range strings.Split(f.Remediation, "\n") {
-				fmt.Fprintf(w, "       %s\n", line)
-			}
-		}
-		if f.DocRef != "" {
-			fmt.Fprintf(w, "       See: %s\n", f.DocRef)
-		}
-	}
-}
-
-// checkContainerHostPrereqs checks host requirements for runner_mode: container (DinD).
-// The inner dockerd, dnsmasq, and iptables live inside the runner image; only the
-// outer Docker daemon and --privileged support are checked here.
-func checkContainerHostPrereqs(w io.Writer, hostName string, h *host.Host, r *Result) {
-	failures := agentic.ValidateContainerPrereqs(h)
-
-	if len(failures) == 0 {
-		printLine(w, sevOK, hostName, "container: host Docker available and --privileged supported")
-		return
-	}
-
-	printAgenticFailures(w, hostName, r, sevFail, "container: ", failures)
-}
-
 // checkContainerRunnerInstall verifies each DinD runner container exists on the host,
 // is running (warn otherwise), inner dockerd responds, and .runner is present inside the image path.
 func checkContainerRunnerInstall(w io.Writer, hostName string, h *host.Host, runners []config.RunnerConfig, r *Result) {
@@ -547,46 +482,6 @@ func checkContainerRunnerInstall(w io.Writer, hostName string, h *host.Host, run
 			continue
 		}
 		printLine(w, sevOK, hostName, fmt.Sprintf("container: instance %s — registered (.runner present in %s)", inst, cname))
-	}
-}
-
-// checkContainerAgenticInnerHygiene runs AWF orphan and network checks against the inner Docker in each running DinD agentic runner.
-func checkContainerAgenticInnerHygiene(w io.Writer, hostName string, h *host.Host, runners []config.RunnerConfig, r *Result) {
-	targets := installTargetsForHost(runners, hostName, func(rc *config.RunnerConfig) bool { return rc.IsAgentic() })
-	if len(targets) == 0 {
-		return
-	}
-	// Host egress MTU is host-level; detect once and reuse for every instance's MTU check.
-	hostEgressMTU := runner.DetectHostEgressMTU(h)
-
-	for _, pair := range targets {
-		inst := pair[0]
-		runnerName := pair[1]
-		cname := runner.ContainerDockerName(inst)
-
-		out, err := runner.ContainerStateStatus(h, cname)
-		status := out
-		// Stricter than IsContainerAcceptingJobs: the inner AWF/network probes
-		// below need a fully-running container, not a transient "restarting"
-		// state, so we require exactly "running".
-		if err != nil || status != "running" {
-			continue
-		}
-
-		failures := agentic.ValidateAWFHygieneInner(h, cname)
-		// Fan the six inner-docker agentic prereq probes (NodeNPM, AWF,
-		// InnerNetwork, InnerResolv, AWFServiceRouting, MTU) into a single
-		// `docker exec` round-trip via ValidateContainerAgenticFanout. This
-		// replaces the six separate h.Run calls that used to issue per
-		// container scanned by `gh sr doctor` with one — same observable
-		// PrereqFailure surface, six fewer SSH round-trips per instance.
-		// See PR #264/#269/#285/#301/#317 for the same win-class.
-		failures = append(failures, agentic.ValidateContainerAgenticFanout(h, cname, runnerName, hostEgressMTU)...)
-		if len(failures) == 0 {
-			printLine(w, sevOK, hostName, fmt.Sprintf("container(agent): awf installed, inner Docker clean, host.docker.internal reachable, resolv.conf pinned to dnsmasq, and AWF service-routing bypass present (%s)", cname))
-			continue
-		}
-		printAgenticFailures(w, hostName, r, sevWarn, "container(agent): ", failures)
 	}
 }
 

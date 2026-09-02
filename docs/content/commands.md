@@ -55,7 +55,7 @@ gh sr down enjoy-win-1
 `gh sr doctor` validates local paths, configuration, GitHub API access, and host prerequisites. Checks are scoped to runners matching `--host` / `--repo` filters:
 
 - **Native** (`runner_mode: native`): curl/tar (or PowerShell on Windows), runner install dirs, Linux passwordless sudo when needed for setup.
-- **Container** (`runner_mode: container` or `profile: agentic` on Linux): host Docker and `--privileged` support, each `gh-sr-<instance>` container, inner `dockerd`, registration, and (for agentic) inner AWF/DNS/hygiene. On non-Linux hosts, doctor reports a FAIL if container-mode runners are in scope.
+- **Container** (`runner_mode: container` on Linux): host Docker and `--privileged` support, each `gh-sr-<instance>` container, inner `dockerd`, and registration. On non-Linux hosts, doctor reports a FAIL if container-mode runners are in scope.
 
 By default only **FAIL** lines produce a non-zero exit. Use **`--strict`** to fail on **WARN** as well (useful in CI). Use **`--fix`** to re-run `gh sr setup` when doctor reports failures, then always re-run doctor; the final exit code reflects the post-fix result.
 
@@ -105,7 +105,7 @@ gh sr hosts --host mac-mini
 
 ## Disk usage and cleanup
 
-Runner workspaces under `~/.gh-sr/runners/<instance>` accumulate job checkouts (`_work`), temp files (`_temp`), and — for container/agentic runners — a persistent inner Docker cache (`docker-data`). Per-job hooks wipe runtime state inside the container but **never** prune the image cache, so disk use can grow large over time.
+Runner workspaces under `~/.gh-sr/runners/<instance>` accumulate job checkouts (`_work`), temp files (`_temp`), and — for container runners — a persistent inner Docker cache (`docker-data`). Per-job hooks wipe runtime state inside the container but **never** prune the image cache, so disk use can grow large over time.
 
 ```bash
 gh sr disk usage                    # breakdown per host/instance
@@ -122,7 +122,7 @@ gh sr disk schedule uninstall
 **Notes:**
 
 - Busy runners (active job on GitHub) are always skipped.
-- Default prune keeps inner Docker cache (`docker-data`) so the next agentic job does not re-pull gh-aw images. Use `--prune-cache` when you need maximum disk recovery.
+- Default prune keeps inner Docker cache (`docker-data`) so the next container job does not re-pull image layers. Use `--prune-cache` when you need maximum disk recovery.
 - `gh sr cleanup` removes **offline GitHub registrations** only — it does not free disk. Use `gh sr disk prune` for workspace cleanup.
 - `gh sr doctor` warns when any instance directory exceeds 50 GiB (including orphan dirs).
 - `gh sr disk schedule install` runs on **this machine** (where you run gh), not on runner hosts. Ensure `gh` is on PATH, `gh auth login` is done, and `~/.gh-sr/env` contains any tokens needed for remote hosts. On Linux headless servers, run `loginctl enable-linger $USER` so the systemd user timer runs without an interactive login. SSH keys for remote hosts must be available to the scheduled job's user environment.

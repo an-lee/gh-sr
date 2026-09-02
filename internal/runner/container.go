@@ -14,10 +14,10 @@ import (
 	"github.com/an-lee/gh-sr/internal/hostshell"
 )
 
-// AgenticRunnerImageTag is the local Docker image tag built by gh sr setup.
-const AgenticRunnerImageTag = "gh-sr/agentic-runner"
+// ContainerRunnerImageTag is the local Docker image tag built by gh sr setup.
+const ContainerRunnerImageTag = "gh-sr/container-runner"
 
-// Docker image labels stamped at build time (see buildAgenticRunnerImage).
+// Docker image labels stamped at build time (see buildContainerRunnerImage).
 const (
 	dockerLabelImageRevision = "gh-sr.image-revision"
 	dockerLabelCLIVersion    = "gh-sr.cli-version"
@@ -39,8 +39,8 @@ const (
 const sessionConflictMsg = "Session Conflict"
 
 // ContainerImageLayoutRevision returns a short hex fingerprint of the embedded
-// container image layout (Dockerfile, manifests, entrypoint, wrapper), gh-sr
-// CLI version, and extra apt package list. It changes when any of those inputs change.
+// container image layout (Dockerfile, entrypoint), gh-sr CLI version, and
+// extra apt package list. It changes when any of those inputs change.
 func ContainerImageLayoutRevision(ghSrVersion string, extraApt []string) string {
 	if ghSrVersion == "" {
 		ghSrVersion = "unknown"
@@ -53,14 +53,8 @@ func ContainerImageLayoutRevision(ghSrVersion string, extraApt []string) string 
 		b.WriteString(p)
 		b.WriteByte('\n')
 	}
-	b.WriteString(agenticRunnerDockerfile)
-	b.WriteString(agenticRunnerAptPackagesCore)
-	b.WriteString(agenticRunnerEntrypoint)
-	b.WriteString(agenticRunnerDockerWrapper)
-	b.WriteString(agenticRunnerDaemonJSON)
-	b.WriteString(agenticRunnerDnsmasqConf)
-	b.WriteString(agenticRunnerJobStartedHook)
-	b.WriteString(agenticRunnerJobCompletedHook)
+	b.WriteString(containerRunnerDockerfile)
+	b.WriteString(containerRunnerEntrypoint)
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])[:12]
 }
@@ -84,10 +78,11 @@ func containerRunnerImageExtraSorted(extra []string) []string {
 	return out
 }
 
-// ContainerRunnerImageTag returns the Docker image reference for the container runner
-// (e.g. gh-sr/agentic-runner:2.320.0 or gh-sr/agentic-runner:2.320.0-xa1b2c3d when extras are set).
-func ContainerRunnerImageTag(actionsRunnerVersion string, extraApt []string) string {
-	base := fmt.Sprintf("%s:%s", AgenticRunnerImageTag, actionsRunnerVersion)
+// buildContainerRunnerImageTag returns the Docker image reference for the container
+// runner (e.g. gh-sr/container-runner:2.320.0 or gh-sr/container-runner:2.320.0-xa1b2c3d
+// when extras are set).
+func buildContainerRunnerImageTag(actionsRunnerVersion string, extraApt []string) string {
+	base := fmt.Sprintf("%s:%s", ContainerRunnerImageTag, actionsRunnerVersion)
 	sorted := containerRunnerImageExtraSorted(extraApt)
 	if len(sorted) == 0 {
 		return base
@@ -364,6 +359,15 @@ func (m *Manager) setupContainer(h *host.Host, rc config.RunnerConfig) error {
 	version, arch, imageTag, err := m.resolveRunnerImageInputs(h)
 	if err != nil {
 		return err
+	}
+
+	// Migration nudge: if a pre-rename `gh-sr/agentic-runner` image is still
+	// on the host from a previous gh-sr install, surface it once so the user
+	// knows to `docker rmi` it manually. We don't auto-rmi because removing
+	// arbitrary image tags can break other runners whose containers still
+	// reference those digests.
+	if msg, ok := detectLegacyContainerRunnerImage(h); ok {
+		fmt.Fprintf(m.out(), "  %s: %s\n", rc.Name, msg)
 	}
 
 	fmt.Fprintf(m.out(), "  %s: checking container runner image %s...\n", rc.Name, imageTag)
@@ -929,15 +933,20 @@ func (m *Manager) rebuildContainerImage(h *host.Host, rc config.RunnerConfig) er
 		return err
 	}
 
+	// Migration nudge: see detectLegacyContainerRunnerImage in setupContainer.
+	if msg, ok := detectLegacyContainerRunnerImage(h); ok {
+		fmt.Fprintf(m.out(), "  %s: %s\n", rc.Name, msg)
+	}
+
 	// Remove only this tag so we force a fresh build. Do not `docker rmi` every
-	// gh-sr/agentic-runner image on the host: other runners' containers may still
+	// gh-sr/container-runner image on the host: other runners' containers may still
 	// reference those digests; removing them breaks `docker image inspect` and
 	// BUILD shows "?" until those runners are rebuilt too.
 	fmt.Fprintf(m.out(), "  %s: removing image %s (if present)...\n", rc.Name, imageTag)
 	_, _ = h.Run(fmt.Sprintf("docker rmi -f %s 2>/dev/null || true", hostshell.PosixSingleQuote(imageTag)))
 
 	fmt.Fprintf(m.out(), "  %s: building container runner image %s (this may take several minutes)...\n", rc.Name, imageTag)
-	if err := buildAgenticRunnerImage(h, imageTag, version, arch, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
+	if err := buildContainerRunnerImage(h, imageTag, version, arch, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
 		return fmt.Errorf("building container runner image: %w", err)
 	}
 	fmt.Fprintf(m.out(), "  %s: image built: %s\n", rc.Name, imageTag)
@@ -1006,21 +1015,21 @@ func (m *Manager) resolveRunnerImageInputs(h *host.Host) (version, arch, imageTa
 		return "", "", "", fmt.Errorf("resolving runner version: %w", err)
 	}
 	arch = archForGitHub(h.Arch)
-	imageTag = ContainerRunnerImageTag(version, m.containerImageExtraApt())
+	imageTag = buildContainerRunnerImageTag(version, m.containerImageExtraApt())
 	return version, arch, imageTag, nil
 }
 
 // buildRunnerImageIfMissing checks whether the container runner image with the
-// given tag already exists on h, and builds it via buildAgenticRunnerImage if not.
+// given tag already exists on h, and builds it via buildContainerRunnerImage if not.
 // Returns built=true when the image was freshly built, built=false when it was
 // already present. Used by setupContainer and ContainerEnvironment.Provision.
 // rebuildContainerImage intentionally skips the existence check and calls
-// buildAgenticRunnerImage directly so the rebuild path always produces a fresh
+// buildContainerRunnerImage directly so the rebuild path always produces a fresh
 // image. Error wrapping matches the historical call-site messages
 // ("checking image: %w" / "building container runner image: %w") so user-visible
 // error output is unchanged.
 //
-// onBuild, when non-nil, is invoked immediately before buildAgenticRunnerImage
+// onBuild, when non-nil, is invoked immediately before buildContainerRunnerImage
 // runs, so the caller can emit its own progress line (e.g. setupContainer's
 // "building container runner image (this may take several minutes)..." heads-up
 // for a multi-minute build). Provision passes nil to stay silent, matching its
@@ -1036,7 +1045,7 @@ func (m *Manager) buildRunnerImageIfMissing(h *host.Host, imageTag, version, arc
 	if onBuild != nil {
 		onBuild()
 	}
-	if err := buildAgenticRunnerImage(h, imageTag, version, arch, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
+	if err := buildContainerRunnerImage(h, imageTag, version, arch, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
 		return false, fmt.Errorf("building container runner image: %w", err)
 	}
 	return true, nil
@@ -1051,61 +1060,52 @@ func embedTextForRemoteWrite(s string) string {
 	return strings.ReplaceAll(s, "GHSR_EOF", "GHSR_E0F")
 }
 
-// buildAgenticRunnerImage uploads the embedded Dockerfile+entrypoint to the host
-// and builds the image via `docker build`.
-func buildAgenticRunnerImage(h *host.Host, imageTag, runnerVersion, runnerArch, ghSrVersion string, extraApt []string) error {
-	buildDir := "/tmp/gh-sr-agentic-runner-build"
+// detectLegacyContainerRunnerImage probes the host's local docker images for
+// any pre-rename `gh-sr/agentic-runner:<tag>` entries and returns a one-line
+// migration message + true when at least one is present. Used by `gh sr setup`
+// and `gh sr up` so users on upgraded hosts see the nudge to `docker rmi` the
+// old tag. The probe is best-effort: any failure (host unreachable, no
+// docker, etc.) returns ("", false) so it never blocks the setup flow.
+func detectLegacyContainerRunnerImage(h *host.Host) (string, bool) {
+	const legacyTag = "gh-sr/agentic-runner"
+	out, err := h.Run(fmt.Sprintf(
+		"docker images --format '{{.Repository}}:{{.Tag}}' %s 2>/dev/null",
+		hostshell.PosixSingleQuote(legacyTag),
+	))
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Filter out `<none>:<none>` entries that show up when the image's
+		// repository:tag is missing in the image manifest.
+		if strings.HasPrefix(line, "<none>:") {
+			continue
+		}
+		return fmt.Sprintf(
+			"Detected legacy image %s; remove with 'docker rmi %s' and re-run setup",
+			line, line,
+		), true
+	}
+	return "", false
+}
 
-	// Write the 8 build-context files via the shared helpers. writeRemoteHeredocFile
-	// creates the parent directory on the host, and writeRemoteHeredocExecutable
-	// additionally chmods the file +x — so each site collapses to a single call.
-	if err := writeRemoteHeredocFile(h, buildDir+"/Dockerfile", agenticRunnerDockerfile); err != nil {
+// buildContainerRunnerImage uploads the embedded Dockerfile + entrypoint to the
+// host and builds the container-runner image via `docker build`. The image is
+// based on `docker:dind` and bundles the actions/runner binary; no custom
+// apt-packages or hooks are needed (the upstream `docker:dind` image provides
+// the daemon, and the upstream `actions/runner` tarball provides the runner).
+func buildContainerRunnerImage(h *host.Host, imageTag, runnerVersion, runnerArch, ghSrVersion string, extraApt []string) error {
+	buildDir := "/tmp/gh-sr-container-runner-build"
+
+	if err := writeRemoteHeredocFile(h, buildDir+"/Dockerfile", containerRunnerDockerfile); err != nil {
 		return err
 	}
-	if err := writeRemoteHeredocFile(h, buildDir+"/apt-packages-core.txt", agenticRunnerAptPackagesCore); err != nil {
+	if err := writeRemoteHeredocExecutable(h, buildDir+"/entrypoint.sh", containerRunnerEntrypoint); err != nil {
 		return err
-	}
-
-	// apt-packages-extra.txt is empty when no extras are configured: truncate instead
-	// of writing an empty heredoc (avoids a stray newline and a confusing file).
-	extraSorted := containerRunnerImageExtraSorted(extraApt)
-	extraPath := buildDir + "/apt-packages-extra.txt"
-	if len(extraSorted) == 0 {
-		if _, err := h.Run(formatEmptyRemoteFile(extraPath)); err != nil {
-			return fmt.Errorf("writing %s: %w", extraPath, err)
-		}
-	} else {
-		if err := writeRemoteHeredocFile(h, extraPath, joinExtraPackages(extraSorted)); err != nil {
-			return err
-		}
-	}
-
-	if err := writeRemoteHeredocExecutable(h, buildDir+"/entrypoint.sh", agenticRunnerEntrypoint); err != nil {
-		return err
-	}
-	if err := writeRemoteHeredocExecutable(h, buildDir+"/docker-wrapper.sh", agenticRunnerDockerWrapper); err != nil {
-		return err
-	}
-
-	// Write baked inner-Docker network configs (Pillar 2: deterministic DNS, single dockerd start).
-	for _, f := range []struct{ name, content string }{
-		{"daemon.json", agenticRunnerDaemonJSON},
-		{"dnsmasq-gh-sr.conf", agenticRunnerDnsmasqConf},
-	} {
-		if err := writeRemoteHeredocFile(h, buildDir+"/"+f.name, f.content); err != nil {
-			return err
-		}
-	}
-
-	// Write per-job reset hooks into the build context (Pillar 1). The helper mkdirs
-	// the parent of every path, so the explicit `mkdir -p buildDir/hooks` is gone.
-	for _, hk := range []struct{ name, content string }{
-		{"job-started.sh", agenticRunnerJobStartedHook},
-		{"job-completed.sh", agenticRunnerJobCompletedHook},
-	} {
-		if err := writeRemoteHeredocExecutable(h, buildDir+"/hooks/"+hk.name, hk.content); err != nil {
-			return err
-		}
 	}
 
 	// Build (stamp labels so gh sr status can compare layout to this binary).
@@ -1113,7 +1113,7 @@ func buildAgenticRunnerImage(h *host.Host, imageTag, runnerVersion, runnerArch, 
 	labelRev := hostshell.PosixSingleQuote(dockerLabelImageRevision + "=" + rev)
 	labelCLI := hostshell.PosixSingleQuote(dockerLabelCLIVersion + "=" + ghSrVersion)
 	buildCmd := fmt.Sprintf(
-		"docker build --build-arg RUNNER_VERSION=%s --build-arg RUNNER_ARCH=%s --label %s --label %s -t %s %s",
+		"docker build --build-arg RUNNER_VERSION=%s --build-arg TARGETARCH=%s --label %s --label %s -t %s %s",
 		hostshell.PosixSingleQuote(runnerVersion),
 		hostshell.PosixSingleQuote(runnerArch),
 		labelRev,

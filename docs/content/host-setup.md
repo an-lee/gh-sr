@@ -37,19 +37,19 @@ ssh -o BatchMode=yes user@host 'sudo -n true'
 
 The first command checks non-interactive SSH (see also [All remote hosts](#all-remote-hosts)). The second must exit **0** if you rely on a non-root user with sudo for automated installs; if it fails, configure `NOPASSWD` for that user or use `root@host`.
 
-- **Container mode on Linux** — `runner_mode: container` and `profile: agentic` require Docker on the host and support for `--privileged` containers (Docker-in-Docker). Install Docker before `gh sr setup` when possible and add the SSH user to the **`docker`** group so `docker` works without `sudo`. Container mode is **Linux-only**; configuring container or agentic runners on macOS or Windows fails at setup and doctor reports a FAIL.
+- **Container mode on Linux** — `runner_mode: container` requires Docker on the host and support for `--privileged` containers (Docker-in-Docker). Install Docker before `gh sr setup` when possible and add the SSH user to the **`docker`** group so `docker` works without `sudo`. Container mode is **Linux-only**; configuring container runners on macOS or Windows fails at setup and doctor reports a FAIL.
 - **Native mode** — You can avoid `sudo` if `curl` and `tar` are present and OS packages the runner needs are already installed; otherwise **gh sr** may print warnings and the runner might be incomplete.
 
 **gh sr** does not deeply verify sudoers rules; failures show up as remote command errors or warnings.
 
 ### Container mode host requirements (Linux)
 
-`runner_mode: container` and `profile: agentic` run each instance as an outer privileged container (`gh-sr-<instance>`) with its own inner `dockerd`. The host only needs:
+`runner_mode: container` runs each instance as an outer privileged container (`gh-sr-<instance>`) with its own inner `dockerd`. The host only needs:
 
 - Docker CLI and daemon available to the SSH user (typically via the `docker` group)
 - Ability to run short-lived **`docker run --privileged`** containers (required for DinD)
 
-gh sr builds the `gh-sr/agentic-runner` image locally during setup. dnsmasq, AWF, gh-aw tooling, and `host.docker.internal` DNS live **inside** the image — not on the host.
+gh sr builds the `gh-sr/container-runner` image locally during setup. It is layered on `docker:dind` and includes the actions/runner binary. Inner Docker state and the host.docker.internal bridge live **inside** the image — not on the host.
 
 
 **Verify from inside a running runner container:**
@@ -58,65 +58,7 @@ gh sr builds the `gh-sr/agentic-runner` image locally during setup. dnsmasq, AWF
 docker exec gh-sr-<instance> docker info
 ```
 
-`gh sr doctor` validates container-mode runners on **Linux** hosts: outer Docker, `--privileged` support, each `gh-sr-<instance>` container, inner `dockerd`, registration, and (for `profile: agentic`) inner AWF/DNS/hygiene checks. On **non-Linux** hosts with container-mode runners configured, doctor reports a FAIL because container mode is unsupported there.
-
-## GitHub Agentic Workflows (gh-aw)
-
-> **For a complete guide** to agentic workflows on self-hosted runners -- architecture, DNS setup, troubleshooting, and what `profile: agentic` automates -- see [Agentic Workflows]({{< ref "agentic-workflows" >}}).
-
-The easiest way to set up a runner for [GitHub Agentic Workflows](https://github.github.com/gh-aw/guides/self-hosted-runners/) is `profile: agentic`:
-
-```yaml
-runners:
-  - name: aw-runner
-    repo: owner/repo
-    host: vps-1
-    profile: agentic
-    count: 2
-```
-
-`profile: agentic` always runs in **container mode** (privileged Docker-in-Docker): each instance gets its own inner `dockerd`, network namespace, MCP gateway port, and `/tmp/gh-aw`, and every job runs from a pristine inner state. The host only needs Docker (with privileged-container support); gh-aw, AWF, `host.docker.internal` DNS, the tool cache, and language runtimes are all baked into the image `gh sr` builds. You can also add it from the CLI:
-
-```bash
-gh sr add runner aw-runner --repo owner/repo --host vps-1 --profile agentic
-```
-
-For **organization-level runners** with runner groups, use `org` and `group` instead of `repo`:
-
-```yaml
-runners:
-  - name: org-runner
-    org: my-org
-    group: my-runner-group
-    host: vps-1
-    profile: agentic
-```
-
-For **ephemeral runners** (clean-slate per job, good for security isolation):
-
-```yaml
-runners:
-  - name: aw-ephemeral
-    repo: owner/repo
-    host: vps-1
-    profile: agentic
-    ephemeral: true
-```
-
-### How it works
-
-Because agentic runners are container-isolated, the host needs only Docker with privileged-container support. Everything else is inside the image:
-
-- **`host.docker.internal` DNS** — baked into the image (the inner default bridge gateway is pinned to `10.200.0.1` and inner container DNS points at a bundled dnsmasq). No host `/etc/hosts`, dnsmasq, or `daemon.json` changes are required. **Do NOT** map `host.docker.internal` to `127.0.0.1` anywhere.
-- **`sudo` / iptables for AWF** — the runner user inside the container already has passwordless sudo; no host sudoers setup is needed for agentic.
-- **Tool cache (`/home/runner/.toolcache`)** — provided inside the image where gh-aw's agent containers expect it. Lives outside `/opt/*` so gh-aw's compiled AWF invocation actually bind-mounts it into the agent container (gh-aw deliberately skips any `RUNNER_TOOL_CACHE` whose path matches `/opt/*` to avoid leaking `/opt/gh-aw` and similar control-plane paths). A compatibility symlink at `/opt/hostedtoolcache → /home/runner/.toolcache` is also baked into the image so legacy actions that hardcode the legacy path (notably `ruby/setup-ruby@v1`, which ignores `$RUNNER_TOOL_CACHE` when it doesn't detect a self-hosted runner) still find a writable tool cache and do not regress to `EACCES`.
-- **`RUNNER_TEMP`** — set to a non-`/tmp` path inside the container so it never collides with `/tmp/gh-aw`.
-
-`gh sr doctor` validates the host Docker daemon, `--privileged` support, and — for each instance — the container, inner `dockerd`, registration, inner `host.docker.internal` resolution, the AWF service-routing bypass, and AWF/Docker hygiene.
-
-See the [Agentic Workflows guide]({{< ref "agentic-workflows" >}}) for the full architecture, the per-job reset model, and troubleshooting.
-
-> **Removed:** the former native-agentic host setup (host dnsmasq, `/etc/sudoers.d` for iptables, `/opt/hostedtoolcache` bind mount) and the per-instance `agentic_mcp_ports` / `gh-sr-mcp-<port>` label scheme. `profile: agentic` + `runner_mode: native` is now rejected; agentic always uses container isolation.
+`gh sr doctor` validates container-mode runners on **Linux** hosts: outer Docker, `--privileged` support, each `gh-sr-<instance>` container, inner `dockerd`, and registration. On **non-Linux** hosts with container-mode runners configured, doctor reports a FAIL because container mode is unsupported there.
 
 ### GitHub CLI authentication (gh)
 
@@ -187,7 +129,7 @@ Run **`gh sr doctor`** (optionally with `--host` / `--repo`) to confirm connecti
 
 For the full explanation of non-interactive SSH, the `gh sr: remote Linux commands need root…` error, `NOPASSWD`, and verification commands, see [Linux SSH user and privileges](#linux-ssh-user-and-privileges) above.
 
-- **Container mode (`runner_mode: container` / `profile: agentic`):** Requires Docker on the host and `--privileged` container support. If Docker is missing, **`gh sr setup` installs it automatically** via [get.docker.com](https://get.docker.com) (requires **root** or **passwordless sudo** over SSH — see [Linux SSH user and privileges](#linux-ssh-user-and-privileges)). After a fresh install, gh sr adds the SSH user to the **`docker`** group and asks you to **run setup again**; the second invocation opens a new SSH session where `docker` works without sudo. Pre-installing Docker yourself still works and skips the two-run flow.
+- **Container mode (`runner_mode: container`):** Requires Docker on the host and `--privileged` container support. If Docker is missing, **`gh sr setup` installs it automatically** via [get.docker.com](https://get.docker.com) (requires **root** or **passwordless sudo** over SSH — see [Linux SSH user and privileges](#linux-ssh-user-and-privileges)). After a fresh install, gh sr adds the SSH user to the **`docker`** group and asks you to **run setup again**; the second invocation opens a new SSH session where `docker` works without sudo. Pre-installing Docker yourself still works and skips the two-run flow.
 - **Native mode (default):** Ensure `curl` and `tar` are on `PATH`. `gh sr setup` may still invoke GitHub's `installdependencies.sh` with **`sudo -n`** when the SSH user is not root and passwordless sudo is available.
 
 Run **`gh sr doctor`** after the host is prepared.
@@ -195,12 +137,12 @@ Run **`gh sr doctor`** after the host is prepared.
 ## macOS
 
 - **Native (default):** `curl` is usually sufficient; gh sr downloads the Actions runner over HTTPS.
-- **Container / agentic:** `runner_mode: container` and `profile: agentic` are **not supported on macOS hosts**. Use a Linux host for agentic workflows or container-isolated runners.
+- **Container mode:** `runner_mode: container` is **not supported on macOS hosts**. Use a Linux host for container-isolated runners.
 
 ## Windows (runner behavior)
 
 - Install and enable **OpenSSH Server** (see the PowerShell snippet under [Windows (OpenSSH and Docker)](#windows-openssh-and-docker)).
-- **Container / agentic:** Not supported on Windows hosts. Use a Linux host for `profile: agentic` or `runner_mode: container`.
+- **Container mode:** Not supported on Windows hosts. Use a Linux host for `runner_mode: container`.
 - **Native mode:** After `gh sr setup`, run **`gh sr up`** to start the listener. Registration logs under `_diag` show **configure** finishing with exit code 0; that is normal and does not mean the runner is listening. For the **run** phase, check **`%USERPROFILE%\.gh-sr\runners\<instance>\runner.log`**. Over SSH, **`Start-Process` listeners are killed when the session disconnects**; gh sr starts the listener with **`Win32_Process.Create` (CIM)** so it keeps running after `gh sr` exits. If the runner shows **stopped** with `runner registration has been deleted from the server`, GitHub auto-pruned the stale registration. `gh sr up` detects this automatically, re-registers, and retries. You can also fix it manually with **`gh sr update <runner>`** (which removes, re-configures, and starts in one step). If `gh sr status` shows **stopped** immediately after `gh sr up` for other reasons, check `runner.log` for error details. As a fallback you can run **`run.cmd`** from an interactive session (RDP), use **Task Scheduler** at logon, or install the runner as a **Windows service** via GitHub’s `config.cmd` options.
 
 Run **`gh sr doctor`** to confirm SSH readiness (and native prerequisites on non-Linux hosts).

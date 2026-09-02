@@ -24,7 +24,6 @@ func TestNewContainerEnvironment(t *testing.T) {
 		Repo:       "owner/repo",
 		Host:       "h",
 		Count:      2,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 	env := m.NewContainerEnvironment(h, rc, 1, "agentic-2")

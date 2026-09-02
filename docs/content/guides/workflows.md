@@ -21,58 +21,34 @@ jobs:
 
 Labels must match what you configure under `runners[].labels` in [Configuration](../configuration.md).
 
-## GitHub Agentic Workflows (gh-aw)
+## Service containers (`services:`)
 
-gh sr has first-class support for [GitHub Agentic Workflows](https://github.github.com/gh-aw/). Use `profile: agentic` to configure a runner with all the prerequisites gh-aw needs:
+Workflows that need `services:` (postgres, redis, etc.) should run on a `runner_mode: container` runner. The container mode provides an inner Docker daemon that service containers attach to, so each job gets its own isolated service stack. See [Configuration](../configuration.md#runners-runner_mode) and [Host setup](../host-setup.md).
 
-```yaml
-runners:
-  - name: aw-runner
-    repo: owner/repo
-    host: vps-1
-    profile: agentic
-    count: 2
-```
+## Organization-level runners
 
-`profile: agentic` always runs in **container mode** (privileged Docker-in-Docker): each instance is isolated and every job runs from a pristine inner state, so multiple concurrent agentic jobs are safe on one machine. The host only needs Docker (with privileged-container support); gh-aw, AWF, DNS, and tooling are baked into the image `gh sr` builds. Use `count: N` for N concurrent jobs — no MCP port or label juggling. See the [Agentic Workflows guide]({{< ref "agentic-workflows" >}}) and [host setup docs](../host-setup.md#github-agentic-workflows-gh-aw) for details.
-
-> Native-mode agentic runners are no longer supported (`profile: agentic` + `runner_mode: native` is rejected), and the `agentic_mcp_ports` / `gh-sr-mcp-<port>` scheme has been removed — container mode isolates the MCP gateway port per runner automatically.
-
-Reference the runner in your agentic workflow Markdown frontmatter:
-
-```yaml
----
-on: issues
-runs-on: [self-hosted, Linux, X64, agentic]
-engine: copilot
----
-Triage this issue.
-```
-
-### Organization-level runners
-
-gh-aw supports `runs-on: { group: my-group, labels: [...] }` for targeting runner groups. Register an org-level runner with gh sr:
+Register a runner against an organization (rather than a single repo) so it can pick up jobs from every repo in the org:
 
 ```yaml
 runners:
-  - name: org-aw-runner
+  - name: org-runner
     org: my-org
-    group: my-runner-group
+    group: my-runner-group   # optional; create the group in GitHub org settings first
     host: vps-1
-    profile: agentic
     count: 4
+    labels: [self-hosted, Linux, X64]
 ```
 
-### Ephemeral runners
+## Ephemeral runners
 
-For security isolation between agentic runs, use `ephemeral: true` so each runner handles one job and then deregisters:
+For security isolation between jobs, use `ephemeral: true` so each runner handles one job and then deregisters:
 
 ```yaml
 runners:
-  - name: aw-ephemeral
+  - name: ephemeral-runner
     repo: owner/repo
     host: vps-1
-    profile: agentic
     ephemeral: true
     count: 4
+    labels: [self-hosted, Linux, X64]
 ```

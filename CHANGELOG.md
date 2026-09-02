@@ -12,6 +12,10 @@ history when you want more than the auto-generated GitHub summary.
 
 ## [Unreleased]
 
+### Removed
+
+- **Drop `gh-aw` (GitHub Agentic Workflows) support entirely.** The `--profile` flag, the `internal/agentic` package (≈3,300 lines including tests), the `agentic-runner-image/` directory, and the auto-append of the `agentic` label are removed. Container mode stays for CI services isolation (`services:` blocks like postgres/redis run inside the runner container with their own inner `dockerd`). The embedded runner image is replaced: `gh-sr/agentic-runner:<version>` → `gh-sr/container-runner:<version>`, layered on [`docker:dind`](https://hub.docker.com/_/docker) plus the [`actions/runner`](https://github.com/actions/runner) binary. `gh sr setup` and `gh sr up` detect pre-rename images and print a one-line migration hint (`docker rmi gh-sr/agentic-runner:<v>`). Agent workflows in user projects should migrate from `baizhiheizi/agents/.github/workflows/agent-*.yml` (gh-aw reusable workflows) to [`anthropics/claude-code-action@beta`](https://github.com/anthropics/claude-code-action). See the migration notes in the change proposal.
+
 ### Added
 
 - Organization-level self-hosted runners are now first-class: a dedicated [Organization runners](https://an-lee.github.io/gh-sr/guides/org-runners/) guide covers repo vs org scope, runner groups, workflow targeting, authentication, security, and migration from per-repo pools. The `org` / `group` fields in `runners[].yml` are documented in the config reference, an org-scoped runner example is added to `config/runners.yml` and `internal/config/runners.yml.template`, and a new "Organization runners" entry is registered in the guides index. `gh sr runner add --org` / `--group` and the existing `org:` / `group:` config fields are the public entry points; `gh sr doctor` reports `org <name>: list runners OK (<n> registered)` and prints an `admin:org` / org-owner hint on 403. `gh sr status` and the TUI now show a uniform `target=org:<name> [group=<name>]` (or `target=owner/repo` for repo-scoped runners) via a new `RunnerConfig.DisplayTarget()` helper. (#187)

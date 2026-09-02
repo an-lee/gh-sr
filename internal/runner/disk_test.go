@@ -86,7 +86,7 @@ func TestMeasureDiskUsage_agenticMode(t *testing.T) {
 	h := diskMockHost("linux", &testutil.MockExecutor{
 		Responses: []string{"100 0 0 0\n"},
 	})
-	rc := config.RunnerConfig{Name: "ag", Count: 1, Profile: "agentic"}
+	rc := config.RunnerConfig{Name: "ag", Count: 1, RunnerMode: config.RunnerModeContainer}
 	entry := MeasureDiskUsage(h, "host1", "ag-1", &rc)
 	if entry.Err != nil {
 		t.Fatal(entry.Err)
@@ -525,7 +525,7 @@ func TestPruneInstance_defaultKeepsDockerCache(t *testing.T) {
 	m := NewManager("")
 	mock := &testutil.MockExecutor{}
 	h := diskMockHost("linux", mock)
-	rc := config.RunnerConfig{Name: "ci", Count: 1, Profile: "agentic"}
+	rc := config.RunnerConfig{Name: "ci", Count: 1}
 	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{DryRun: true})
 	for _, a := range res.Actions {
 		if strings.Contains(a, "docker cache") {
@@ -539,7 +539,7 @@ func TestPruneInstance_pruneCacheIncludesDockerPrune(t *testing.T) {
 	m := NewManager("")
 	mock := &testutil.MockExecutor{}
 	h := diskMockHost("linux", mock)
-	rc := config.RunnerConfig{Name: "ci", Count: 1, Profile: "agentic"}
+	rc := config.RunnerConfig{Name: "ci", Count: 1, RunnerMode: config.RunnerModeContainer}
 	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{DryRun: true, PruneCache: true})
 	found := false
 	for _, a := range res.Actions {
@@ -580,7 +580,7 @@ func TestPruneInnerDockerCache_innerDockerDown(t *testing.T) {
 		},
 	})
 	m := NewManager("")
-	rc := config.RunnerConfig{Name: "ag", Count: 1, Profile: "agentic"}
+	rc := config.RunnerConfig{Name: "ag", Count: 1, RunnerMode: config.RunnerModeContainer}
 	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{PruneCache: true})
 	if res.Err == nil {
 		t.Fatal("expected error when inner dockerd is down")
@@ -612,7 +612,7 @@ func TestPruneInnerDockerCache_happyPath(t *testing.T) {
 		},
 	})
 	m := NewManager("")
-	rc := config.RunnerConfig{Name: "ag", Count: 1, Profile: "agentic"}
+	rc := config.RunnerConfig{Name: "ag", Count: 1, RunnerMode: config.RunnerModeContainer}
 	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{PruneCache: true})
 	if res.Err != nil {
 		t.Fatalf("unexpected error: %v", res.Err)
@@ -655,7 +655,7 @@ func TestPruneInnerDockerCache_probeError(t *testing.T) {
 		},
 	})
 	m := NewManager("")
-	rc := config.RunnerConfig{Name: "ag", Count: 1, Profile: "agentic"}
+	rc := config.RunnerConfig{Name: "ag", Count: 1}
 	res := m.PruneInstance(h, "host1", "ci-1", &rc, false, PruneOptions{PruneCache: true})
 	if res.Err == nil {
 		t.Fatal("expected error when SSH fails")

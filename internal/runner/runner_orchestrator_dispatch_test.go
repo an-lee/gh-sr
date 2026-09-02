@@ -167,7 +167,6 @@ func TestNeedsSetup_containerAllPresent_returnsFalse(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      2,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -192,7 +191,6 @@ func TestNeedsSetup_containerMissing_returnsTrue(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      2,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -265,7 +263,6 @@ func TestRebuildImage_containerModeDispatchesToRebuildContainerImage(t *testing.
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      1,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 

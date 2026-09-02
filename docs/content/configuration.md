@@ -82,13 +82,6 @@ runners:
     labels: [self-hosted, Linux, X64]
     runner_mode: container
 
-  # GitHub Agentic Workflows — profile: agentic always uses container mode (DinD).
-  - name: hangar-aw
-    repo: an-lee/hangar
-    host: vps-1
-    profile: agentic
-    count: 2
-
   # Organization-level runner — shared across all repos in the org.
   # Create runner groups in GitHub org settings before referencing group:.
   - name: myorg-ci
@@ -116,12 +109,10 @@ See [Organization runners](guides/org-runners.md) for runner groups, workflow ta
 | `runners[].group` | Runner group name (org-level runners only). Passed as `--runnergroup` during registration. The group must already exist in GitHub org settings. |
 | `runners[].host` | References a key under `hosts` |
 | `runners[].count` | Number of parallel instances (default: 1) |
-| `runners[].labels` | Labels for workflow `runs-on` matching. Include **`agentic`** when the runner should serve [GitHub Agentic Workflows](https://github.github.com/gh-aw/). With **`profile: agentic`**, the `agentic` label is added automatically if omitted. |
-| `runners[].runner_mode` | `native` (default) or `container`. `container` runs each runner instance in its own privileged Docker container with an inner dockerd (DinD), fully isolating `/tmp/gh-aw`, iptables, and the MCP gateway port between concurrent jobs on the same host. The image is built locally by `gh sr setup` and includes Docker CE, dnsmasq, gh-aw, AWF, and the actions runner. **`profile: agentic` always uses `container` mode** (and `runner_mode: native` + `profile: agentic` is rejected). See [Agentic Workflows](guides/agentic-workflows.md). |
-| `runners[].profile` | Optional. Set to **`agentic`** for [GitHub Agentic Workflows](https://github.github.com/gh-aw/): implies `runner_mode: container`, adds the `agentic` label, and bakes gh-aw/AWF/DNS/tooling into the locally built runner image. See [Host setup — GitHub Agentic Workflows](host-setup.md#github-agentic-workflows-gh-aw). |
+| `runners[].labels` | Labels for workflow `runs-on` matching. |
+| `runners[].runner_mode` | `native` (default) or `container`. `container` runs each runner instance in its own privileged Docker container with an inner dockerd (DinD), isolating the filesystem and network namespace between concurrent jobs on the same host. The image is built locally by `gh sr setup` and is based on `docker:dind` plus the actions/runner binary. |
 | `runners[].ephemeral` | Optional boolean. When `true`, the runner handles one job and deregisters. Container mode uses `--restart no`; native passes `--ephemeral` to `config.sh`. |
-| `runners[].agentic_mcp_ports` / `runners[].agentic_mcp_port_base` | **Removed.** The per-instance MCP port-label scheme is no longer used: container mode isolates the MCP gateway port per runner. `gh sr` rejects these fields with a migration message — delete them. |
-| `container_runner_image.extra_apt_packages` | Optional list of additional Debian package names to install in the locally built container runner image (`runner_mode: container`). At most 256 entries; each name must match `[a-z0-9][a-z0-9+.-]*` (max 200 chars). When set, the image tag gains a `-x<8-hex>` suffix so Docker does not reuse an image built without those packages. Core packages are in the repo manifest `internal/runner/agentic-runner-image/apt-packages-core.txt`. |
+| `container_runner_image.extra_apt_packages` | Reserved for future use. Currently the locally built image is layered on `docker:dind` and includes only the actions/runner binary; extra apt packages are not yet supported in the new image. |
 | `container_runner_image.mtu` | Optional integer (576–1500). Forces the Docker network MTU for `runner_mode: container` — both the outer runner container's egress interface and the inner `dockerd` bridge. Leave unset (0) to **auto-detect** the host's egress MTU, which fixes the common reduced-MTU case (cloud overlay networks like GCP's 1460, VPN/WireGuard) where large-packet TLS handshakes otherwise fail with `Client network socket disconnected before secure TLS connection was established` (e.g. `actions/setup-go`). Set this only when the host's real path MTU is below its NIC MTU (a tunnel the NIC is unaware of) so auto-detection cannot see it. Only ever lowers the MTU; applied at container-create time, so changing it requires `gh sr rebuild <name>`. |
 | `container_runner_image.dockerd_start_timeout_seconds` | Optional integer (30–300). Seconds the entrypoint waits for inner `dockerd` during bootstrap. Default **90** when unset. Increase on slow or I/O-bound hosts. Applied at container-create time (`gh sr rebuild` to change existing containers). |
 | `container_runner_image.bootstrap_max_retries` | Optional integer (1–20). Consecutive inner-`dockerd` start failures before the entrypoint stops retrying and marks the runner **failed** (default **5**). Applied at container-create time. |

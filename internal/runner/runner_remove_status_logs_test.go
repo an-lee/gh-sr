@@ -128,7 +128,6 @@ func TestManagerRemove_dispatchesToRemoveContainerForEachInstance(t *testing.T) 
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      2,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -172,7 +171,6 @@ func TestManagerRemove_propagatesRemoveContainerError(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      3,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -291,7 +289,6 @@ func TestManagerStatus_containerPopulatesImageAndBuild(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      2,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -367,7 +364,6 @@ func TestManagerStatus_containerNotInstalledBuildIsDash(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      1,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -441,7 +437,6 @@ func TestManagerLogs_dispatchesToLogsContainer(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      1,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 
@@ -473,7 +468,6 @@ func TestManagerLogs_propagatesContainerLogsError(t *testing.T) {
 		Repo:       "o/r",
 		Host:       "h",
 		Count:      1,
-		Profile:    "agentic",
 		RunnerMode: config.RunnerModeContainer,
 	}
 

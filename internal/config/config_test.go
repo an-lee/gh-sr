@@ -707,75 +707,6 @@ func TestFilterRunners(t *testing.T) {
 	}
 }
 
-// TestValidate_agenticMCPPortsRemoved asserts the deprecated per-instance MCP port
-// fields are now rejected with a migration message (container mode isolates the port).
-func TestValidate_agenticMCPPortsRemoved(t *testing.T) {
-	t.Parallel()
-	base := 9080
-	cases := []struct {
-		name string
-		rc   RunnerConfig
-	}{
-		{"port_base", RunnerConfig{Name: "r", Repo: "o/r", Host: "h", Profile: "agentic", Count: 2, AgenticMCPPortBase: &base}},
-		{"explicit_ports", RunnerConfig{Name: "r", Repo: "o/r", Host: "h", Profile: "agentic", Count: 2, AgenticMCPPorts: []int{9080, 9081}}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			cfg := Config{
-				Hosts:   map[string]HostConfig{"h": {Addr: "local", OS: "linux", Arch: "amd64"}},
-				Runners: []RunnerConfig{tc.rc},
-			}
-			err := cfg.Validate()
-			if err == nil {
-				t.Fatal("expected error: agentic MCP port fields are removed")
-			}
-			if !strings.Contains(err.Error(), "have been removed") {
-				t.Fatalf("expected removal message, got %v", err)
-			}
-		})
-	}
-}
-
-// TestValidate_agenticImpliesContainer asserts profile: agentic resolves to container
-// mode (no runner_mode needed) and validates.
-func TestValidate_agenticImpliesContainer(t *testing.T) {
-	t.Parallel()
-	rc := RunnerConfig{Name: "a", Repo: "o/r", Host: "h", Profile: "agentic"}
-	if rc.EffectiveRunnerMode() != RunnerModeContainer {
-		t.Fatalf("agentic should resolve to container mode, got %q", rc.EffectiveRunnerMode())
-	}
-	if !rc.IsContainerMode() {
-		t.Fatal("agentic runner should report container mode")
-	}
-	cfg := Config{
-		Hosts:   map[string]HostConfig{"h": {Addr: "local", OS: "linux", Arch: "amd64"}},
-		Runners: []RunnerConfig{rc},
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("agentic without runner_mode should validate: %v", err)
-	}
-}
-
-// TestValidate_agenticNativeRejected asserts profile: agentic + runner_mode: native
-// is rejected (native mode cannot isolate concurrent agentic jobs on one host).
-func TestValidate_agenticNativeRejected(t *testing.T) {
-	t.Parallel()
-	cfg := Config{
-		Hosts: map[string]HostConfig{"h": {Addr: "local", OS: "linux", Arch: "amd64"}},
-		Runners: []RunnerConfig{{
-			Name: "a", Repo: "o/r", Host: "h", Profile: "agentic", RunnerMode: RunnerModeNative,
-		}},
-	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error: profile: agentic + runner_mode: native is no longer supported")
-	}
-	if !strings.Contains(err.Error(), "no longer supported with runner_mode: native") {
-		t.Fatalf("expected native-rejection message, got %v", err)
-	}
-}
-
 func TestRunnerConfig_RunnerMode_defaults(t *testing.T) {
 	t.Parallel()
 	rc := RunnerConfig{}
@@ -821,24 +752,7 @@ func TestValidate_runnerMode_container_nonAgentic_valid(t *testing.T) {
 		}},
 	}
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("container mode without profile: agentic should validate: %v", err)
-	}
-}
-
-func TestValidate_runnerMode_container_withAgenticMCPPorts(t *testing.T) {
-	t.Parallel()
-	base := 9080
-	cfg := Config{
-		Hosts: map[string]HostConfig{"h": {Addr: "local", OS: "linux", Arch: "amd64"}},
-		Runners: []RunnerConfig{{
-			Name: "r", Repo: "o/r", Host: "h",
-			Profile:            "agentic",
-			RunnerMode:         RunnerModeContainer,
-			AgenticMCPPortBase: &base,
-		}},
-	}
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected error: agentic_mcp_port_base not needed with container mode")
+		t.Fatalf("container mode without profile should validate: %v", err)
 	}
 }
 
@@ -848,7 +762,6 @@ func TestValidate_runnerMode_container_valid(t *testing.T) {
 		Hosts: map[string]HostConfig{"h": {Addr: "local", OS: "linux", Arch: "amd64"}},
 		Runners: []RunnerConfig{{
 			Name: "r", Repo: "o/r", Host: "h", Count: 2,
-			Profile:    "agentic",
 			RunnerMode: RunnerModeContainer,
 		}},
 	}

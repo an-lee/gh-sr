@@ -89,7 +89,6 @@ type AddRunnerOpts struct {
 	Count     int
 	Labels    []string
 	Ephemeral bool
-	Profile   string // "agentic" for GitHub Agentic Workflows
 }
 
 // AddRunner adds a runner entry to the config file at cfgPath.
@@ -174,13 +173,6 @@ func AddRunnerFull(cfgPath string, opts AddRunnerOpts) error {
 		entry.Content = append(entry.Content,
 			&yaml.Node{Kind: yaml.ScalarNode, Value: "ephemeral"},
 			&yaml.Node{Kind: yaml.ScalarNode, Value: "true", Tag: "!!bool"},
-		)
-	}
-
-	if opts.Profile != "" {
-		entry.Content = append(entry.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Value: "profile"},
-			&yaml.Node{Kind: yaml.ScalarNode, Value: opts.Profile},
 		)
 	}
 

@@ -11,10 +11,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 
-	"github.com/an-lee/gh-sr/internal/agentic"
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/host"
 	"github.com/an-lee/gh-sr/internal/runner"
@@ -111,7 +109,6 @@ func TestInstallTargetsForHost(t *testing.T) {
 	t.Parallel()
 	native := func(rc *config.RunnerConfig) bool { return !rc.IsContainerMode() }
 	container := func(rc *config.RunnerConfig) bool { return rc.IsContainerMode() }
-	agentic := func(rc *config.RunnerConfig) bool { return rc.IsAgentic() }
 
 	t.Run("NativeMode", func(t *testing.T) {
 		t.Parallel()
@@ -158,27 +155,6 @@ func TestInstallTargetsForHost(t *testing.T) {
 			if got[i][0] != want[i][0] || got[i][1] != want[i][1] {
 				t.Fatalf("idx %d: got %#v want %#v", i, got[i], want[i])
 			}
-		}
-	})
-
-	t.Run("Agentic", func(t *testing.T) {
-		t.Parallel()
-		runners := []config.RunnerConfig{
-			{Name: "ci", Host: "h1", Repo: "o/r", Count: 1, RunnerMode: config.RunnerModeContainer},
-			{Name: "ag", Host: "h1", Repo: "o/r", Count: 1, RunnerMode: config.RunnerModeContainer, Profile: "agentic"},
-		}
-		got := installTargetsForHost(runners, "h1", agentic)
-		if len(got) != 1 || got[0][0] != "ag-1" || got[0][1] != "ag" {
-			t.Fatalf("want single agentic container instance, got %#v", got)
-		}
-
-		// profile: agentic alone implies container mode (no explicit runner_mode).
-		implicit := []config.RunnerConfig{
-			{Name: "aw", Host: "h1", Repo: "o/r", Count: 1, Profile: "agentic"},
-		}
-		gotImplicit := installTargetsForHost(implicit, "h1", agentic)
-		if len(gotImplicit) != 1 || gotImplicit[0][0] != "aw-1" {
-			t.Fatalf("profile: agentic should resolve to container agentic target, got %#v", gotImplicit)
 		}
 	})
 
@@ -233,10 +209,9 @@ func TestHasNativeModeRunners(t *testing.T) {
 	t.Parallel()
 	containerOnly := []config.RunnerConfig{
 		{Name: "c", Host: "h1", Repo: "o/r", RunnerMode: config.RunnerModeContainer},
-		{Name: "a", Host: "h1", Repo: "o/r", Profile: "agentic"},
 	}
 	if hasNativeModeRunners(containerOnly) {
-		t.Fatal("container-only and profile: agentic should not require native checks")
+		t.Fatal("container-only should not require native checks")
 	}
 	mixed := []config.RunnerConfig{
 		{Name: "n", Host: "h1", Repo: "o/r"},
@@ -254,56 +229,6 @@ func TestHasContainerModeRunners(t *testing.T) {
 	}
 	if hasContainerModeRunners(nativeOnly) {
 		t.Fatal("native-only should not trigger container checks")
-	}
-	agenticOnly := []config.RunnerConfig{
-		{Name: "a", Host: "h1", Repo: "o/r", Profile: "agentic"},
-	}
-	if !hasContainerModeRunners(agenticOnly) {
-		t.Fatal("profile: agentic should trigger container checks")
-	}
-}
-
-// TestHasContainerAgenticRunners pins the helper that gates the per-host
-// inner-AWF hygiene check. It must return true if (and only if) at least
-// one runner on the host uses profile: agentic — which transitively
-// implies container mode via EffectiveRunnerMode — and false for every
-// other combination (native, container-explicit-but-not-agentic, empty).
-func TestHasContainerAgenticRunners(t *testing.T) {
-	t.Parallel()
-	empty := []config.RunnerConfig{}
-	if hasContainerAgenticRunners(empty) {
-		t.Fatal("empty runner list should not trigger agentic container checks")
-	}
-	nativeOnly := []config.RunnerConfig{
-		{Name: "n1", Host: "h1", Repo: "o/r"},
-		{Name: "n2", Host: "h2", Repo: "o/r"},
-	}
-	if hasContainerAgenticRunners(nativeOnly) {
-		t.Fatal("native-only runners should not trigger agentic container checks")
-	}
-	containerExplicitOnly := []config.RunnerConfig{
-		{Name: "c1", Host: "h1", Repo: "o/r", RunnerMode: config.RunnerModeContainer},
-	}
-	if hasContainerAgenticRunners(containerExplicitOnly) {
-		t.Fatal("runner_mode: container without profile: agentic should not trigger agentic hygiene checks")
-	}
-	// Agentic on a different host must not affect the host-scoped decision.
-	agenticOtherHost := []config.RunnerConfig{
-		{Name: "a1", Host: "h2", Repo: "o/r", Profile: "agentic"},
-	}
-	// hasContainerAgenticRunners is host-agnostic — the per-host filtering
-	// happens at the caller (installTargetsForHost). The helper itself
-	// reports "does any runner anywhere use agentic container mode?", so
-	// a runner on another host must still flip it to true.
-	if !hasContainerAgenticRunners(agenticOtherHost) {
-		t.Fatal("profile: agentic on any host should trigger agentic container checks (caller filters per-host)")
-	}
-	mixed := []config.RunnerConfig{
-		{Name: "n1", Host: "h1", Repo: "o/r"},
-		{Name: "a1", Host: "h1", Repo: "o/r", Profile: "agentic"},
-	}
-	if !hasContainerAgenticRunners(mixed) {
-		t.Fatal("mixed list containing an agentic runner should trigger agentic container checks")
 	}
 }
 
@@ -340,7 +265,7 @@ func TestRunHostChecks_ContainerOnlySkipsNative(t *testing.T) {
 	h := host.NewHost("mac", config.HostConfig{OS: "darwin", Addr: "user@mac"})
 	h.SetConn(failIfRunExec{t: t})
 	runners := []config.RunnerConfig{
-		{Name: "aw", Host: "mac", Repo: "o/r", Profile: "agentic"},
+		{Name: "aw", Host: "mac", Repo: "o/r", RunnerMode: config.RunnerModeContainer},
 	}
 	var buf strings.Builder
 	var r Result
@@ -357,14 +282,14 @@ func TestRunHostChecks_NonLinuxContainerFails(t *testing.T) {
 	var buf strings.Builder
 	var r Result
 	runners := []config.RunnerConfig{
-		{Name: "aw", Host: "mac", Repo: "o/r", Profile: "agentic"},
+		{Name: "aw", Host: "mac", Repo: "o/r", RunnerMode: config.RunnerModeContainer},
 	}
 	runHostChecks(&buf, "mac", h, runners, &r)
-	if r.Fail != 1 {
-		t.Fatalf("expected one FAIL for container mode on darwin, got %+v", r)
-	}
-	if !strings.Contains(buf.String(), "only supported on Linux") {
-		t.Fatalf("expected linux-only container message, got:\n%s", buf.String())
+	// On darwin, Linux-only inner container checks (dockerd readiness, .runner presence)
+	// are skipped. Container mode on darwin is rejected upstream by `gh sr setup`
+	// rather than by doctor; doctor only validates the host it can reach.
+	if r.Fail != 0 {
+		t.Fatalf("darwin container check should not emit FAIL, got %+v", r)
 	}
 }
 
@@ -601,130 +526,6 @@ func TestCheckRunnerDiskUsage_warnsOrphanOverThreshold(t *testing.T) {
 	}
 }
 
-func TestPrintAgenticFailures_SeverityError(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	r := Result{}
-	printAgenticFailures(&buf, "h1", &r, sevWarn, "container: ", []agentic.PrereqFailure{
-		{Message: "docker down", Severity: agentic.SeverityError},
-	})
-	if !strings.Contains(buf.String(), "FAIL  [h1          ] container: docker down") {
-		t.Fatalf("missing FAIL line, got:\n%s", buf.String())
-	}
-	if r.Fail != 1 || r.Warn != 0 {
-		t.Fatalf("counters: got %+v, want Fail=1 Warn=0", r)
-	}
-}
-
-func TestPrintAgenticFailures_SeverityWarning(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	r := Result{}
-	printAgenticFailures(&buf, "h1", &r, sevFail, "container: ", []agentic.PrereqFailure{
-		{Message: "slow", Severity: agentic.SeverityWarning},
-	})
-	if !strings.Contains(buf.String(), "WARN  [h1          ] container: slow") {
-		t.Fatalf("missing WARN line, got:\n%s", buf.String())
-	}
-	if r.Fail != 0 || r.Warn != 1 {
-		t.Fatalf("counters: got %+v, want Fail=0 Warn=1", r)
-	}
-}
-
-func TestPrintAgenticFailures_DefaultSevFail(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	r := Result{}
-	printAgenticFailures(&buf, "h1", &r, sevFail, "container: ", []agentic.PrereqFailure{
-		{Message: "unknown", Severity: "info"},
-	})
-	if !strings.Contains(buf.String(), "FAIL  [h1          ] container: unknown") {
-		t.Fatalf("expected FAIL line, got:\n%s", buf.String())
-	}
-	if r.Fail != 1 || r.Warn != 0 {
-		t.Fatalf("counters: got %+v, want Fail=1 Warn=0", r)
-	}
-}
-
-func TestPrintAgenticFailures_DefaultSevWarn(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	r := Result{}
-	printAgenticFailures(&buf, "h1", &r, sevWarn, "container(agent): ", []agentic.PrereqFailure{
-		{Message: "unknown", Severity: "info"},
-	})
-	if !strings.Contains(buf.String(), "WARN  [h1          ] container(agent): unknown") {
-		t.Fatalf("expected WARN line, got:\n%s", buf.String())
-	}
-	if r.Fail != 0 || r.Warn != 1 {
-		t.Fatalf("counters: got %+v, want Fail=0 Warn=1", r)
-	}
-}
-
-func TestPrintAgenticFailures_RemediationAndDocRef(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	r := Result{}
-	printAgenticFailures(&buf, "h1", &r, sevFail, "container: ", []agentic.PrereqFailure{
-		{
-			Message:     "out of disk",
-			Severity:    agentic.SeverityError,
-			Remediation: "rm -rf /tmp/junk\nsudo systemctl restart docker",
-			DocRef:      "ops.md §7",
-		},
-	})
-	out := buf.String()
-	for _, want := range []string{
-		"FAIL  [h1          ] container: out of disk",
-		"       rm -rf /tmp/junk",
-		"       sudo systemctl restart docker",
-		"       See: ops.md §7",
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("missing %q in output:\n%s", want, out)
-		}
-	}
-	if r.Fail != 1 || r.Warn != 0 {
-		t.Fatalf("counters: got %+v, want Fail=1 Warn=0", r)
-	}
-}
-
-func TestPrintAgenticFailures_EmptySlice(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	r := Result{}
-	printAgenticFailures(&buf, "h1", &r, sevFail, "container: ", nil)
-	if buf.Len() != 0 {
-		t.Fatalf("expected no output for empty failures, got:\n%s", buf.String())
-	}
-	if r.Fail != 0 || r.Warn != 0 {
-		t.Fatalf("counters: got %+v, want zero", r)
-	}
-}
-
-func TestPrintAgenticFailures_MixedSeverities(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	r := Result{}
-	printAgenticFailures(&buf, "h1", &r, sevFail, "container(agent): ", []agentic.PrereqFailure{
-		{Message: "err", Severity: agentic.SeverityError},
-		{Message: "warn", Severity: agentic.SeverityWarning},
-		{Message: "info", Severity: "info"},
-	})
-	out := buf.String()
-	for _, want := range []string{
-		"FAIL  [h1          ] container(agent): err",
-		"WARN  [h1          ] container(agent): warn",
-		"FAIL  [h1          ] container(agent): info", // defaultSev=sevFail
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("missing %q in output:\n%s", want, out)
-		}
-	}
-	if r.Fail != 2 || r.Warn != 1 {
-		t.Fatalf("counters: got %+v, want Fail=2 Warn=1", r)
-	}
-}
 
 // TestCheckShellOK_OkBranch verifies checkShellOK returns true, prints the
 // OK line, and leaves r.Fail untouched when trimmed stdout matches want.
@@ -1455,236 +1256,3 @@ func TestCheckContainerRunnerInstall(t *testing.T) {
 	}
 }
 
-// TestCheckContainerAgenticInnerHygiene_Empty covers the no-targets path for
-// the agentic profile predicate and host filter.
-func TestCheckContainerAgenticInnerHygiene_Empty(t *testing.T) {
-	t.Parallel()
-	h := host.NewHost("h1", config.HostConfig{OS: "linux", Addr: "local"})
-	called := false
-	h.SetConn(&testutil.MockExecutor{
-		RunFn: func(cmd string) (string, error) {
-			called = true
-			return "", nil
-		},
-	})
-	runners := []config.RunnerConfig{
-		{Name: "native", Host: "h1", Repo: "o/r", Count: 1},
-		{Name: "container", Host: "h1", Repo: "o/r", Count: 1, RunnerMode: config.RunnerModeContainer},
-		{Name: "agentic-other-host", Host: "h2", Repo: "o/r", Count: 1, Profile: "agentic"},
-	}
-	var buf bytes.Buffer
-	r := Result{}
-	checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r)
-	if called {
-		t.Fatal("checkContainerAgenticInnerHygiene must not probe when no agentic targets match")
-	}
-	if r.Fail != 0 || r.Warn != 0 {
-		t.Fatalf("empty: counters should stay zero, got %+v", r)
-	}
-	if buf.Len() != 0 {
-		t.Fatalf("empty: expected no output, got %q", buf.String())
-	}
-}
-
-type agenticInnerHygieneExecutor struct {
-	mu sync.Mutex
-
-	inspectOut string
-	inspectErr error
-	mtuOut     string
-	awfOut     string
-	fanoutOut  string
-
-	calls      []string
-	unexpected []string
-}
-
-func (e *agenticInnerHygieneExecutor) Run(cmd string) (string, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.calls = append(e.calls, cmd)
-
-	switch {
-	case strings.Contains(cmd, "ip -o route get 1.1.1.1"):
-		return e.mtuOut, nil
-	case strings.Contains(cmd, "docker inspect --format"):
-		return e.inspectOut, e.inspectErr
-	case strings.Contains(cmd, `echo "#container-inner-host-docker-internal:$?"`):
-		return e.fanoutOut, nil
-	case strings.Contains(cmd, `--filter "name=awf-" --filter "name=gh-aw"`):
-		return e.awfOut, nil
-	case strings.Contains(cmd, "iptables -L DOCKER-USER"):
-		return "", nil
-	case strings.Contains(cmd, `--filter "name=gh-aw-mcpg-"`):
-		return "", nil
-	default:
-		e.unexpected = append(e.unexpected, cmd)
-		return "", fmt.Errorf("unexpected command: %s", cmd)
-	}
-}
-
-func (e *agenticInnerHygieneExecutor) Upload(string, string) error { return nil }
-func (e *agenticInnerHygieneExecutor) Close() error                { return nil }
-
-func (e *agenticInnerHygieneExecutor) snapshot() (calls, unexpected []string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return append([]string(nil), e.calls...), append([]string(nil), e.unexpected...)
-}
-
-// TestCheckContainerAgenticInnerHygiene covers the strict running-state gate,
-// clean result, both warning sources, and the host-MTU fanout gate.
-func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
-	t.Parallel()
-
-	const cleanFanout = "#container-inner-host-docker-internal:0\n" +
-		"#container-inner-resolv:0\n" +
-		"#container-awf-service-routing:0\n" +
-		"#container-node-npm:0\n" +
-		"#container-awf:0"
-
-	tests := []struct {
-		name            string
-		inspectOut      string
-		inspectErr      error
-		mtuOut          string
-		awfOut          string
-		fanoutOut       string
-		wantWarn        int
-		wantExecCalls   int
-		wantFanoutCalls int
-		wantMTUBlock    bool
-		wantContains    []string
-		wantNotContains []string
-	}{
-		{
-			name:            "inspect error skips inner probes",
-			inspectErr:      errors.New("docker unavailable"),
-			mtuOut:          "1400\n",
-			wantNotContains: []string{"container(agent):"},
-		},
-		{
-			name:            "restarting skips inner probes",
-			inspectOut:      "restarting\n",
-			mtuOut:          "1400\n",
-			wantNotContains: []string{"container(agent):"},
-		},
-		{
-			name:            "healthy standard MTU",
-			inspectOut:      "running\n",
-			mtuOut:          "1500\n",
-			fanoutOut:       cleanFanout,
-			wantExecCalls:   4,
-			wantFanoutCalls: 1,
-			wantContains:    []string{"container(agent): awf installed, inner Docker clean", "gh-sr-aw-1"},
-			wantNotContains: []string{"[WARN]", "[FAIL]"},
-		},
-		{
-			name:            "inner AWF orphan warning",
-			inspectOut:      "running\n",
-			mtuOut:          "1500\n",
-			awfOut:          "awf-c1\n",
-			fanoutOut:       cleanFanout,
-			wantWarn:        1,
-			wantExecCalls:   4,
-			wantFanoutCalls: 1,
-			wantContains: []string{
-				"container(agent): orphan gh-aw/awf containers in inner Docker",
-				"docker exec -it gh-sr-aw-1 bash",
-				"See: agentic-workflows.md §12",
-			},
-		},
-		{
-			name:            "fanout probe warning",
-			inspectOut:      "running\n",
-			mtuOut:          "1500\n",
-			fanoutOut:       "#container-node-npm:1",
-			wantWarn:        1,
-			wantExecCalls:   4,
-			wantFanoutCalls: 1,
-			wantContains: []string{
-				"container(agent): node LTS/npm are not on PATH",
-				"gh sr rebuild aw",
-				"See: agentic-workflows.md §8",
-			},
-		},
-		{
-			name:            "healthy reduced MTU includes probe",
-			inspectOut:      "running\n",
-			mtuOut:          "1400\n",
-			fanoutOut:       cleanFanout + "\n#container-mtu:0",
-			wantExecCalls:   4,
-			wantFanoutCalls: 1,
-			wantMTUBlock:    true,
-			wantContains:    []string{"container(agent): awf installed, inner Docker clean"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			exec := &agenticInnerHygieneExecutor{
-				inspectOut: tt.inspectOut,
-				inspectErr: tt.inspectErr,
-				mtuOut:     tt.mtuOut,
-				awfOut:     tt.awfOut,
-				fanoutOut:  tt.fanoutOut,
-			}
-			h := host.NewHost("h1", config.HostConfig{OS: "linux", Addr: "local"})
-			h.SetConn(exec)
-			runners := []config.RunnerConfig{
-				{Name: "aw", Host: "h1", Repo: "o/r", Count: 1, Profile: "agentic"},
-			}
-			var buf bytes.Buffer
-			r := Result{}
-			checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r)
-
-			if r.Fail != 0 || r.Warn != tt.wantWarn {
-				t.Fatalf("counters: got %+v, want Fail=0 Warn=%d", r, tt.wantWarn)
-			}
-			out := buf.String()
-			for _, want := range tt.wantContains {
-				if !strings.Contains(out, want) {
-					t.Errorf("missing %q in output:\n%s", want, out)
-				}
-			}
-			for _, unwanted := range tt.wantNotContains {
-				if strings.Contains(out, unwanted) {
-					t.Errorf("unexpected %q in output:\n%s", unwanted, out)
-				}
-			}
-
-			calls, unexpected := exec.snapshot()
-			if len(unexpected) != 0 {
-				t.Fatalf("unexpected commands: %q", unexpected)
-			}
-			var mtuCalls, inspectCalls, execCalls, fanoutCalls int
-			var fanoutCommand string
-			for _, cmd := range calls {
-				switch {
-				case strings.Contains(cmd, "ip -o route get 1.1.1.1"):
-					mtuCalls++
-				case strings.Contains(cmd, "docker inspect --format"):
-					inspectCalls++
-				}
-				if strings.Contains(cmd, `docker exec "gh-sr-aw-1"`) {
-					execCalls++
-				}
-				if strings.Contains(cmd, `echo "#container-inner-host-docker-internal:$?"`) {
-					fanoutCalls++
-					fanoutCommand = cmd
-				}
-			}
-			if mtuCalls != 1 || inspectCalls != 1 || execCalls != tt.wantExecCalls || fanoutCalls != tt.wantFanoutCalls {
-				t.Fatalf("probe calls: mtu=%d inspect=%d exec=%d fanout=%d; want 1, 1, %d, %d\nall calls: %q",
-					mtuCalls, inspectCalls, execCalls, fanoutCalls, tt.wantExecCalls, tt.wantFanoutCalls, calls)
-			}
-			if tt.wantFanoutCalls != 0 {
-				hasMTUBlock := strings.Contains(fanoutCommand, `echo "#container-mtu:$?"`) && strings.Contains(fanoutCommand, "host=1400")
-				if hasMTUBlock != tt.wantMTUBlock {
-					t.Errorf("fanout MTU block = %v, want %v\ncommand: %s", hasMTUBlock, tt.wantMTUBlock, fanoutCommand)
-				}
-			}
-		})
-	}
-}

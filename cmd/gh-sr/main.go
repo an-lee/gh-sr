@@ -284,12 +284,6 @@ func runQuickInit(runnersPath string, force bool) error {
 		count = 1
 	}
 
-	profileStr := prompt(`Runner profile ("agentic" for GitHub Agentic Workflows, or empty)`, "")
-	profileLine := ""
-	if profileStr == "agentic" {
-		profileLine = "    profile: agentic\n"
-	}
-
 	seed := fmt.Sprintf(`github: {}
 hosts:
   %s:
@@ -299,7 +293,7 @@ runners:
     repo: %s
     host: %s
     count: %d
-%s`, hostName, addr, runnerName, repo, hostName, count, profileLine)
+`, hostName, addr, runnerName, repo, hostName, count)
 
 	if _, err := os.Stat(runnersPath); err == nil && !force {
 		fmt.Printf("\n%s already exists. Overwrite? [y/N]: ", runnersPath)
@@ -326,9 +320,6 @@ runners:
 	fmt.Printf("  Host:   %s (%s)\n", hostName, addr)
 	fmt.Printf("  Runner: %s -> %s (x%d)\n", runnerName, repo, count)
 	fmt.Println("  Labels: auto-generated from host os/arch")
-	if profileStr == "agentic" {
-		fmt.Println("  Profile: agentic (GitHub Agentic Workflows)")
-	}
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  gh sr doctor   # verify config, GitHub access, and host connectivity")
@@ -378,7 +369,6 @@ func addRunnerCmd() *cobra.Command {
 		count     int
 		labels    []string
 		ephemeral bool
-		profile   string
 	)
 	cmd := &cobra.Command{
 		Use:   "runner <name>",
@@ -386,9 +376,7 @@ func addRunnerCmd() *cobra.Command {
 		Long: `Adds a runner to runners.yml. Labels are auto-generated from host os/arch if not specified.
 
 Use --org instead of --repo for organization-level runners, and --group
-to assign the runner to a runner group. Use --profile agentic for GitHub
-Agentic Workflows (gh-aw) runners; agentic runners always use container
-(Docker-in-Docker) isolation, so no runner_mode or MCP port config is needed.`,
+to assign the runner to a runner group.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgPath, err := config.ResolveConfigPath(cfgFile)
@@ -405,9 +393,6 @@ Agentic Workflows (gh-aw) runners; agentic runners always use container
 			if host == "" {
 				return fmt.Errorf("--host is required")
 			}
-			if profile != "" && profile != "agentic" {
-				return fmt.Errorf("--profile must be empty or \"agentic\"")
-			}
 			opts := config.AddRunnerOpts{
 				Name:      name,
 				Repo:      repo,
@@ -417,7 +402,6 @@ Agentic Workflows (gh-aw) runners; agentic runners always use container
 				Count:     count,
 				Labels:    labels,
 				Ephemeral: ephemeral,
-				Profile:   profile,
 			}
 			if err := config.AddRunnerFull(cfgPath, opts); err != nil {
 				return err
@@ -437,7 +421,6 @@ Agentic Workflows (gh-aw) runners; agentic runners always use container
 	cmd.Flags().IntVar(&count, "count", 1, "number of parallel instances")
 	cmd.Flags().StringSliceVar(&labels, "labels", nil, "runner labels (auto-generated if empty)")
 	cmd.Flags().BoolVar(&ephemeral, "ephemeral", false, "register as ephemeral (one job then deregister)")
-	cmd.Flags().StringVar(&profile, "profile", "", `runner profile: "agentic" for GitHub Agentic Workflows (gh-aw); runs in container (DinD) mode automatically`)
 	return cmd
 }
 
@@ -462,7 +445,7 @@ func doctorCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check config, GitHub API access, and host prerequisites",
-		Long:  "Validates local paths, configuration, GitHub API access, and SSH targets. For runner_mode: native, checks host runner dirs. profile: agentic always uses container mode: checks outer Docker and --privileged, each gh-sr-<instance> container, inner dockerd, .runner inside the container, and AWF hygiene/networking on the inner Docker. See README \"Host setup\" for steps gh sr cannot automate.",
+		Long:  "Validates local paths, configuration, GitHub API access, and SSH targets. For runner_mode: native, checks host runner dirs. For runner_mode: container, checks outer Docker and --privileged, each gh-sr-<instance> container, inner dockerd, and .runner inside the container. See README \"Host setup\" for steps gh sr cannot automate.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := config.BootstrapEnv(); err != nil {

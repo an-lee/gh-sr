@@ -25,7 +25,7 @@ type Config struct {
 }
 
 // ContainerRunnerImageConfig controls optional customization of the locally built
-// gh-sr/agentic-runner Docker image (runner_mode: container).
+// container runner Docker image (runner_mode: container).
 type ContainerRunnerImageConfig struct {
 	// ExtraAptPackages lists additional Debian package names to install in the
 	// image at build time (Ubuntu main archive only in v1).
@@ -240,9 +240,7 @@ const RunnerModeNative = "native"
 
 // RunnerModeContainer runs each runner instance inside its own privileged Docker
 // container (DinD), providing full filesystem and network isolation between
-// concurrent jobs on the same host. It is required for agentic workflows (isolated
-// /tmp/gh-aw, MCP gateway port, and AWF iptables per runner) and is also useful for
-// any self-hosted runner that wants container isolation.
+// concurrent jobs on the same host.
 const RunnerModeContainer = "container"
 
 type RunnerConfig struct {
@@ -254,39 +252,17 @@ type RunnerConfig struct {
 	Count      int      `yaml:"count"`
 	Labels     []string `yaml:"labels"`
 	Ephemeral  bool     `yaml:"ephemeral"`
-	Profile    string   `yaml:"profile"`     // "agentic" for GitHub Agentic Workflows
 	RunnerMode string   `yaml:"runner_mode"` // "native" (default) or "container"
-	// Deprecated: the per-instance MCP port-label scheme was removed. agentic runners
-	// now use runner_mode: container, which isolates the MCP gateway port per runner.
-	// These fields are retained only so old configs still parse; Validate rejects them
-	// with a migration message.
-	AgenticMCPPorts    []int `yaml:"agentic_mcp_ports,omitempty"`
-	AgenticMCPPortBase *int  `yaml:"agentic_mcp_port_base,omitempty"`
-}
-
-// IsAgentic returns true if the runner uses the agentic profile.
-func (rc *RunnerConfig) IsAgentic() bool {
-	return rc.Profile == "agentic"
 }
 
 // IsContainerMode returns true if the runner uses container-isolated DinD mode.
-// This includes any profile: agentic runner (agentic implies container; see
-// EffectiveRunnerMode) as well as runners that set runner_mode: container explicitly.
 func (rc *RunnerConfig) IsContainerMode() bool {
 	return rc.EffectiveRunnerMode() == RunnerModeContainer
 }
 
 // EffectiveRunnerMode returns the resolved runner mode.
-//
-// profile: agentic always resolves to container mode: native mode cannot isolate
-// gh-aw's machine-global resources (/tmp/gh-aw, the MCP gateway port, AWF iptables)
-// between concurrent jobs on one host, so agentic runners use per-instance DinD
-// isolation. Validate rejects an explicit runner_mode: native + profile: agentic.
 func (rc *RunnerConfig) EffectiveRunnerMode() string {
 	if rc.RunnerMode == RunnerModeContainer {
-		return RunnerModeContainer
-	}
-	if rc.IsAgentic() {
 		return RunnerModeContainer
 	}
 	return RunnerModeNative
@@ -380,9 +356,6 @@ func (rc *RunnerConfig) effectiveLabelsCore(hostOS, arch string) []string {
 		labels = append([]string(nil), rc.Labels...)
 	} else {
 		labels = DefaultLabels(hostOS, arch)
-	}
-	if rc.IsAgentic() && !hasLabel(labels, "agentic") {
-		labels = append(labels, "agentic")
 	}
 	return labels
 }
@@ -480,17 +453,6 @@ func (c *Config) applyDefaults() {
 		if c.Runners[i].Count < 1 {
 			c.Runners[i].Count = 1
 		}
-		c.Runners[i].applyAgenticDefaults()
-	}
-}
-
-func (rc *RunnerConfig) applyAgenticDefaults() {
-	if !rc.IsAgentic() {
-		return
-	}
-	// Agentic runners get "agentic" label auto-added if not present.
-	if !hasLabel(rc.Labels, "agentic") {
-		rc.Labels = append(rc.Labels, "agentic")
 	}
 }
 
@@ -569,22 +531,8 @@ func (c *Config) Validate() error {
 		if _, ok := c.Hosts[r.Host]; !ok {
 			return fmt.Errorf("runner %q: host %q not found in hosts", r.Name, r.Host)
 		}
-		if r.Profile != "" && r.Profile != "agentic" {
-			return fmt.Errorf("runner %q: profile must be empty or \"agentic\" (got %q)", r.Name, r.Profile)
-		}
 		if r.RunnerMode != "" && r.RunnerMode != RunnerModeNative && r.RunnerMode != RunnerModeContainer {
 			return fmt.Errorf("runner %q: runner_mode must be %q or %q (got %q)", r.Name, RunnerModeNative, RunnerModeContainer, r.RunnerMode)
-		}
-		// profile: agentic now requires container isolation. Native mode cannot keep
-		// concurrent agentic jobs from colliding on /tmp/gh-aw, the MCP gateway port,
-		// or AWF iptables; agentic therefore always runs in container mode.
-		if r.IsAgentic() && r.RunnerMode == RunnerModeNative {
-			return fmt.Errorf("runner %q: profile: agentic is no longer supported with runner_mode: native (native mode cannot isolate /tmp/gh-aw, the MCP gateway port, or AWF iptables between concurrent jobs on one host); remove runner_mode (agentic uses container isolation automatically) or set runner_mode: container", r.Name)
-		}
-		// The per-instance MCP port-label scheme has been removed: container mode gives
-		// each agentic runner its own isolated MCP gateway port, so ports/labels are unnecessary.
-		if len(r.AgenticMCPPorts) > 0 || r.AgenticMCPPortBase != nil {
-			return fmt.Errorf("runner %q: agentic_mcp_ports / agentic_mcp_port_base have been removed; agentic runners use runner_mode: container, which isolates the MCP gateway port per runner — delete these fields", r.Name)
 		}
 		// Inline the `name-N` construction instead of calling r.InstanceNames(): the
 		// per-call slice+fmt.Sprintf allocs are the dominant cost on large configs.

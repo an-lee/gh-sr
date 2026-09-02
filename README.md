@@ -80,25 +80,6 @@ gh sr up                              # auto-setup + start
 
 Then run `gh sr` on a terminal for the interactive dashboard, or use `gh sr status`, `gh sr logs <name>`, etc.
 
-## GitHub Agentic Workflows (gh-aw)
-
-To run [GitHub Agentic Workflows](https://github.github.com/gh-aw/guides/self-hosted-runners/) on your self-hosted runners, use the `agentic` profile:
-
-```yaml
-runners:
-  - name: aw-runner
-    repo: owner/repo
-    host: my-vps
-    count: 3           # 3 concurrent agentic jobs, each isolated
-    profile: agentic   # always runs in container (DinD) mode
-```
-
-`profile: agentic` always runs in **container mode**: each runner instance is a privileged Docker-in-Docker container with its own inner `dockerd`, network namespace, MCP gateway port, and `/tmp/gh-aw`, and every job runs from a pristine inner state (via the runner's job hooks). This is what makes multiple concurrent agentic runners stable on one machine.
-
-The **host only needs Docker** (with privileged-container support). Everything `gh-aw` needs — the `gh-aw` CLI, AWF, `host.docker.internal` DNS, the tool cache, language runtimes — lives inside the image `gh sr` builds during setup. There is no host dnsmasq, `/etc/hosts`, sudoers, or `RUNNER_TEMP` setup to do; `host.docker.internal` resolution is baked into the image (pinned bridge gateway `10.200.0.1` + bundled dnsmasq). `gh sr doctor` verifies the inner Docker, registration, DNS, and AWF hygiene.
-
-For details, see the [Agentic Workflows guide](https://an-lee.github.io/gh-sr/guides/agentic-workflows/).
-
 ## Development
 
 ```bash

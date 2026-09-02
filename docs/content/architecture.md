@@ -28,12 +28,12 @@ flowchart LR
 
 ## Where runners run
 
-**Runner mode** (`native` vs `container`) is resolved per runner via `runners[].runner_mode`. The default is **`native`**. Set **`runner_mode: container`** for privileged Docker-in-Docker (DinD) isolation. **`profile: agentic` always implies `container` mode** — see [Agentic Workflows](guides/agentic-workflows.md).
+**Runner mode** (`native` vs `container`) is resolved per runner via `runners[].runner_mode`. The default is **`native`**. Set **`runner_mode: container`** for privileged Docker-in-Docker (DinD) isolation.
 
 | Host OS | Typical setup | Where the workload runs |
 |--------|---------------|-------------------------|
 | Linux | `runner_mode: native` (default) | Files under `~/.gh-sr/runners/<instance>`; process via `run.sh` and a PID file (or systemd when installed). |
-| Linux | `runner_mode: container` or `profile: agentic` | Privileged outer container `gh-sr-<instance>` with an inner `dockerd`; image `gh-sr/agentic-runner:<version>` built locally by `gh sr setup`. gh-aw, AWF, DNS, and tooling live inside the image. |
+| Linux | `runner_mode: container` | Privileged outer container `gh-sr-<instance>` with an inner `dockerd`; image `gh-sr/container-runner:<version>` built locally by `gh sr setup`. |
 | Windows | `runner_mode: native` (default) | `%USERPROFILE%\.gh-sr\runners\<instance>`; process via `run.cmd` and a PID file. |
 | macOS | `runner_mode: native` (default) | `~/.gh-sr/runners/<instance>`. |
 
@@ -43,7 +43,7 @@ flowchart LR
 flowchart TB
   subgraph linuxHost [Linux_host]
     ln[runner_mode_native]
-    lc[runner_mode_container_or_profile_agentic]
+    lc[runner_mode_container]
     ln --> d1[Dir_HOME_gh_sr_runners_name_1]
     lc --> c1[Container_gh_sr_name_1_with_inner_dockerd]
   end
@@ -80,7 +80,7 @@ sequenceDiagram
 
 | Command | Behavior |
 |---------|----------|
-| `gh sr setup` | Install/configure runner software on the host. For **container** mode, builds the local `gh-sr/agentic-runner` image (if needed) and creates outer runner containers. |
+| `gh sr setup` | Install/configure runner software on the host. For **container** mode, builds the local `gh-sr/container-runner` image (if needed) and creates outer runner containers. |
 | `gh sr up` / `gh sr down` | Start or stop each instance (native process or outer container). |
 | `gh sr restart` | `down` then `up`; stop errors are ignored before start. |
 | `gh sr update` | Remove local runner registration (native) or outer container (container mode), then setup and start again—use when upgrading the runner stack. |
