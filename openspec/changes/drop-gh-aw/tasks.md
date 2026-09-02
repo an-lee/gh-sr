@@ -25,15 +25,17 @@
 - [x] 4.6 In the `gh sr setup` / `gh sr up` path, detect when an old `gh-sr/agentic-runner` image exists locally. Print a one-line migration message: `Detected legacy image gh-sr/agentic-runner:<v>; remove with 'docker rmi gh-sr/agentic-runner:<v>' and re-run setup.` Build the new tag regardless. Verify: `go test` covers the legacy-image-present and legacy-image-absent paths.
 - [x] 4.7 Update `ContainerImageLayoutRevision` so its fingerprint includes the new wrapper file contents (it already fingerprints the embedded strings, so adding the new files to the `WriteString` chain in `imageLayoutFingerprint` is sufficient). Verify: bumping the wrapper entrypoint changes the fingerprint.
 
-## 4b. Fix wrapper base — use the official actions/runner-dind image
+## 4b. Fix wrapper base — Ubuntu 22.04 (Debian/glibc) with dockerd + runner installed
 
-The original `FROM docker:dind` choice (task 4.3) is wrong: `docker:dind` is built on Alpine (musl libc), but the official actions/runner Linux binary is built for glibc. Running a glibc binary on Alpine aborts at `run.sh` with a dynamic-loader error.
+Three failed attempts to drop the wrapper image:
 
-`docker:dind-rootless` is also Alpine-based (verified — `apt-get: not found` on first build attempt), so the obvious fix doesn't work either.
+1. `FROM docker:dind` — Alpine (musl). `actions/runner` is glibc, aborts at run.sh.
+2. `FROM docker:dind-rootless` — **also Alpine** (verified — `apt-get: not found` on the build's RUN line, even though the tag name suggests otherwise).
+3. `FROM ghcr.io/actions/actions-runner-dind` — **private** package; returns 401 to anonymous pulls. Not viable for a public gh-sr install.
 
-The correct base is `ghcr.io/actions/actions-runner-dind:v<version>` — an official GitHub-maintained Debian-based image that bundles dockerd + actions/runner. The Dockerfile becomes a 3-line overlay that only adds our pid-cleanup entrypoint.
+The only option left is to keep the wrapper, but switch the base to `ubuntu:22.04` (Debian/glibc Ubuntu LTS) and install dockerd from get.docker.com + actions/runner from GitHub releases. The Dockerfile is still small (~25 lines vs. the original ~80); it's just not zero.
 
-- [x] 4b.1 Update `internal/runner/container-runner-image/Dockerfile`: replace the apt-get install layer, the tarball-download layer, and the COPY entrypoint with a single `FROM ghcr.io/actions/actions-runner-dind:v${RUNNER_VERSION}` + `COPY entrypoint.sh /entrypoint.sh` + `ENTRYPOINT ["/entrypoint.sh"]`. Update the header comment to point at the upstream image and explain the libc constraint. Verify: `cat Dockerfile` shows the new FROM and the rationale.
+- [x] 4b.1 Update `internal/runner/container-runner-image/Dockerfile`: change `FROM ghcr.io/actions/actions-runner-dind` to `FROM ubuntu:22.04` and add the two RUN layers (dockerd from get.docker.com, actions/runner tarball). Drop the upstream-image ARG/version tag pinning (use the runner version directly as the actions/runner release tag). Update the header comment to document the constraint: no public upstream image combines glibc + DinD + actions/runner. Verify: `cat Dockerfile` shows the new FROM and the rationale.
 - [x] 4b.2 Build the new image locally and confirm `docker info` succeeds inside it: `docker build -f internal/runner/container-runner-image/Dockerfile -t test/container-runner:test . && docker run --privileged --rm test/container-runner-test docker info`. Verify: end-to-end on a real Docker daemon. (Manual smoke test — no automated harness in this environment.)
 
 ## 5. Consumer workflow & dispatcher deletion
