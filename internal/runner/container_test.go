@@ -327,6 +327,7 @@ func TestAgenticRunnerJobHooksReset(t *testing.T) {
 	for _, want := range []string{
 		"docker ps -aq",
 		"docker network prune -f",
+		"chown -R runner:runner",
 		"PREROUTING",
 		"172.30.0.0/24",
 		"docker info",

@@ -11,14 +11,18 @@
 #      job/service (`services:`) containers and network. So removing ALL inner containers
 #      here cannot touch the current job's containers; it only reaps leftovers from a
 #      previous job whose completed-hook did not run (e.g. the runner was killed mid-job).
-#   2. (Re)assert the AWF service-routing bypass so workflow `services:` reachability
+#   2. Reclaim /runner-state/_work and _temp for the runner user. The bind-mount
+#      survives container recreation; leftover files owned by uid 1000 (host user
+#      or a previous native-mode job) make the next job fail with
+#      "Access to the path '/runner-state/_work/...' is denied".
+#   3. (Re)assert the AWF service-routing bypass so workflow `services:` reachability
 #      survives any flush.
-#   3. Verify the inner dockerd is responsive. This is the only hard failure: if
+#   4. Verify the inner dockerd is responsive. This is the only hard failure: if
 #      dockerd is down the job cannot run anyway, and failing here surfaces a clear
 #      message in "Set up runner" instead of a confusing failure minutes later.
 #
 # Never removes images / volumes — the /runner-state/docker-data image cache is
-# preserved so the job does not re-pull gh-aw's images.
+# preserved so the job does not re-pull service or agent images.
 
 set +e
 export PATH="/opt/gh-sr/docker-shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -36,7 +40,13 @@ if command -v iptables >/dev/null 2>&1; then
 fi
 sudo -n rm -rf /tmp/gh-aw >/dev/null 2>&1 || rm -rf /tmp/gh-aw >/dev/null 2>&1
 
-# 2. (Re)assert the AWF service-routing bypass (idempotent): exempt AWF-subnet
+# 2. Reclaim bind-mounted work/temp for uid 1001 (runner). Do not touch
+#    docker-data (root-owned inner image cache).
+sudo -n chown -R runner:runner /runner-state/_work /runner-state/_temp 2>/dev/null \
+    || chown -R runner:runner /runner-state/_work /runner-state/_temp 2>/dev/null \
+    || log "WARNING: could not chown /runner-state/_work (next job may hit permission denied)"
+
+# 3. (Re)assert the AWF service-routing bypass (idempotent): exempt AWF-subnet
 #    traffic destined to a local IP from inner dockerd's DOCKER chain DNAT so AWF
 #    agents can reach workflow `services:` published ports. Mirrors entrypoint.sh.
 if command -v iptables >/dev/null 2>&1; then
@@ -44,7 +54,7 @@ if command -v iptables >/dev/null 2>&1; then
     sudo -n iptables -t nat -I PREROUTING -s "${AWF_SUBNET}" -m addrtype --dst-type LOCAL -j RETURN >/dev/null 2>&1
 fi
 
-# 3. Ensure the inner dockerd is responsive (entrypoint starts it before run.sh;
+# 4. Ensure the inner dockerd is responsive (entrypoint starts it before run.sh;
 #    this guards against a daemon that died between jobs).
 for i in $(seq 1 30); do
     if docker info >/dev/null 2>&1; then
