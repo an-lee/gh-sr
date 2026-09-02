@@ -71,6 +71,6 @@ FAIL_FILE="${RUNNER_STATE_DIR:-/home/runner/_work}/dockerd-start-failures"
 rm -f "${FAIL_FILE}" 2>/dev/null || true
 
 # 4. Hand off to the actions/runner entrypoint. The runner binary's own
-#    entrypoint (config.sh / run.sh) reads GH_SR_* env vars (set by the outer
-#    gh-sr orchestrator) and registers with GitHub.
+# entrypoint (run.sh) reads GH_SR_* env vars (set by the outer gh-sr
+# orchestrator) and registers with GitHub.
 exec /home/runner/run.sh

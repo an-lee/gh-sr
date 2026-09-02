@@ -25,6 +25,13 @@
 - [x] 4.6 In the `gh sr setup` / `gh sr up` path, detect when an old `gh-sr/agentic-runner` image exists locally. Print a one-line migration message: `Detected legacy image gh-sr/agentic-runner:<v>; remove with 'docker rmi gh-sr/agentic-runner:<v>' and re-run setup.` Build the new tag regardless. Verify: `go test` covers the legacy-image-present and legacy-image-absent paths.
 - [x] 4.7 Update `ContainerImageLayoutRevision` so its fingerprint includes the new wrapper file contents (it already fingerprints the embedded strings, so adding the new files to the `WriteString` chain in `imageLayoutFingerprint` is sufficient). Verify: bumping the wrapper entrypoint changes the fingerprint.
 
+## 4b. Fix wrapper base — Alpine doesn't work with actions/runner
+
+The original `FROM docker:dind` choice (task 4.3) is wrong: `docker:dind` is built on Alpine (musl libc), but the official actions/runner Linux binary is built for glibc. Running a glibc binary on Alpine aborts at `run.sh` with a dynamic-loader error. The fix is small: switch the FROM to `docker:dind-rootless`, which is the Debian/glibc sibling — rootless is incidental (we run the outer container with `--privileged`).
+
+- [x] 4b.1 Update `internal/runner/container-runner-image/Dockerfile`: change `FROM docker:${DOCKER_VERSION:-dind}` to `FROM docker:${DOCKER_VERSION:-dind-rootless}`. Replace the `apk add || apt-get install` fallback with a single `apt-get install` (Debian base). Drop the `|| true` on `installdependencies.sh` — Debian has `apt-get`, so the script will succeed. Verify: `cat Dockerfile` shows the new base; the comments document the libc constraint.
+- [x] 4b.2 Build the new image locally and confirm `docker info` succeeds inside it: `docker build -f internal/runner/container-runner-image/Dockerfile -t test/container-runner:test . && docker run --privileged --rm test/container-runner:test docker info`. Verify: end-to-end on a real Docker daemon. (Manual smoke test — no automated harness in this environment.)
+
 ## 5. Consumer workflow & dispatcher deletion
 
 - [x] 5.1 Delete every `.github/workflows/*-*.md` and matching `.lock.yml` file (perf-improver, test-improver, doc-updater, grumpy-reviewer, efficiency-improver, duplicate-code-detector, repo-assist). Verify: `ls .github/workflows/` contains only `ci.yml`, `release.yml`, `bench-compare.yml`, and `copilot-setup-steps.yml` (or its successor from 5.4).
