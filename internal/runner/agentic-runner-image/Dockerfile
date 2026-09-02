@@ -24,7 +24,7 @@ RUN apt-get update \
 
 # Docker CE (for DinD — the inner dockerd that gh-aw uses)
 RUN install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    && curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors https://download.docker.com/linux/ubuntu/gpg \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
     && chmod a+r /etc/apt/keyrings/docker.gpg \
     && echo \
@@ -42,7 +42,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI (gh) — required by gh-aw
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+RUN curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
@@ -54,7 +54,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Node.js LTS (NodeSource) — gh-aw activation setup installs @actions/artifact via npm
 # before actions/setup-node runs in the agent job.
-RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+RUN curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors https://deb.nodesource.com/setup_lts.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && node -v \
     && npm -v \
@@ -97,19 +97,19 @@ RUN if [ -z "$RUNNER_VERSION" ]; then \
         echo "ERROR: RUNNER_VERSION build-arg is required" >&2; exit 1; \
     fi \
     && mkdir -p /home/runner/actions-runner \
-    && curl -fsSL \
+    && curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" \
        | tar -xz -C /home/runner/actions-runner \
     && chown -R runner:runner /home/runner/actions-runner \
     && /home/runner/actions-runner/bin/installdependencies.sh
 
 # gh-aw CLI extension
-RUN su - runner -c "curl -sL https://raw.githubusercontent.com/github/gh-aw/main/install-gh-aw.sh | bash"
+RUN su - runner -c "curl -sL --retry 5 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/github/gh-aw/main/install-gh-aw.sh | bash"
 
 # Agentic Workflow Firewall CLI. Compiled gh-aw workflows invoke `sudo -E awf`
 # directly, so this must be installed globally instead of relying on the gh-aw
 # extension installer.
-RUN curl -sSL https://raw.githubusercontent.com/github/gh-aw-firewall/main/install.sh \
+RUN curl -sSL --retry 5 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/github/gh-aw-firewall/main/install.sh \
         | AWF_FORCE_BINARY=1 bash \
     && awf --version
 

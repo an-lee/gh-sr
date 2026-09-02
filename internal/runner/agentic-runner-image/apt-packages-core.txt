@@ -34,3 +34,31 @@ sudo
 tar
 uidmap
 unzip
+
+# Chrome for Testing runtime libraries (libnss/libatk/libcups/libgbm/libxkbcommon/...).
+# Workflows that exercise system tests download Chrome for Testing into
+# $RUNNER_TOOL_CACHE/ohmyxin-chrome and launch it directly; the actions/runner
+# `installdependencies.sh` is browser-agnostic and does NOT install any of
+# these. Without them Chrome aborts with
+#   "error while loading shared libraries: libatk-1.0.so.0"
+# the moment any test tries to launch it — observed in workflow run
+# 33598149688, where all four test shards died identically on libatk-1.0
+# before a single test could run. `chromium` in Ubuntu 24.04 is a
+# transitional stub for the snap and no longer transitively pulls these in,
+# so list them explicitly. Versions are pinned to whatever Ubuntu 24.04 ships.
+libatk1.0-0
+libatk-bridge2.0-0
+libatspi2.0-0
+libasound2t64
+libcairo2
+libcups2
+libdrm2
+libgbm1
+libnss3
+libnspr4
+libpango-1.0-0
+libxcomposite1
+libxdamage1
+libxfixes3
+libxkbcommon0
+libxrandr2
