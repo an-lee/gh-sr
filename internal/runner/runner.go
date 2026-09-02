@@ -145,7 +145,7 @@ func (m *Manager) Start(h *host.Host, rc config.RunnerConfig) error {
 				return err
 			}
 			fmt.Fprintf(m.out(), "  %s: container started\n", name)
-			if containerLogsContainStaleRegistration(h, name) {
+			if containerLogsContainRecoverableRegistrationError(h, name) {
 				fmt.Fprintf(m.out(), "  %s: registration expired on GitHub, re-creating container...\n", name)
 				if err := m.recoverContainerStaleRegistration(h, rc, i, name); err != nil {
 					return fmt.Errorf("recovering stale registration for %s: %w", name, err)

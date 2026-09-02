@@ -269,6 +269,28 @@ func TestAgenticRunnerEntrypointStartsDockerdOnce(t *testing.T) {
 	}
 }
 
+// TestAgenticRunnerEntrypointUnlinksStaleDockerdPid guards against re-introducing the
+// host-side hard-kill failure mode where /var/run/docker.pid is left behind on the
+// container's overlay writable layer and the next dockerd refuses to start with
+// "process with PID … is still running". The cleanup must run on every entrypoint
+// invocation and must precede the single dockerd start (it does not need to be the
+// very first line of the script — only ordered before the daemon).
+func TestAgenticRunnerEntrypointUnlinksStaleDockerdPid(t *testing.T) {
+	t.Parallel()
+	const cleanupLine = "rm -f /var/run/docker.pid"
+	if !strings.Contains(agenticRunnerEntrypoint, cleanupLine) {
+		t.Fatalf("entrypoint must unlink the stale /var/run/docker.pid before starting dockerd (missing %q)", cleanupLine)
+	}
+	cleanupIdx := strings.Index(agenticRunnerEntrypoint, cleanupLine)
+	dockerdIdx := strings.Index(agenticRunnerEntrypoint, "dockerd \\")
+	if dockerdIdx < 0 {
+		t.Fatal("entrypoint has no dockerd invocation; test setup is wrong")
+	}
+	if cleanupIdx > dockerdIdx {
+		t.Fatal("stale-pid cleanup must precede the single dockerd start (a daemon written by a later shell invocation cannot read it)")
+	}
+}
+
 // TestAgenticRunnerEntrypointWiresJobHooks verifies the per-job reset hooks are wired
 // into the runner .env so the Actions runner invokes them before/after every job.
 func TestAgenticRunnerEntrypointWiresJobHooks(t *testing.T) {
@@ -2315,6 +2337,92 @@ func TestManagerStartContainerRecoversStaleRegistration(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "registration expired on GitHub, re-creating container") {
 		t.Fatalf("missing stale-registration recovery message: %q", out.String())
+	}
+}
+
+// TestManagerStartContainerRecoversSessionConflict verifies the SessionConflict
+// branch of containerLogsContainRecoverableRegistrationError: when the runner
+// has logged SessionConflictException (and no staleRegistrationMsg substring),
+// the Start flow still routes the affected container through
+// recoverContainerStaleRegistration rather than letting the empty docker logs
+// check return false and skip recovery. The shared helper must therefore match
+// either pattern with a single SSH round-trip.
+func TestManagerStartContainerRecoversSessionConflict(t *testing.T) {
+	t.Parallel()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/actions/runners/registration-token") {
+			_ = json.NewEncoder(w).Encode(tokenResponse{Token: "fresh-token"})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	var out bytes.Buffer
+	var logProbe string
+	var logProbeCalls int
+	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
+		switch {
+		case strings.Contains(cmd, "docker update --restart") && strings.Contains(cmd, "docker start gh-sr-ci-1"):
+			return "gh-sr-ci-1\n", nil
+		case strings.Contains(cmd, "docker logs --tail 200") && strings.Contains(cmd, "grep -F"):
+			logProbe = cmd
+			logProbeCalls++
+			// Session conflict path: NO staleRegistrationMsg substring anywhere
+			// in the recent logs. We still need the helper to return true so
+			// the recovery path runs; mock this by reporting grep success only
+			// when the cmd contains sessionConflictMsg (which the helper now
+			// chains via -e), and never when it does not.
+			if strings.Contains(cmd, sessionConflictMsg) {
+				return "", nil
+			}
+			return "no-match\n", errors.New("exit 1")
+		case strings.Contains(cmd, "docker inspect --format '{{.Config.Image}}'"):
+			return "gh-sr/agentic-runner:2.330.0\n", nil
+		case cmd == "echo $HOME":
+			return "/home/runner\n", nil
+		case strings.Contains(cmd, "docker rm -f"):
+			return "", nil
+		case strings.Contains(cmd, "docker create"):
+			return "", nil
+		case strings.Contains(cmd, "docker inspect --format '{{.State.Status}}'"):
+			return "running\n", nil
+		case strings.Contains(cmd, `docker exec "gh-sr-ci-1" sh -c`) &&
+			strings.Contains(cmd, "docker info") &&
+			strings.Contains(cmd, "test -f /home/runner/actions-runner/.runner"):
+			return "dockerd-ok\nok\n", nil
+		default:
+			return "", nil
+		}
+	}}
+	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
+	h.SetConn(mock)
+	m := &Manager{
+		GitHub: NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
+		Out:    &out,
+	}
+	rc := config.RunnerConfig{
+		Name:       "ci",
+		Repo:       "o/r",
+		Host:       "h",
+		Count:      1,
+		RunnerMode: config.RunnerModeContainer,
+	}
+	if err := m.Start(h, rc); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if logProbeCalls != 1 {
+		t.Fatalf("expected exactly one docker logs probe per instance, got %d", logProbeCalls)
+	}
+	if !strings.Contains(logProbe, sessionConflictMsg) {
+		t.Fatalf("log probe must include sessionConflictMsg so a SessionConflict trigger is detected, got: %q", logProbe)
+	}
+	if !strings.Contains(logProbe, staleRegistrationMsg) {
+		t.Fatalf("log probe must still cover staleRegistrationMsg so the prior failure mode is unaffected, got: %q", logProbe)
+	}
+	if !strings.Contains(out.String(), "registration expired on GitHub, re-creating container") {
+		t.Fatalf("missing recovery message — SessionConflict did not route through recovery: %q", out.String())
 	}
 }
 

@@ -29,6 +29,15 @@ const (
 	dockerdStartFailuresFile = "dockerd-start-failures"
 )
 
+// sessionConflictMsg is the substring the Actions runner writes to its log when
+// GitHub still holds the previous run's session and rejects a fresh
+// registration with `SessionConflictException` (eventually `Runner listener
+// exit with Session Conflict error`). It is container-mode-only — the runner is
+// the only gh-sr-managed process whose lifecycle overlaps with the server-side
+// session, and the substring is broader than the GitHub exception type so a
+// future phrasing change still matches.
+const sessionConflictMsg = "Session Conflict"
+
 // ContainerImageLayoutRevision returns a short hex fingerprint of the embedded
 // container image layout (Dockerfile, manifests, entrypoint, wrapper), gh-sr
 // CLI version, and extra apt package list. It changes when any of those inputs change.
@@ -658,16 +667,28 @@ func (m *Manager) startContainer(h *host.Host, instanceName string) error {
 	return nil
 }
 
-// containerLogsContainStaleRegistration reports whether the runner inside an
-// existing container has hit GitHub's "registration deleted" failure. With
-// --restart unless-stopped Docker can otherwise keep restarting the same stale
-// local .runner/.credentials files forever.
-func containerLogsContainStaleRegistration(h *host.Host, instanceName string) bool {
+// containerLogsContainRecoverableRegistrationError reports whether the runner
+// inside an existing container has hit a recoverable registration error against
+// GitHub. Two patterns qualify:
+//
+//   - staleRegistrationMsg  — the runner logged that its registration has been
+//     deleted server-side; `recoverContainerStaleRegistration` was originally
+//     written for this case.
+//   - sessionConflictMsg — GitHub still holds the previous run's session and
+//     the freshly-rebuilt container cannot register until that session is
+//     cleared (or until the local runner retries past its 240 s cap and exits).
+//
+// With --restart unless-stopped, Docker can otherwise keep restarting the same
+// stale local .runner/.credentials files forever. A single SSH round-trip
+// reads the recent container logs once and matches either pattern via grep -e's,
+// keeping the per-instance cost to one remote command.
+func containerLogsContainRecoverableRegistrationError(h *host.Host, instanceName string) bool {
 	cname := containerName(instanceName)
 	cmd := fmt.Sprintf(
-		"docker logs --tail 200 %s 2>&1 | grep -F %s >/dev/null",
+		"docker logs --tail 200 %s 2>&1 | grep -F -e %s -e %s >/dev/null",
 		QuoteContainerName(cname),
 		hostshell.PosixSingleQuote(staleRegistrationMsg),
+		hostshell.PosixSingleQuote(sessionConflictMsg),
 	)
 	_, err := h.Run(cmd)
 	return err == nil

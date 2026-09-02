@@ -213,6 +213,11 @@ if [ -n "${BRIDGE_MTU}" ]; then
 fi
 
 # ── 2b. Inner dockerd (single start; DNS baked into /etc/docker/daemon.json) ────
+# Always unlink a stale pid file left by a hard-killed predecessor so the daemon
+# does not refuse to start with `process with PID … is still running` on the next
+# entrypoint run. dockerd owns and re-creates /var/run/docker.pid on its own
+# during normal startup, so removing it here is a no-op on a clean start.
+rm -f /var/run/docker.pid
 echo "[entrypoint] starting dockerd..."
 dockerd \
     --data-root="${DOCKER_DATA_ROOT}" \
