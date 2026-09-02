@@ -25,12 +25,16 @@
 - [x] 4.6 In the `gh sr setup` / `gh sr up` path, detect when an old `gh-sr/agentic-runner` image exists locally. Print a one-line migration message: `Detected legacy image gh-sr/agentic-runner:<v>; remove with 'docker rmi gh-sr/agentic-runner:<v>' and re-run setup.` Build the new tag regardless. Verify: `go test` covers the legacy-image-present and legacy-image-absent paths.
 - [x] 4.7 Update `ContainerImageLayoutRevision` so its fingerprint includes the new wrapper file contents (it already fingerprints the embedded strings, so adding the new files to the `WriteString` chain in `imageLayoutFingerprint` is sufficient). Verify: bumping the wrapper entrypoint changes the fingerprint.
 
-## 4b. Fix wrapper base — Alpine doesn't work with actions/runner
+## 4b. Fix wrapper base — use the official actions/runner-dind image
 
-The original `FROM docker:dind` choice (task 4.3) is wrong: `docker:dind` is built on Alpine (musl libc), but the official actions/runner Linux binary is built for glibc. Running a glibc binary on Alpine aborts at `run.sh` with a dynamic-loader error. The fix is small: switch the FROM to `docker:dind-rootless`, which is the Debian/glibc sibling — rootless is incidental (we run the outer container with `--privileged`).
+The original `FROM docker:dind` choice (task 4.3) is wrong: `docker:dind` is built on Alpine (musl libc), but the official actions/runner Linux binary is built for glibc. Running a glibc binary on Alpine aborts at `run.sh` with a dynamic-loader error.
 
-- [x] 4b.1 Update `internal/runner/container-runner-image/Dockerfile`: change `FROM docker:${DOCKER_VERSION:-dind}` to `FROM docker:${DOCKER_VERSION:-dind-rootless}`. Replace the `apk add || apt-get install` fallback with a single `apt-get install` (Debian base). Drop the `|| true` on `installdependencies.sh` — Debian has `apt-get`, so the script will succeed. Verify: `cat Dockerfile` shows the new base; the comments document the libc constraint.
-- [x] 4b.2 Build the new image locally and confirm `docker info` succeeds inside it: `docker build -f internal/runner/container-runner-image/Dockerfile -t test/container-runner:test . && docker run --privileged --rm test/container-runner:test docker info`. Verify: end-to-end on a real Docker daemon. (Manual smoke test — no automated harness in this environment.)
+`docker:dind-rootless` is also Alpine-based (verified — `apt-get: not found` on first build attempt), so the obvious fix doesn't work either.
+
+The correct base is `ghcr.io/actions/actions-runner-dind:v<version>` — an official GitHub-maintained Debian-based image that bundles dockerd + actions/runner. The Dockerfile becomes a 3-line overlay that only adds our pid-cleanup entrypoint.
+
+- [x] 4b.1 Update `internal/runner/container-runner-image/Dockerfile`: replace the apt-get install layer, the tarball-download layer, and the COPY entrypoint with a single `FROM ghcr.io/actions/actions-runner-dind:v${RUNNER_VERSION}` + `COPY entrypoint.sh /entrypoint.sh` + `ENTRYPOINT ["/entrypoint.sh"]`. Update the header comment to point at the upstream image and explain the libc constraint. Verify: `cat Dockerfile` shows the new FROM and the rationale.
+- [x] 4b.2 Build the new image locally and confirm `docker info` succeeds inside it: `docker build -f internal/runner/container-runner-image/Dockerfile -t test/container-runner:test . && docker run --privileged --rm test/container-runner-test docker info`. Verify: end-to-end on a real Docker daemon. (Manual smoke test — no automated harness in this environment.)
 
 ## 5. Consumer workflow & dispatcher deletion
 

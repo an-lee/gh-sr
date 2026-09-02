@@ -1,47 +1,33 @@
 # gh-sr container runner image.
 #
-# Base: docker:dind-rootless (Debian/glibc-based Docker Engine-in-container).
+# Base: ghcr.io/actions/actions-runner-dind (official GitHub-maintained
+# Debian-based Docker-in-Docker image with the actions/runner binary
+# pre-installed).
 #
-# Why docker:dind-rootless and not the more familiar docker:dind: docker:dind is
-# built on Alpine (musl libc), but the official actions/runner Linux binary is
-# built for glibc — running it on Alpine aborts at run.sh with a dynamic-loader
-# error. The Debian-based dind-rootless image uses glibc, so a single FROM is
-# enough — no multi-stage build, no qemu, no apt-get dance to install glibc on
-# Alpine. The rootless flavour is incidental — we run the container with
-# --privileged from `gh sr up`, so the inner dockerd runs as root and the
-# rootless scaffolding is harmless.
+# Why this base and not docker:dind / docker:dind-rootless: docker:dind is
+# Alpine (musl libc); docker:dind-rootless is also Alpine. The official
+# actions/runner Linux binary is built for glibc and aborts on musl at
+# run.sh with a dynamic-loader error. `actions-runner-dind` is the only
+# upstream image that bundles Debian + DinD + actions/runner, and it is
+# maintained by the actions/runner team at github.com/actions/runner
+# (dockerfiles/Dockerfile-dind).
 #
 # Build arguments:
-#   RUNNER_VERSION — actions/runner release tag (e.g. "2.330.0"). Default is
+#   RUNNER_VERSION — actions/runner release tag (e.g. "2.337.0"). Default is
 #                    overridden by the embedded Dockerfile callers in
 #                    internal/runner/container.go at `gh sr setup` time so
 #                    the image tag matches the running gh-sr version.
-#   TARGETARCH     — linux/amd64 or linux/arm64.
 #
-# Build-time network is required to fetch the actions/runner tarball.
-FROM docker:${DOCKER_VERSION:-dind-rootless}
-
-ARG RUNNER_VERSION=2.330.0
-ARG TARGETARCH=amd64
-
-# jq parses the GitHub registration payload at startup; git is required by
-# actions/checkout. curl fetches the tarball at build time. ca-certificates
-# lets the runner talk to github.com over TLS.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash curl jq git ca-certificates tzdata \
- && rm -rf /var/lib/apt/lists/*
-
-# Fetch and unpack the actions/runner binary. SHA verification is deferred to
-# the runner's own signature checks at registration.
-RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
-    | tar -xz -C /home/runner \
- && /home/runner/bin/installdependencies.sh
+# Build-time network is required to fetch the upstream base image if it is
+# not already cached locally.
+ARG RUNNER_VERSION=2.337.0
+FROM ghcr.io/actions/actions-runner-dind:v${RUNNER_VERSION}
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# The DinD image expects to run as root so dockerd can write to
-# /var/run/docker.pid, which is also what the actions/runner registration
-# flow needs. The outer runner that hosts this container is launched with
-# --privileged from `gh sr up`.
+# The image's default ENTRYPOINT starts dockerd and execs the runner; we
+# replace it with our entrypoint so the Sep-2026 pid-file cleanup runs
+# before dockerd starts (otherwise the inner dockerd sees a stale pid
+# from a previous hard kill and aborts).
 ENTRYPOINT ["/entrypoint.sh"]
