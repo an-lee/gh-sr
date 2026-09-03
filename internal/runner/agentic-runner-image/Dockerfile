@@ -61,6 +61,24 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && npm -v \
     && rm -rf /var/lib/apt/lists/*
 
+# Docker Compose CLI plugin — gh-aw's rootless sandbox (AWF) starts its squid
+# proxy and agent containers via `docker compose`. The fork base's static Docker
+# bundle ships buildx but no compose, and the plugin lookup then fails with the
+# CLI's "unknown shorthand flag: 'd' in -d". Installed into the system-wide
+# plugin dir so the runner user (whom AWF runs as) finds it too. TARGETARCH is
+# docker's amd64/arm64; compose release assets use Go arch names (x86_64/aarch64).
+ARG COMPOSE_VERSION=v5.5.0
+RUN mkdir -p /usr/local/lib/docker/cli-plugins /tmp/compose \
+    && case "${TARGETARCH}" in arm64) _carch=aarch64 ;; *) _carch=x86_64 ;; esac \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${_carch}" \
+        -o "/tmp/compose/docker-compose-linux-${_carch}" \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${_carch}.sha256" \
+        -o "/tmp/compose/docker-compose-linux-${_carch}.sha256" \
+    && (cd /tmp/compose && sha256sum -c "docker-compose-linux-${_carch}.sha256") \
+    && install -m 0755 "/tmp/compose/docker-compose-linux-${_carch}" /usr/local/lib/docker/cli-plugins/docker-compose \
+    && rm -rf /tmp/compose \
+    && docker compose version
+
 # Tool cache — must NOT live under /opt/* because gh-aw's compiled AWF invocation
 # (see repo-assist.lock.yml) intentionally SKIPS mounting any RUNNER_TOOL_CACHE
 # whose path matches `/opt/*` to avoid leaking the rest of /opt (e.g. /opt/gh-aw

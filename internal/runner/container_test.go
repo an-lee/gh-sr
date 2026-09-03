@@ -169,15 +169,19 @@ func TestContainerRunnerImageTag(t *testing.T) {
 
 // TestAgenticRunnerDockerfileRootlessBase pins the rootless image contract: the
 // Dockerfile derives FROM the fork runner base (passed as the FORK_RUNNER_IMAGE
-// build-arg, which carries the CUSTOM_ACTIONS_RESULTS_URL override) and the apt
+// build-arg, which carries the CUSTOM_ACTIONS_RESULTS_URL override), the apt
 // manifest installs zstd (the Actions-cache compression codec the fork runner
-// needs for cache upload/download).
+// needs for cache upload/download), and the Docker Compose CLI plugin is
+// installed system-wide (the fork base's static bundle ships buildx but no
+// compose, and gh-aw's rootless sandbox starts its containers via
+// `docker compose`).
 func TestAgenticRunnerDockerfileRootlessBase(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
 		"ARG FORK_RUNNER_IMAGE",
 		"FROM ${FORK_RUNNER_IMAGE}",
 		"USER root",
+		"/usr/local/lib/docker/cli-plugins/docker-compose",
 	} {
 		if !strings.Contains(agenticRunnerDockerfile, want) {
 			t.Fatalf("Dockerfile must contain %q, got:\n%s", want, agenticRunnerDockerfile)
