@@ -33,7 +33,7 @@ flowchart LR
 | Host OS | Typical setup | Where the workload runs |
 |--------|---------------|-------------------------|
 | Linux | `runner_mode: native` (default) | Files under `~/.gh-sr/runners/<instance>`; process via `run.sh` and a PID file (or systemd when installed). |
-| Linux | `runner_mode: container` or `profile: agentic` | Privileged outer container `gh-sr-<instance>` with an inner `dockerd`; image `gh-sr/agentic-runner:<version>` built locally by `gh sr setup`. gh-aw, AWF, DNS, and tooling live inside the image. |
+| Linux | `runner_mode: container` or `profile: agentic` | Privileged outer container `gh-sr-<instance>` with an inner `dockerd`; image `gh-sr/agentic-runner:<version>` built locally by `gh sr setup` from a fork runner base (`container_runner_image.base_image`). Docker CE, Node.js LTS, zstd, and the per-job reset hooks live inside the image; gh-aw and AWF are not preinstalled — jobs install their own tooling. |
 | Windows | `runner_mode: native` (default) | `%USERPROFILE%\.gh-sr\runners\<instance>`; process via `run.cmd` and a PID file. |
 | macOS | `runner_mode: native` (default) | `~/.gh-sr/runners/<instance>`. |
 

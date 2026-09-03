@@ -49,7 +49,7 @@ The first command checks non-interactive SSH (see also [All remote hosts](#all-r
 - Docker CLI and daemon available to the SSH user (typically via the `docker` group)
 - Ability to run short-lived **`docker run --privileged`** containers (required for DinD)
 
-gh sr builds the `gh-sr/agentic-runner` image locally during setup. dnsmasq, AWF, gh-aw tooling, and `host.docker.internal` DNS live **inside** the image — not on the host.
+gh sr builds the `gh-sr/agentic-runner` image locally during setup from a fork runner base. Docker CE, Node.js LTS, zstd, and the per-job reset hooks live **inside** the image — not on the host; gh-aw and AWF are not preinstalled (jobs install their own tooling), and `host.docker.internal` needs no baking (inner job containers pass `--add-host=host.docker.internal:host-gateway`).
 
 
 **Verify from inside a running runner container:**
@@ -58,11 +58,11 @@ gh sr builds the `gh-sr/agentic-runner` image locally during setup. dnsmasq, AWF
 docker exec gh-sr-<instance> docker info
 ```
 
-`gh sr doctor` validates container-mode runners on **Linux** hosts: outer Docker, `--privileged` support, each `gh-sr-<instance>` container, inner `dockerd`, registration, and (for `profile: agentic`) inner AWF/DNS/hygiene checks. On **non-Linux** hosts with container-mode runners configured, doctor reports a FAIL because container mode is unsupported there.
+`gh sr doctor` validates container-mode runners on **Linux** hosts: outer Docker, `--privileged` support, each `gh-sr-<instance>` container, inner `dockerd`, registration, and (for `profile: agentic`) the rootless-sandbox checks — node/npm and zstd on PATH, docker-socket access for the runner user, the inner `host.docker.internal` alias, local-cache env wiring, MTU pinning, and inner-Docker hygiene. On **non-Linux** hosts with container-mode runners configured, doctor reports a FAIL because container mode is unsupported there.
 
 ## GitHub Agentic Workflows (gh-aw)
 
-> **For a complete guide** to agentic workflows on self-hosted runners -- architecture, DNS setup, troubleshooting, and what `profile: agentic` automates -- see [Agentic Workflows]({{< ref "agentic-workflows" >}}).
+> **For a complete guide** to agentic workflows on self-hosted runners -- architecture, configuration, troubleshooting, and what `profile: agentic` automates -- see [Agentic Workflows]({{< ref "agentic-workflows" >}}).
 
 The easiest way to set up a runner for [GitHub Agentic Workflows](https://github.github.com/gh-aw/guides/self-hosted-runners/) is `profile: agentic`:
 
@@ -105,14 +105,16 @@ runners:
 
 ### How it works
 
-Because agentic runners are container-isolated, the host needs only Docker with privileged-container support. Everything else is inside the image:
+Because agentic runners are container-isolated, the host needs only Docker with privileged-container support. Everything else is inside the image, which derives from a fork actions-runner base image:
 
-- **`host.docker.internal` DNS** — baked into the image (the inner default bridge gateway is pinned to `10.200.0.1` and inner container DNS points at a bundled dnsmasq). No host `/etc/hosts`, dnsmasq, or `daemon.json` changes are required. **Do NOT** map `host.docker.internal` to `127.0.0.1` anywhere.
-- **`sudo` / iptables for AWF** — the runner user inside the container already has passwordless sudo; no host sudoers setup is needed for agentic.
+- **`host.docker.internal` DNS** — gh-aw v0.88+ job containers are started with `--add-host=host.docker.internal:host-gateway`, so the alias resolves via the inner Docker bridge automatically. No host `/etc/hosts`, dnsmasq, or `daemon.json` changes are required. **Do NOT** map `host.docker.internal` to `127.0.0.1` anywhere.
+- **No `sudo` / iptables** — the gh-aw sandbox runs **rootless** (default `docker` runtime profile): the AFW firewall, Squid proxy, and MCP gateway run as unprivileged containers on the inner bridge topology. The image removes all passwordless-sudo grants.
+- **Docker socket access** — the `runner` user is in the base image's `docker` group so the `awmg-mcpg` gateway can mount and use `/var/run/docker.sock`.
 - **Tool cache (`/home/runner/.toolcache`)** — provided inside the image where gh-aw's agent containers expect it. Lives outside `/opt/*` so gh-aw's compiled AWF invocation actually bind-mounts it into the agent container (gh-aw deliberately skips any `RUNNER_TOOL_CACHE` whose path matches `/opt/*` to avoid leaking `/opt/gh-aw` and similar control-plane paths). A compatibility symlink at `/opt/hostedtoolcache → /home/runner/.toolcache` is also baked into the image so legacy actions that hardcode the legacy path (notably `ruby/setup-ruby@v1`, which ignores `$RUNNER_TOOL_CACHE` when it doesn't detect a self-hosted runner) still find a writable tool cache and do not regress to `EACCES`.
 - **`RUNNER_TEMP`** — set to a non-`/tmp` path inside the container so it never collides with `/tmp/gh-aw`.
+- **Local Actions cache** — a per-host `gh-sr-cache` container is deployed automatically (`cache.enabled`, default on) and `CUSTOM_ACTIONS_RESULTS_URL` is wired into the runner. See [Local Actions cache](guides/local-cache.md).
 
-`gh sr doctor` validates the host Docker daemon, `--privileged` support, and — for each instance — the container, inner `dockerd`, registration, inner `host.docker.internal` resolution, the AWF service-routing bypass, and AWF/Docker hygiene.
+`gh sr doctor` validates the host Docker daemon, `--privileged` support, and — for each instance — the container, inner `dockerd`, registration, inner `host-gateway` alias resolution, node/zstd/docker-socket access, rootless hygiene (orphan `awmg-mcpg`/`awf` containers and networks), the local cache server, and (with `--check-lockfiles`) stale compiled workflows.
 
 See the [Agentic Workflows guide]({{< ref "agentic-workflows" >}}) for the full architecture, the per-job reset model, and troubleshooting.
 

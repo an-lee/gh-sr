@@ -7,46 +7,56 @@ weight: 20
 
 [GitHub Agentic Workflows](https://github.github.com/gh-aw/) (`gh-aw`) are markdown workflow files compiled to GitHub Actions via `gh aw compile`. They run a live AI agent (Claude, Copilot, Codex, …) inside a sandboxed Docker stack that decides what tools to call and what steps to take.
 
+> **Breaking change (image layout v2):** gh-sr now runs the **gh-aw v0.88+ rootless sandbox** on a fork runner image. Workflows compiled with older gh-aw releases (sudo/iptables sandbox era, `compiler_version < 0.88`) are **not supported** — recompile with `gh extension upgrade gh-aw && gh aw compile` (or run `gh sr doctor --check-lockfiles` to have doctor flag stale lock files).
+
 ## 1. Why agentic runners use container mode
 
 gh-aw was designed for **GitHub-hosted runners**, where every job gets a fresh, single-tenant VM. Each compiled workflow hardcodes machine-global resources:
 
 - the runtime tree **`/tmp/gh-aw`** (~80 references per workflow, including a `-v /tmp/gh-aw:/tmp/gh-aw:rw` mount and a `rm -rf /tmp/gh-aw` during setup),
-- **fixed host-network ports** for the MCP gateway and helper servers,
-- **fixed Docker/AWF names** (`gh-aw-mcpg`, `awf-net`, `awf-squid`, …) and the `DOCKER-USER` iptables chain,
+- **fixed container names** for the MCP gateway and sandbox (`awmg-mcpg`, `awf-*`) and the shared `awf-net` bridge,
 - shared `$HOME` engine state (`~/.copilot`, `~/.claude`) and the Docker socket.
 
-If several agentic jobs share one host, these collide. To make concurrent agentic runners stable on a single machine, **`gh sr` runs every `profile: agentic` runner in container mode**: each runner instance is a privileged Docker-in-Docker (DinD) container with its **own** inner `dockerd`, network namespace, MCP gateway port, `iptables`, and `/tmp/gh-aw`.
+If several agentic jobs share one host, these collide. To make concurrent agentic runners stable on a single machine, **`gh sr` runs every `profile: agentic` runner in container mode**: each runner instance is a privileged Docker-in-Docker (DinD) container with its **own** inner `dockerd`, network namespace, `/tmp/gh-aw`, and `$HOME` — so the fixed names and ports never leave each container.
 
-> **`profile: agentic` always implies `runner_mode: container`.** `gh sr` rejects `profile: agentic` with `runner_mode: native`, because native mode cannot isolate the resources above. (The old per-instance `agentic_mcp_ports` / `gh-sr-mcp-<port>` label scheme and the host-level dnsmasq/sudoers/`/opt/hostedtoolcache` setup are gone — they are unnecessary in container mode.)
+> **`profile: agentic` always implies `runner_mode: container`.** `gh sr` rejects `profile: agentic` with `runner_mode: native`, because native mode cannot isolate the resources above.
+
+### Rootless sandbox, GitHub-hosted equivalence
+
+gh-aw v0.88+ runs its firewall **rootless** (default `docker` runtime profile): the AWF agent, Squid proxy, and api-proxy run as unprivileged containers on the **inner bridge topology** (`awf-net` + Squid), with no `sudo`, no `iptables` manipulation, and no `NET_ADMIN`. gh-aw job containers reach the MCP gateway and workflow `services:` through the bridge and the standard `--add-host=host.docker.internal:host-gateway` mapping — exactly the environment of a GitHub-hosted VM, where the runner filesystem **is** the Docker daemon's filesystem.
+
+That is the property the DinD container provides: the actions runner and the inner `dockerd` share one filesystem and one network namespace, so gh-aw's compiled steps (gateway on `--network bridge` with `127.0.0.1` port mapping, socket mount, `host-gateway` alias) behave identically to GitHub-hosted.
 
 ### Pristine per job
 
 Each long-lived runner container makes the inner environment **pristine before and after every job** via the official Actions runner hooks (`ACTIONS_RUNNER_HOOK_JOB_STARTED` / `ACTIONS_RUNNER_HOOK_JOB_COMPLETED`):
 
-- **before a job** — remove any leftover inner containers, prune networks, flush AWF `iptables`, delete `/tmp/gh-aw`, and (re)assert the AWF service-routing bypass; verify the inner `dockerd` is healthy;
-- **after a job** — tear down the gh-aw / AWF containers it created, prune networks, flush AWF rules, and delete `/tmp/gh-aw`.
+- **before a job** — remove any leftover `awmg-mcpg` / `awf-` / `gh-aw` containers, prune `awf-net` networks, delete `/tmp/gh-aw`, and verify the inner `dockerd` is healthy;
+- **after a job** — tear down the gh-aw containers the job created, prune networks, and delete `/tmp/gh-aw`.
 
-The inner Docker **image-layer cache** (`/runner-state/docker-data`) is the only state preserved across jobs, so resets never re-pull gh-aw's images. This eliminates the entire class of "leftover from a previous/crashed job" failures (stale MCP gateway on the gateway port, orphan AWF containers, stale iptables) without any timing-based cleanup.
+The inner Docker **image-layer cache** (`/runner-state/docker-data`) is the only state preserved across jobs (images and volumes are never deleted by the hooks), so resets never re-pull gh-aw's images. This eliminates the entire class of "leftover from a previous/crashed job" failures (stale gateway, orphan sandbox containers) without any timing-based cleanup.
 
 ```mermaid
 flowchart TD
   subgraph host [One Linux host]
+    cache["gh-sr-cache (local Actions cache server)"]
     subgraph slotA ["gh-sr-myrepo-1 (privileged DinD)"]
       hookA1["JOB_STARTED: reset to clean"]
-      jobA["agentic job: gh-aw + AWF + MCP gateway"]
+      jobA["agentic job: rootless AWF + awmg-mcpg"]
       hookA2["JOB_COMPLETED: tear down"]
       hookA1 --> jobA --> hookA2 --> hookA1
     end
     subgraph slotB ["gh-sr-myrepo-2 (privileged DinD)"]
       jobB["agentic job"]
     end
+    cache -.-> slotA
+    cache -.-> slotB
   end
 ```
 
 ## 2. Host requirements
 
-The host runs only the **outer** runner containers, so its requirements are minimal. Everything gh-aw needs (gh-aw CLI, AWF, Node/Python tooling, Docker CE, dnsmasq, browser packages, DNS config, sudoers) lives **inside the image** that `gh sr` builds.
+The host runs only the **outer** runner containers, so its requirements are minimal. Everything gh-aw needs (gh-aw CLI, AWF, Node tooling, Docker CE, zstd, browser packages) lives **inside the image** that `gh sr` builds.
 
 | Requirement      | Details                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------ |
@@ -64,7 +74,7 @@ sudo usermod -aG docker "$USER"   # log out/in (or: newgrp docker)
 docker run --rm --privileged alpine echo privileged-ok   # must print privileged-ok
 ```
 
-That is all the host setup `gh sr` cannot do for you. There is **no** host dnsmasq, `/etc/hosts`, sudoers-for-iptables, `RUNNER_TEMP`, or tool-cache configuration to perform — those concerns are handled inside the image.
+That is all the host setup `gh sr` cannot do for you. There is **no** host dnsmasq, `/etc/hosts`, sudoers, or tool-cache configuration to perform — those concerns are handled inside the image.
 
 ## 3. Configuration
 
@@ -85,7 +95,9 @@ runners:
 - Optional extra image packages: set a global `container_runner_image.extra_apt_packages` list (Debian package names) in `runners.yml`; the image tag gains a suffix so Docker rebuilds.
 - Reduced-MTU networks (cloud overlay / VPN / nested virt) are handled automatically — `gh sr` detects the host egress MTU and pins the container's inner/outer Docker MTU to it. Override with `container_runner_image.mtu` only when the host NIC hides a smaller path MTU (see §4).
 
-Workflow frontmatter only needs standard self-hosted targeting:
+### Pointing workflows at the runner
+
+Workflows must be compiled with **gh-aw >= v0.88**. Frontmatter only needs standard self-hosted targeting:
 
 ```yaml
 ---
@@ -96,39 +108,47 @@ safe-outputs:
 ---
 ```
 
+For gh-aw's lightweight agents (`runs-on-slim` / `safe-outputs.runs-on`), point them at the same runner pool — e.g. `runs-on-slim: self-hosted` — so auxiliary jobs also land on gh-sr runners instead of consuming hosted minutes.
+
+After editing frontmatter, recompile and commit the updated `*.lock.yml` files:
+
+```bash
+gh extension upgrade gh-aw
+gh aw compile
+gh sr doctor --check-lockfiles   # optional gate: fails on stale-era lock files
+```
+
 ## 4. What the runner image provides
 
-`gh sr setup` builds `gh-sr/agentic-runner:<runner-version>` locally (Ubuntu 24.04). It bundles:
+`gh sr setup` builds `gh-sr/agentic-runner:<runner-version>` locally. The image **derives from the [falcondev-oss actions-runner fork](https://github.com/falcondev-oss/actions-runner)** (an official actions-runner build patched so `CUSTOM_ACTIONS_RESULTS_URL` redirects cache traffic; override with `container_runner_image.base_image`). On top of that base, the image adds:
 
-- **Docker CE** (the inner `dockerd` for DinD) with a **baked daemon config** that pins the inner default bridge gateway to `10.200.0.1` and points container DNS at a bundled **dnsmasq**, so `host.docker.internal` resolves deterministically for inner containers. The inner `dockerd` starts exactly once — there is no runtime DNS rewrite or daemon restart. (`10.200.0.1` is deliberately outside the host's default Docker bridge subnet `172.17.0.0/16` so the inner bridge cannot collide with the outer runner container's own network.)
+- **Docker CE** (the inner `dockerd` for DinD) — the daemon starts exactly once at container boot, with no baked daemon.json beyond an MTU pin when the host needs one. The runner user (uid 1001) is in the base image's `docker` group, so gh-aw's MCP gateway can mount and use `/var/run/docker.sock` without sudo.
+- **Node.js LTS** (accelerates first jobs; the compiler still emits its own `setup-node`), **zstd** (actions/cache archives), **gh**, and the `extra_apt_packages` you configure.
+- **Tool cache relocation**: `RUNNER_TOOL_CACHE=/home/runner/.toolcache` (an officially supported non-`/opt` path) with an `/opt/hostedtoolcache` symlink, so legacy setup actions keep working while gh-aw's `buildToolCacheMountSettings` mounts the real path read-only into agent sandboxes.
+- **Per-job reset hooks** at `/opt/gh-sr/hooks/job-started.sh` and `/opt/gh-sr/hooks/job-completed.sh`, wired via the runner `.env`.
+- **Cache wiring**: when the per-host cache server is enabled (default), `CUSTOM_ACTIONS_RESULTS_URL` is injected so `actions/cache` hits the local server (see [Local Actions cache](local-cache.md)).
+- **MTU pinning** for hosts whose egress path MTU is below 1500 (cloud overlays like GCP's 1460, VPN/WireGuard, nested virtualisation). At `docker create` time `gh sr` detects the host's primary egress-interface MTU and injects it as `GH_SR_HOST_MTU`; `entrypoint.sh` writes a minimal `daemon.json` (`mtu` only) and pins the outer container's `eth0` — both strictly before the single `dockerd` start. This makes TCP advertise a matching MSS in both directions so large packets fit.
 
-  > **Why not the default `172.17.0.0/16`?** The outer runner container itself normally sits on the host's **default Docker bridge** `172.17.0.0/16` (gateway `172.17.0.1`). If the inner bridge were pinned to a `172.17.x` address it would duplicate the container's own default-gateway IP and capture that route, **black-holing all outbound traffic into the inner bridge** — the host network stays fine, but every connection made *inside* the runner (agent → model provider, `git`, package installs) crawls or times out. `10.200.0.0/24` avoids this because it lies outside Docker's default address pools (`172.16.0.0/12` and `192.168.0.0/16`).
-  >
-  > As **defence in depth**, `entrypoint.sh` validates the baked gateway against the runner container's *actual* interfaces just before the single `dockerd` start. If a custom host happens to attach the runner container to a subnet that overlaps `10.200.0.0/24`, the entrypoint automatically falls back to the next free candidate (`10.201.0.1`, `10.210.0.1`, …) and rewrites `daemon.json` + the dnsmasq config **once, before** `dockerd` starts (still a single start, no restart). A `WARNING: baked inner-bridge gateway … overlaps an existing interface` line in `docker logs <runner-container>` indicates the fallback was used.
-  >
-  > **Agent-sandbox DNS (why the runner's own `/etc/resolv.conf` is repointed).** After dnsmasq is up, `entrypoint.sh` rewrites the runner container's `/etc/resolv.conf` to a single `nameserver` = the inner-bridge gateway. This matters beyond the runner itself: AWF **auto-detects the agent sandbox's DNS servers by parsing this `/etc/resolv.conf`**. Pinning it to dnsmasq — which answers `host.docker.internal` authoritatively with the gateway IP that AWF's sandbox firewall *exempts* from its transparent Squid redirect — makes the agent reach the MCP gateway directly and deterministically. Without the pin the sandbox inherits the **outer host** resolver and intermittently maps `host.docker.internal` to a non-exempt IP, so the MCP gateway POST is force-proxied into Squid (which rejects the origin-form request with `ERR_INVALID_URL` → HTTP 400) and the agent reports `MCP server(s) failed to launch`. dnsmasq still forwards every other name to the runner container's **original** upstream resolvers (so enterprise/VPC DNS keeps working); `no-resolv` prevents dnsmasq from looping back through the repointed `resolv.conf`.
-- **Reduced-MTU pinning** for hosts whose egress path MTU is below Docker's 1500 default (cloud overlay networks — GCP defaults to **1460** — VPN/WireGuard, nested virtualisation). At `docker create` time `gh sr` detects the host's primary egress-interface MTU and injects it as `GH_SR_HOST_MTU`; `entrypoint.sh` then pins both the **inner `dockerd` bridge** (`daemon.json` `mtu`) and the **outer container's `eth0`** to it (plus a `mangle` MSS clamp for forwarded inner traffic), strictly before the single `dockerd` start. This makes TCP advertise a matching MSS in both directions so large packets fit.
+  > **Why this is needed.** When the real host path MTU is smaller and PMTUD is black-holed, small packets pass so connections *open*, but large packets are silently dropped. TLS handshakes then stall and the socket is torn down mid-handshake, surfacing as `Client network socket disconnected before secure TLS connection was established` — exactly how `actions/setup-go` fails on such hosts while the host itself downloads fine. If the host NIC reports 1500 but a deeper tunnel lowers the real path MTU, force it with `container_runner_image.mtu` in `runners.yml` and `gh sr rebuild`.
 
-  > **Why this is needed.** The outer runner container sits on the host's default Docker bridge (MTU 1500) and the inner bridge also defaults to 1500. When the real host path MTU is smaller and PMTUD is black-holed (ICMP "fragmentation needed" filtered — very common), small packets pass (DNS, TCP `SYN`/`ACK`) so connections *open*, but large packets are silently dropped. TLS handshakes (the `ServerHello` + certificate chain span several full-size segments) then stall and the socket is torn down mid-handshake, surfacing as `Client network socket disconnected before secure TLS connection was established` — exactly how `actions/setup-go` fails on such hosts while the host itself downloads fine (its real NIC never emits oversized frames). Auto-detection covers the common case where the host **NIC** MTU is already below 1500; if the host NIC reports 1500 but a deeper tunnel lowers the real path MTU, force it with `container_runner_image.mtu` in `runners.yml` and `gh sr rebuild`.
-- The **actions runner**, **gh-aw CLI**, and **AWF** (`github/gh-aw-firewall`), plus `gh`, **Node.js LTS** (NodeSource), Python (`uv`), Chromium/`chromium-chromedriver`, and common build/system libraries.
-- The **per-job reset hooks** at `/opt/gh-sr/hooks/job-started.sh` and `/opt/gh-sr/hooks/job-completed.sh`.
-- A minimal **Docker CLI shim** at `/opt/gh-sr/docker-shim/docker`. When gh-aw launches the MCP gateway (`docker run … ghcr.io/github/gh-aw-mcpg:*`) it injects two deterministic flags, then `exec`s the real `docker`: `--hostname gh-aw-mcpg` (so the gateway's self-inspect does not fail under `--network host` in DinD) and, for `docker run`, a `--name gh-aw-mcpg-ghsr-*` (so a leftover gateway is always reapable by the per-job reset hooks and `gh sr doctor`). It does not supervise the gateway or rewrite MCP config URLs — baked DNS and the job hooks make those unnecessary.
+**What is deliberately gone** (the retired sudo/iptables image): the docker CLI shim, baked `daemon.json` gateway pinning + bundled dnsmasq + `/etc/resolv.conf` rewrite, the `iptables` NAT bypass for workflow `services:`, passwordless `sudo` for the runner user, pre-installed gh-aw CLI / AWF binaries (jobs install what they need), and a `RUNNER_VERSION` build-arg.
 
 ## 5. Operations
 
 ```bash
-gh sr setup                 # build the image (first run) and create runner containers
+gh sr setup                 # build the image (first run), deploy the cache server, create runner containers
 gh sr up                    # start runners; waits for each to be ready (inner dockerd up, registered)
 gh sr status                # show local + GitHub status, image, and BUILD freshness
 gh sr logs my-agentic       # recent logs for an instance
 gh sr down                  # stop the runner containers
-gh sr rebuild my-agentic    # rebuild the image after a gh-sr upgrade and restart containers
+gh sr rebuild my-agentic    # rebuild the image after a gh-sr or base_image change, restart containers
 gh sr remove my-agentic     # deregister from GitHub and remove container + state
+gh sr cache status          # local cache server health and storage usage
 ```
 
 Each instance runs as a Docker container named `gh-sr-<instance>` with `--restart unless-stopped` so any non-explicit exit (crash, OOM, inner runner process shutdown, Docker daemon restart, host reboot) brings the container back automatically, while `docker stop` / `gh sr down` keep it down. The entrypoint caps persistent inner-`dockerd` bootstrap failures with a `bootstrap-failed` marker so a host that cannot start inner `dockerd` does not restart forever. `gh sr up` clears bootstrap failure markers and staggers multi-instance starts to reduce lockstep load spikes. `gh sr up` health-gates startup: it reports a runner as ready only once the container is running, the inner `dockerd` responds, and the actions runner is registered (a slow first boot is a warning, not a failure). `gh sr status` shows `restarting` or `failed` when bootstrap is stuck.
 
-The **BUILD** column in `gh sr status` compares the image's baked layout revision with the one your current `gh sr` expects: `ok` means current, `stale` means run `gh sr rebuild`, `?` means the image predates revision labels.
+The **BUILD** column in `gh sr status` compares the image's baked layout revision with the one your current `gh sr` expects: `ok` means current, `stale` means run `gh sr rebuild`, `?` means the image predates revision labels. Changing `container_runner_image.base_image`, the pinned fork tag, or the embedded image sources changes the fingerprint — `gh sr rebuild` is what picks it up.
 
 ## 6. Health checks (`gh sr doctor`)
 
@@ -136,10 +156,20 @@ For each Linux host with container-mode runners, `gh sr doctor` checks:
 
 - host Docker CLI/daemon and that a short `--privileged` test container runs (required for DinD);
 - for each instance: the `gh-sr-<instance>` container exists and is **running**, the **inner `dockerd`** responds, and `.runner` is present (registered);
-- for agentic instances: **Node.js LTS** and `npm` are on PATH inside the container (required by gh-aw activation setup — flagged as `container-node-npm` on stale images), `awf` is available via `sudo` inside the container, `host.docker.internal` resolves to a non-loopback address from inner containers, the runner's `/etc/resolv.conf` is pinned to the bundled dnsmasq (so the agent sandbox inherits an AWF-exempt resolver — flagged as `container-inner-resolv` otherwise), the AWF service-routing bypass is installed, no Docker interface MTU exceeds the host egress MTU (flagged as `container-mtu` on a stale, pre-MTU-pinning image when the host path MTU is below 1500), and there are no orphan `gh-aw`/`awf-`/`gh-aw-mcpg-*` containers or stale `DOCKER-USER` rules in the inner Docker.
+- for agentic instances (fan-out in a single `docker exec` round-trip):
+  - `container-inner-host-docker-internal` — an inner container started with `--add-host=host.docker.internal:host-gateway` resolves the alias to a non-loopback address (how gh-aw job containers reach gateway/services endpoints);
+  - `container-node-npm` / `container-zstd` — Node.js LTS, npm, and zstd are on PATH inside the container;
+  - `container-docker-socket-user` — the `runner` user can talk to the inner Docker socket (needed by the `awmg-mcpg` gateway);
+  - `container-cache-env` (only when the cache is enabled) — `CUSTOM_ACTIONS_RESULTS_URL` is present in the runner `.env`;
+  - `container-mtu` (only when the host egress MTU is below 1500) — no Docker interface MTU exceeds the host egress MTU;
+  - hygiene: no orphan `awmg-mcpg`/`awf-`/`gh-aw` containers or `awf-net` networks in the inner Docker;
+- the **local cache server** (when enabled): deployed, healthy, and not bound to `0.0.0.0` (LAN exposure warning).
+
+With `--check-lockfiles`, doctor additionally scans each scoped repo's compiled `*.lock.yml` files (up to 20 per repo, via the GitHub API) for retired sudo/iptables-era markers (`FAIL`: must recompile) and old `compiler_version` (`WARN`).
 
 ```bash
 gh sr doctor --host my-linux-host
+gh sr doctor --check-lockfiles
 ```
 
 ## 7. State layout
@@ -165,7 +195,7 @@ gh sr disk prune --yes              # idle runners only; keeps inner Docker cach
 gh sr disk prune --yes --prune-cache # also reclaim docker-data when disk is critical
 ```
 
-See [Commands — Disk usage and cleanup](../commands.md#disk-usage-and-cleanup) for scheduling and orphan cleanup.
+`gh sr disk usage` also reports the per-host cache storage directory (`gh-sr-cache`). See [Commands — Disk usage and cleanup](../commands.md#disk-usage-and-cleanup) for scheduling and orphan cleanup.
 
 ## 8. Troubleshooting
 
@@ -176,11 +206,13 @@ See [Commands — Disk usage and cleanup](../commands.md#disk-usage-and-cleanup)
 | Validation error: `agentic_mcp_ports / agentic_mcp_port_base have been removed` | old per-instance MCP port config | Delete those fields; container mode isolates the port per runner. |
 | `docker --privileged` fails on the host | privileged containers blocked (userns-remap, security policy) | Allow privileged containers, or use a Sysbox runtime (see below). |
 | Inner `dockerd` not responding / runner not registered | slow first boot or a broken container | `gh sr logs <name>`, then `gh sr doctor`; `gh sr rebuild <name>` if persistent. |
-| AWF agent → workflow `services:` (postgres/redis) `Connection refused` | AWF service-routing bypass missing in the container | `gh sr rebuild <name>` (the hooks/entrypoint install it), or apply live: `docker exec gh-sr-<instance> iptables -t nat -I PREROUTING -s 172.30.0.0/24 -m addrtype --dst-type LOCAL -j RETURN`. |
-| `mcp_servers` failed inside AWF | inner DNS or a stale environment | Confirm `host.docker.internal` resolves inside the container (`docker exec gh-sr-<instance> docker run --rm alpine getent hosts host.docker.internal`); recompile workflows with a current `gh aw`. |
-| `MCP server(s) failed to launch` **intermittently** (succeeds on a later run); agent log shows a Squid `ERR_INVALID_URL` page for `host.docker.internal` | runner `/etc/resolv.conf` not pinned to dnsmasq (stale pre-fix image), so the agent sandbox resolved `host.docker.internal` via the outer host to a non-exempt IP and got force-proxied into Squid | `gh sr rebuild <name>`, then verify `docker exec gh-sr-<instance> cat /etc/resolv.conf` shows a single `nameserver` equal to the inner `docker0` gateway (e.g. `10.200.0.1`). `gh sr doctor` reports this as `container-inner-resolv`. |
-| `actions/setup-go` / `setup-node` (or any download) fails with `Client network socket disconnected before secure TLS connection was established`, retries, then errors — but the **host** downloads the same URL fine | container MTU (1500) exceeds the host's real egress path MTU (cloud overlay/VPN/nested virt) with PMTUD black-holed, so large TLS handshake packets are dropped | `gh sr rebuild <name>` to pick up MTU pinning (auto-detects the host egress MTU). If the host NIC reports 1500 but a tunnel lowers the real path MTU, set `container_runner_image.mtu: <value>` in `runners.yml` and rebuild. `gh sr doctor` reports a mismatch as `container-mtu`; verify with `docker exec gh-sr-<instance> cat /sys/class/net/eth0/mtu`. |
-| Agentic workflow fails at `activation` with `npm is not available. Cannot install @actions/artifact package.` | gh-aw v0.79+ enables `safe-output-artifact-client` during activation setup, which runs before `actions/setup-node` | `gh sr rebuild <name>` so the image includes Node.js LTS/npm. `gh sr doctor` reports this as `container-node-npm`. Verify with `docker exec gh-sr-<instance> sh -lc 'node --version && npm --version'`. |
+| `mcp_servers` failed to launch / gateway unreachable | inner `host.docker.internal` mapping broken or stale container | `gh sr rebuild <name>`; verify `gh sr doctor` reports `container-inner-host-docker-internal` as OK (`docker exec gh-sr-<instance> docker run --rm --add-host=host.docker.internal:host-gateway alpine getent hosts host.docker.internal`). |
+| `awmg-mcpg` gateway cannot access the Docker socket | socket permissions for the `runner` user | `gh sr rebuild <name>` (fork base image puts `runner` in the docker group). `gh sr doctor` reports this as `container-docker-socket-user`. |
+| `actions/cache` misses never hit the local server | cache URL not wired into the runner `.env`, or cache server not deployed | `gh sr cache deploy && gh sr up <name>`; `gh sr doctor` reports this as `container-cache-env`. See [Local Actions cache](local-cache.md). |
+| `actions/setup-go` / `setup-node` (or any download) fails with `Client network socket disconnected before secure TLS connection was established`, retries, then errors — but the **host** downloads the same URL fine | container MTU (1500) exceeds the host's real egress path MTU (cloud overlay/VPN/nested virt) with PMTUD black-holed | `gh sr rebuild <name>` to pick up MTU pinning (auto-detects the host egress MTU). If the host NIC reports 1500 but a tunnel lowers the real path MTU, set `container_runner_image.mtu: <value>` in `runners.yml` and rebuild. `gh sr doctor` reports a mismatch as `container-mtu`. |
+| Agentic workflow fails at `activation` with `npm is not available. Cannot install @actions/artifact package.` | gh-aw activation setup runs before `actions/setup-node` | `gh sr rebuild <name>` so the image includes Node.js LTS/npm. `gh sr doctor` reports this as `container-node-npm`. |
+| Job artifacts (tools, caches) missing for legacy actions that hardcode `/opt/hostedtoolcache` | tool cache moved off `/opt` (rootless mount-safe path) | Expected: the image ships an `/opt/hostedtoolcache` symlink to `/home/runner/.toolcache`; rebuild if your image predates layout v2. |
+| Agent job fails with sandbox/iptables-era errors, or `gh sr doctor --check-lockfiles` reports FAIL on a `*.lock.yml` | workflow compiled with pre-0.88 gh-aw | `gh extension upgrade gh-aw && gh aw compile`, commit the updated lock files. |
 
 Inspect a running runner:
 
@@ -195,11 +227,13 @@ tail -f /runner-state/dockerd.log
 
 Container-mode runners use `--privileged` because the inner `dockerd` needs full Linux capabilities. This suits trusted infrastructure. For privilege-free DinD, install [Sysbox](https://github.com/nestybox/sysbox) and run the runner container with `--runtime sysbox-runc` instead of `--privileged` (not auto-configured by `gh sr`).
 
-## 9. Migrating from native agentic / port labels
+## 9. Migrating from the retired sudo/iptables image (layout v1)
 
-If you previously ran `profile: agentic` in native mode (with `agentic_mcp_ports` / `agentic_mcp_port_base` and `gh-sr-mcp-<port>` labels and `sandbox.mcp.port` in workflow frontmatter):
+If your host still runs the pre-v2 image (baked dnsmasq, docker shim, AWF-via-sudo):
 
-1. In `runners.yml`, delete `runner_mode: native`, `agentic_mcp_ports`, and `agentic_mcp_port_base` from agentic runners. Keep `profile: agentic` and set `count` to the concurrency you want.
-2. Remove the `gh-sr-mcp-<port>` entries from your workflows' `runs-on` and any custom `sandbox.mcp.port`; recompile with `gh aw compile`.
-3. Run `gh sr setup` (builds the image), then `gh sr up`.
-4. Optional: drop the host-level dnsmasq/sudoers/`/opt/hostedtoolcache` tweaks the old native path created — they are no longer used.
+1. Upgrade gh-aw and recompile every workflow: `gh extension upgrade gh-aw && gh aw compile` (compiler_version must be >= 0.88). Commit the new `*.lock.yml` files.
+2. `gh sr rebuild <name>` — the layout-v2 fingerprint differs, so rebuild rebuilds the image on the fork base and recreates the containers. Existing registrations are preserved.
+3. Deploy the cache server (automatic with `gh sr setup`/`gh sr up` when `cache.enabled`, default on): `gh sr cache status` to verify.
+4. Verify: `gh sr doctor --strict`, then run one agentic workflow end to end.
+
+The historical native-agentic migration (per-instance `agentic_mcp_ports`, `gh-sr-mcp-<port>` labels) is long gone: `profile: agentic` + `runner_mode: native` is rejected, and those config fields are rejected with a migration message.

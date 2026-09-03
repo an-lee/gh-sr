@@ -93,9 +93,11 @@ runners:
     profile: agentic   # always runs in container (DinD) mode
 ```
 
-`profile: agentic` always runs in **container mode**: each runner instance is a privileged Docker-in-Docker container with its own inner `dockerd`, network namespace, MCP gateway port, and `/tmp/gh-aw`, and every job runs from a pristine inner state (via the runner's job hooks). This is what makes multiple concurrent agentic runners stable on one machine.
+`profile: agentic` always runs in **container mode**: each runner instance is a privileged Docker-in-Docker container with its own inner `dockerd`, network namespace, and `/tmp/gh-aw`, and every job runs from a pristine inner state (via the runner's job hooks). This is what makes multiple concurrent agentic runners stable on one machine.
 
-The **host only needs Docker** (with privileged-container support). Everything `gh-aw` needs — the `gh-aw` CLI, AWF, `host.docker.internal` DNS, the tool cache, language runtimes — lives inside the image `gh sr` builds during setup. There is no host dnsmasq, `/etc/hosts`, sudoers, or `RUNNER_TEMP` setup to do; `host.docker.internal` resolution is baked into the image (pinned bridge gateway `10.200.0.1` + bundled dnsmasq). `gh sr doctor` verifies the inner Docker, registration, DNS, and AWF hygiene.
+The image is built locally from a fork runner base (`container_runner_image.base_image`, default `ghcr.io/falcondev-oss/actions-runner:v2.337.0`) and adds Docker CE, Node.js LTS, zstd, and the per-job reset hooks. The gh-aw v0.88+ sandbox is **rootless** — no `sudo`, no iptables rules: the AWF firewall runs unprivileged on the inner Docker bridge, and inner containers resolve `host.docker.internal` via `--add-host=host.docker.internal:host-gateway`. Workflows must be compiled with **gh-aw >= v0.88** (`gh aw compile`); `gh sr doctor --check-lockfiles` flags retired sudo/iptables-era lockfiles.
+
+A **local Actions cache server** is deployed per host by default (`cache.enabled` is on), so `actions/cache` reads and writes the local host instead of round-tripping GitHub. `gh sr doctor` verifies the inner Docker, registration, rootless-sandbox hygiene, and cache wiring.
 
 For details, see the [Agentic Workflows guide](https://an-lee.github.io/gh-sr/guides/agentic-workflows/).
 

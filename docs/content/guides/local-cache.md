@@ -1,25 +1,66 @@
 # Local Actions Cache
 
-gh-sr 可以在每台 Linux 主机上部署一个本地 Actions cache 服务器,使 `actions/cache`、`actions/cache/restore|save` 以及 gh-aw 的 `cache-memory`、usage cache 等全部落在本机,不再在每次任务开始时从 GitHub 下载缓存。
+gh-sr can deploy a local GitHub Actions cache server on every Linux host, so `actions/cache`, `actions/cache/restore|save`, and gh-aw's `cache-memory` / usage caches all resolve against the local machine instead of downloading from GitHub at the start of every job.
 
-> 本页是骨架文档,随 Phase B(cache 集成)实施补全。
+The server is [falcondev-oss/github-actions-cache-server](https://github.com/falcondev-oss/github-actions-cache-server) — a drop-in replacement implementing the Actions cache **v2 protocol**, so official `actions/cache` steps work unmodified.
 
-## 方案
+## Topology
 
-采用 [falcondev-oss/github-actions-cache-server](https://github.com/falcondev-oss/github-actions-cache-server) —— Actions cache **v2 协议**的 drop-in 替代,官方 `actions/cache` 无需改动工作流。
+- **One `gh-sr-cache` container per Linux host**, shared by all container-mode runners on that host.
+- **Wiring**: the runner container receives `CUSTOM_ACTIONS_RESULTS_URL` pointing at the local server. The runner binary must come from the [falcondev fork image](https://github.com/falcondev-oss/actions-runner) — which is exactly the base gh-sr's runner image is built from — because the stock runner overrides the env var with the job message's `ACTIONS_RESULTS_URL` and silently falls back to GitHub.
+- **Artifacts are unaffected**: `upload-artifact` / `download-artifact` and other non-cache ACTIONS_RESULTS requests are proxied through the cache server back to GitHub (`DEFAULT_ACTIONS_RESULTS_URL`), so cross-host safe-outputs keep working.
+- **Binding**: the server publishes on the **docker0 gateway IP** (auto-detected, typically `172.17.0.1`) so only containers on the host can reach it — not your LAN. Without a docker0 interface it falls back to `0.0.0.0` and `gh sr doctor` warns about the exposure.
 
-- **拓扑**:每台 Linux 主机一个 `gh-sr-cache` 容器,该机上所有 container 模式 runner 共享。
-- **接线**:runner 容器注入 `CUSTOM_ACTIONS_RESULTS_URL`(指向本机 cache server)。runner 二进制必须来自 [falcondev fork 镜像](https://github.com/falcondev-oss/github-actions-runner)(gh-sr 的容器镜像已以其为 base),否则 runner 会用 job message 里的 `ACTIONS_RESULTS_URL` 覆盖环境变量,缓存静默回源 GitHub。
-- **artifacts 不受影响**:`upload-artifact`/`download-artifact` 等非 cache 请求由 cache server 透传回 GitHub(`DEFAULT_ACTIONS_RESULTS_URL`),跨主机 safe-outputs 仍然正常。
-- **安全**:cache server 绑定 docker0 网关 IP(仅本机容器可达),并校验 runner 的 OIDC token。
+## Configuration (runners.yml)
 
-## CLI(规划中)
+The whole `cache:` section is optional; a per-host server is deployed automatically (`enabled` defaults to `true`) whenever `gh sr setup` / `gh sr up` / `gh sr update` / `gh sr rebuild` run.
 
+```yaml
+cache:
+  enabled: true                    # default true; set false to keep using GitHub's cache service
+  port: 3000                       # host-side published port
+  bind_addr: 172.17.0.1            # empty = docker0 gateway IP (recommended); 0.0.0.0 = all interfaces
+  storage_path: ~/.gh-sr/cache     # host directory for cached data ($HOME expansion supported)
+  retention_days: 90               # 0 = server default (90)
+  max_size_bytes: 0                # 0 = unbounded
+  max_usage_percent: 90            # 0 = server default (90)
+  image: ghcr.io/falcondev-oss/github-actions-cache-server:latest   # pin a digest for reproducible deploys
+  management_api_key: env:CACHE_MGMT_KEY   # optional; empty = auto-generate and persist one
+  url_override: http://10.0.0.5:3000/      # escape hatch for exotic topologies; must include scheme
 ```
-gh sr cache status            # 各主机 cache 状态、存储占用
-gh sr cache deploy            # 显式部署/升级
-gh sr cache prune             # 触发管理 API 清理
-gh sr cache remove [--purge-data]   # 卸载(--purge-data 才删数据)
+
+Notes:
+
+- `management_api_key` supports `env:VAR` references resolved from the environment at CLI startup. When empty, gh-sr generates a random key on first deploy and persists it (mode `0600`) under the storage directory.
+- Native-mode runners are out of scope: they keep GitHub's cache service (the injection is a container-env mechanism).
+
+## CLI
+
+```bash
+gh sr cache status             # per-host: running/healthy, URL, bind, storage usage
+gh sr cache deploy             # explicit deploy / upgrade (idempotent)
+gh sr cache prune              # trigger the management-API cleanup endpoint (best-effort)
+gh sr cache remove             # stop and remove the cache container (runners keep running)
+gh sr cache remove --purge-data  # also delete the storage directory
 ```
 
-`cache.enabled` 默认开启;`gh sr setup`/`gh sr up` 会自动确保 cache server 存在。
+`gh sr cache remove` is the only uninstall path — removing a runner never removes the cache.
+
+## Health checks
+
+`gh sr doctor` (on hosts with container-mode runners) verifies the cache when enabled:
+
+- **FAIL** — the container exists but `/health` is not healthy: check `docker logs gh-sr-cache`;
+- **WARN** — enabled but not deployed: run `gh sr cache deploy`;
+- **WARN** — bound to `0.0.0.0`: the cache API answers on every host interface; set `cache.bind_addr` (e.g. the docker0 gateway IP);
+- OK — healthy at the resolved URL, with the storage path reported.
+
+`gh sr doctor` also reports `container-cache-env` on agentic instances whose runner `.env` is missing `CUSTOM_ACTIONS_RESULTS_URL` (fix with `gh sr up <name>` after deploying the cache).
+
+`gh sr disk usage` includes the per-host cache storage directory as a `gh-sr-cache` row.
+
+## How a restore hits the server
+
+1. Runner starts; the entrypoint writes `CUSTOM_ACTIONS_RESULTS_URL=http://<gateway>:3000/` into the runner `.env` (only when the cache is enabled and a URL resolves).
+2. The fork runner propagates it to `actions/cache` (node) and cache hook steps.
+3. Restore/save requests go to the local server; everything else flows through to GitHub unchanged.
