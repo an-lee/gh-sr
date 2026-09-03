@@ -513,9 +513,12 @@ func TestCacheURLEnvFor(t *testing.T) {
 		t.Fatalf("nil settings: got %q", got)
 	}
 
-	// No host calls needed: the runner URL is the cache container's fixed
-	// address on the dedicated gh-sr network, not a host-resolved address.
-	mock := &testutil.MockExecutor{}
+	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
+		if strings.Contains(cmd, "ip -4 -o addr show docker0") {
+			return "2: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\\n", nil
+		}
+		return "", nil
+	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
 	h.SetConn(mock)
 
@@ -523,25 +526,8 @@ func TestCacheURLEnvFor(t *testing.T) {
 		t.Fatalf("disabled settings: got %q", got)
 	}
 	got := cacheURLEnvFor(h, &cache.Settings{Enabled: true})
-	want := cacheURLDockerCreateArg(fmt.Sprintf("http://%s:%d/", cache.ContainerIP, cache.ContainerPort))
-	if got != want {
-		t.Fatalf("enabled settings: got %q, want %q", got, want)
-	}
-	if len(mock.Calls) != 0 {
-		t.Fatalf("runner URL must not require host probes, calls: %v", mock.Calls)
-	}
-}
-
-func TestRunnerNetworkDockerCreateArg(t *testing.T) {
-	t.Parallel()
-	if got := runnerNetworkDockerCreateArg(nil); got != "" {
-		t.Fatalf("nil settings: got %q", got)
-	}
-	if got := runnerNetworkDockerCreateArg(&cache.Settings{Enabled: false}); got != "" {
-		t.Fatalf("disabled settings: got %q", got)
-	}
-	if got, want := runnerNetworkDockerCreateArg(&cache.Settings{Enabled: true}), "  --network "+cache.NetworkName; got != want {
-		t.Fatalf("enabled settings: got %q, want %q", got, want)
+	if got != cacheURLDockerCreateArg(fmt.Sprintf("http://172.17.0.1:%d/", cache.DefaultPort)) {
+		t.Fatalf("enabled settings: got %q", got)
 	}
 }
 

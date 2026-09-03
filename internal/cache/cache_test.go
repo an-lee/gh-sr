@@ -62,17 +62,30 @@ func TestRunnerURL_precedence(t *testing.T) {
 		t.Errorf("override: got %q", got)
 	}
 
-	// Default: the cache container's fixed address on the dedicated gh-sr
-	// network — independent of bind_addr, the docker0 gateway, and the
-	// host-side published port.
 	s = Settings{Enabled: true, BindAddr: "192.168.1.5", Port: 3001}
-	if got := s.RunnerURL(h); got != fmt.Sprintf("http://%s:%d/", ContainerIP, ContainerPort) {
-		t.Errorf("default: got %q", got)
+	if got := s.RunnerURL(h); got != "http://192.168.1.5:3001/" {
+		t.Errorf("explicit bind: got %q", got)
+	}
+
+	// 0.0.0.0 is not injectable; fall through to the docker0 gateway.
+	s = Settings{Enabled: true, BindAddr: "0.0.0.0"}
+	if got := s.RunnerURL(h); got != fmt.Sprintf("http://172.17.0.1:%d/", DefaultPort) {
+		t.Errorf("0.0.0.0 bind + gateway: got %q", got)
 	}
 
 	s = Settings{Enabled: true}
-	if got := s.RunnerURL(newCacheHost(t, &testutil.MockExecutor{RunErr: io.EOF})); got != fmt.Sprintf("http://%s:%d/", ContainerIP, ContainerPort) {
-		t.Errorf("no-gateway host must not affect the URL: got %q", got)
+	if got := s.RunnerURL(h); got != fmt.Sprintf("http://172.17.0.1:%d/", DefaultPort) {
+		t.Errorf("auto bind: got %q", got)
+	}
+
+	// No docker0 → no container-reachable address → skip injection.
+	s = Settings{Enabled: true}
+	if got := s.RunnerURL(newCacheHost(t, &testutil.MockExecutor{RunErr: io.EOF})); got != "" {
+		t.Errorf("gateway failure: got %q", got)
+	}
+	s = Settings{Enabled: true}
+	if got := s.RunnerURL(newCacheHost(t, &testutil.MockExecutor{Output: "device not found\n"})); got != "" {
+		t.Errorf("no docker0: got %q", got)
 	}
 }
 
@@ -114,11 +127,11 @@ func TestEnsure_disabled(t *testing.T) {
 func TestEnsure_runningNoop(t *testing.T) {
 	t.Parallel()
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
+		if strings.Contains(cmd, "Config.Labels") {
+			return "running|" + cacheLayoutRev + "\n", nil
+		}
 		if strings.Contains(cmd, ".State.Status") {
 			return "running\n", nil
-		}
-		if strings.Contains(cmd, "NetworkSettings.Networks") {
-			return NetworkName + "=" + ContainerIP + " \n", nil
 		}
 		return "", nil
 	}}
@@ -127,7 +140,7 @@ func TestEnsure_runningNoop(t *testing.T) {
 	}
 	for _, c := range mock.Calls {
 		if strings.Contains(c, "docker start") || strings.Contains(c, "docker rm") || strings.Contains(c, "docker run") {
-			t.Fatalf("running container on the expected network must be a no-op, calls: %v", mock.Calls)
+			t.Fatalf("running container with the current layout must be a no-op, calls: %v", mock.Calls)
 		}
 	}
 }
@@ -136,10 +149,10 @@ func TestEnsure_existsStarts(t *testing.T) {
 	t.Parallel()
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
 		switch {
+		case strings.Contains(cmd, "Config.Labels"):
+			return "exited|" + cacheLayoutRev + "\n", nil
 		case strings.Contains(cmd, ".State.Status"):
 			return "exited\n", nil
-		case strings.Contains(cmd, "NetworkSettings.Networks"):
-			return NetworkName + "=" + ContainerIP + " \n", nil
 		default:
 			return "", nil
 		}
@@ -153,18 +166,18 @@ func TestEnsure_existsStarts(t *testing.T) {
 	}
 }
 
-// TestEnsure_recreatesWhenNetworkMismatch covers convergence from a
-// pre-network deployment: an existing container not on NetworkName with the
-// fixed IP must be removed and redeployed, not silently left blackholed.
-func TestEnsure_recreatesWhenNetworkMismatch(t *testing.T) {
+// TestEnsure_recreatesWhenLayoutStale covers convergence from a deployment
+// made by an older gh-sr layout: the stale container (env and ports are baked
+// at create) must be removed and redeployed with the current arguments.
+func TestEnsure_recreatesWhenLayoutStale(t *testing.T) {
 	t.Parallel()
 	created := false
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
 		switch {
+		case strings.Contains(cmd, "Config.Labels"):
+			return "running|<no value>\n", nil
 		case strings.Contains(cmd, ".State.Status"):
 			return "running\n", nil
-		case strings.Contains(cmd, "NetworkSettings.Networks"):
-			return "bridge=172.17.0.8 \n", nil
 		case strings.Contains(cmd, "docker rm -f"):
 			return "", nil
 		case strings.Contains(cmd, "docker run"):
@@ -172,13 +185,15 @@ func TestEnsure_recreatesWhenNetworkMismatch(t *testing.T) {
 			return "", nil
 		case strings.Contains(cmd, "echo $HOME"):
 			return "/root\n", nil
+		case strings.Contains(cmd, "ip -4 -o addr show docker0"):
+			return gwOutput, nil
 		default:
 			return "", nil
 		}
 	}}
 	var buf strings.Builder
 	if err := Ensure(&buf, newCacheHost(t, mock), Settings{Enabled: true}); err != nil {
-		t.Fatalf("Ensure mismatch: %v", err)
+		t.Fatalf("Ensure stale layout: %v", err)
 	}
 	if !strings.Contains(buf.String(), "recreating") {
 		t.Errorf("expected recreate message, got: %s", buf.String())
@@ -222,11 +237,10 @@ func TestEnsure_missingDeploys(t *testing.T) {
 	for _, want := range []string{
 		"docker run -d --name gh-sr-cache",
 		"--restart unless-stopped",
-		"--network " + NetworkName,
-		"--ip " + ContainerIP,
+		"--label " + LayoutLabel + "=" + cacheLayoutRev,
 		fmt.Sprintf("-p 172.17.0.1:%d:%d", DefaultPort, ContainerPort),
 		"-v '/root/.gh-sr/cache':/data",
-		fmt.Sprintf("-e 'API_BASE_URL=http://%s:%d/'", ContainerIP, ContainerPort),
+		fmt.Sprintf("-e 'API_BASE_URL=http://172.17.0.1:%d/'", DefaultPort),
 		"-e 'STORAGE_DRIVER=filesystem'",
 		"-e 'STORAGE_FILESYSTEM_PATH=/data/cache'",
 		"-e 'DB_DRIVER=sqlite'",
@@ -240,10 +254,6 @@ func TestEnsure_missingDeploys(t *testing.T) {
 		if !strings.Contains(runLine, want) {
 			t.Errorf("docker run missing %q:\n%s", want, runLine)
 		}
-	}
-	// The network itself must be ensured (idempotent create) before the run.
-	if !contains(mock.Calls, fmt.Sprintf("docker network create --subnet=%s %s", NetworkSubnet, NetworkName)) {
-		t.Errorf("expected idempotent network create, calls: %v", mock.Calls)
 	}
 }
 

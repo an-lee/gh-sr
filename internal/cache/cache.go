@@ -34,24 +34,15 @@ const (
 	// cache.storage_path is unset.
 	DefaultStoragePath = "$HOME/.gh-sr/cache"
 
-	// NetworkName is the dedicated Docker bridge network shared by the cache
-	// server and every container-mode runner on the host. Runners reach the
-	// cache container-to-container over this bridge — a path Docker's own
-	// FORWARD rules accept, independent of the host's INPUT firewall (ufw and
-	// friends commonly block the alternative route through a host-published
-	// port, which silently blackholed all results-API traffic).
-	NetworkName = "gh-sr"
-	// NetworkSubnet is the fixed subnet for NetworkName. Deliberately outside
-	// Docker's default address pools (172.16.0.0/12, 192.168.0.0/16): DinD
-	// runner containers run an inner dockerd that allocates those same pools
-	// in its own netns, and an overlap would make the cache URL unresolvable
-	// from inside job containers. 10.66.0.0/24 is unlikely to collide with a
-	// host LAN; cache.url_override exists for pathological hosts.
-	NetworkSubnet = "10.66.0.0/24"
-	// ContainerIP is the cache container's fixed address on NetworkName —
-	// near the top of the subnet so Docker's dynamic allocation (which starts
-	// low and skips taken addresses) never claims it for a runner.
-	ContainerIP = "10.66.0.254"
+	// LayoutLabel is the Docker label stamped on the cache container with the
+	// current deploy layout revision. Ensure recreates containers stamped with
+	// an older value (or none), so deploy-argument changes converge on the
+	// next Ensure instead of silently running a stale deployment forever.
+	LayoutLabel    = "gh-sr.cache-layout"
+	cacheLayoutRev = "v3" // published-port routing (docker0 gateway, firewall-remediable)
+	// networkNamePrev is the bridge network a retired experiment attached the
+	// cache and runners to; removed best-effort when recreating a stale one.
+	networkNamePrev = "gh-sr"
 
 	// In-container paths for the mounted storage volume; the server reads them
 	// from its own env (see lib/schemas.ts upstream). We set them explicitly so
@@ -91,6 +82,12 @@ func (s Settings) port() int {
 	return s.Port
 }
 
+// EffectivePort is the exported form of the resolved host-side published port
+// (Port, or DefaultPort when unset) for packages reporting remediation hints.
+func (s Settings) EffectivePort() int {
+	return s.port()
+}
+
 // WithTrailingSlash guarantees the single trailing slash the actions runner
 // expects on an ACTIONS_RESULTS_URL-style base URL.
 func WithTrailingSlash(u string) string {
@@ -128,16 +125,29 @@ func parseGatewayIPOutput(out string) string {
 }
 
 // RunnerURL returns the cache base URL to inject into runners on this host
-// (with trailing slash). It is the cache container's fixed address on the
-// dedicated gh-sr docker network — reachable container-to-container from
-// every runner (and from inner job containers, since the address does not
-// overlap the inner dockerd's default pools) and independent of the host's
-// INPUT firewall. URLOverride, when set, wins verbatim.
-func (s Settings) RunnerURL(_ *host.Host) string {
+// (with trailing slash), or "" when injection must be skipped.
+//
+// Precedence: URLOverride → explicit non-0.0.0.0 BindAddr → docker0 gateway.
+// A gateway lookup failure yields "" (deploy then binds 0.0.0.0 and the
+// caller warns), because without a bridge gateway there is no
+// container-reachable address to inject.
+//
+// Note this is a host-published port: reaching it from a container traverses
+// the host's INPUT chain, so hosts with a default-deny firewall (ufw et al)
+// need one allow rule — `gh sr doctor` probes the exact URL from inside a
+// runner and prints the command when it is blocked.
+func (s Settings) RunnerURL(h *host.Host) string {
 	if s.URLOverride != "" {
 		return WithTrailingSlash(s.URLOverride)
 	}
-	return fmt.Sprintf("http://%s:%d/", ContainerIP, ContainerPort)
+	if s.BindAddr != "" && s.BindAddr != "0.0.0.0" {
+		return fmt.Sprintf("http://%s:%d/", s.BindAddr, s.port())
+	}
+	gw, err := ResolveGatewayIP(h)
+	if err != nil || gw == "" {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d/", gw, s.port())
 }
 
 // localURL is the cache API base as seen from the host itself: an explicit
@@ -196,24 +206,25 @@ func containerState(h *host.Host) (string, error) {
 	}
 }
 
-// cacheNetworkCurrent reports whether an existing cache container is attached
-// to NetworkName with the expected fixed IP. Used by Ensure to converge
-// deployments made before the dedicated-network design (or after a config
-// change): a mismatched container is recreated, since docker cannot move a
-// created container onto a network with a new fixed IP in place.
-func cacheNetworkCurrent(h *host.Host) (bool, error) {
+// cacheLayoutCurrent reports whether an existing cache container carries the
+// current deploy layout label. Used by Ensure to converge deployments made by
+// older gh-sr versions (or after a layout change): a stale container cannot
+// be updated in place (its env and ports are baked at create), so it is
+// recreated.
+func cacheLayoutCurrent(h *host.Host) (bool, error) {
 	out, err := h.Run(fmt.Sprintf(
-		"docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}' %s 2>/dev/null || true", ContainerName))
+		"docker inspect --format '{{.State.Status}}|{{index .Config.Labels %q}}' %s 2>/dev/null || true",
+		LayoutLabel, ContainerName))
 	if err != nil {
-		return false, fmt.Errorf("inspecting cache container networks: %w", err)
+		return false, fmt.Errorf("inspecting cache container layout: %w", err)
 	}
-	return strings.Contains(out, NetworkName+"="+ContainerIP), nil
+	return strings.Contains(out, "|"+cacheLayoutRev), nil
 }
 
-// Ensure deploys the cache server idempotently: a running container on the
-// expected network is a no-op, a stopped one is started, a missing one is
-// pulled and created, and one attached to the wrong network/IP (e.g. deployed
-// by an older gh-sr) is recreated. The management API key comes from Settings
+// Ensure deploys the cache server idempotently: a running container with the
+// current layout label is a no-op, a stopped one is started, a missing one is
+// pulled and created, and one stamped with an older layout (e.g. deployed by
+// an earlier gh-sr) is recreated. The management API key comes from Settings
 // or (generated on first deploy, kept for later prune/status calls)
 // <storage>/.management-api-key.
 func Ensure(w io.Writer, h *host.Host, s Settings) error {
@@ -225,15 +236,18 @@ func Ensure(w io.Writer, h *host.Host, s Settings) error {
 		return err
 	}
 	if state != "" {
-		current, err := cacheNetworkCurrent(h)
+		current, err := cacheLayoutCurrent(h)
 		if err != nil {
 			return err
 		}
 		if !current {
-			fmt.Fprintf(w, "  cache: %s is not on network %s (%s); recreating...\n", ContainerName, NetworkName, ContainerIP)
+			fmt.Fprintf(w, "  cache: %s was deployed by an older gh-sr layout; recreating...\n", ContainerName)
 			if _, err := h.Run("docker rm -f " + ContainerName); err != nil {
 				return fmt.Errorf("removing outdated cache container: %w", err)
 			}
+			// Best-effort cleanup of the bridge network a retired deploy
+			// layout attached the cache and runners to.
+			_, _ = h.Run("docker network rm " + networkNamePrev + " 2>/dev/null || true")
 			state = ""
 		}
 	}
@@ -273,16 +287,6 @@ func deploy(w io.Writer, h *host.Host, s Settings) error {
 	// without registry access. A genuinely missing image fails at docker run.
 	_, _ = h.Run("docker pull " + hostshell.PosixSingleQuote(s.image()))
 
-	// Dedicated bridge network: runners and the cache container reach each
-	// other container-to-container, a path Docker's FORWARD rules accept
-	// regardless of the host INPUT firewall (which commonly blocks the
-	// host-published-port route). Idempotent create.
-	if _, err := h.Run(fmt.Sprintf(
-		"docker network inspect %s >/dev/null 2>&1 || docker network create --subnet=%s %s",
-		NetworkName, NetworkSubnet, NetworkName)); err != nil {
-		return fmt.Errorf("ensuring docker network %s: %w", NetworkName, err)
-	}
-
 	bind := s.BindAddr
 	if bind == "" {
 		gw, err := ResolveGatewayIP(h)
@@ -295,10 +299,9 @@ func deploy(w io.Writer, h *host.Host, s Settings) error {
 	}
 
 	envs := []string{
-		// Runner-facing base URL: the cache container's fixed address on the
-		// dedicated network. The server signs cache download URLs with it, so
-		// it must be an address the runners (and inner job containers) can
-		// reach — not the host-side published port.
+		// Runner-facing base URL: the server signs cache download URLs with
+		// it, so it must be an address the runner containers can reach — the
+		// same published host port the runners are injected with.
 		"API_BASE_URL=" + s.RunnerURL(h),
 		"STORAGE_DRIVER=filesystem",
 		"STORAGE_FILESYSTEM_PATH=" + storageFilesystemPath,
@@ -322,8 +325,7 @@ func deploy(w io.Writer, h *host.Host, s Settings) error {
 		"docker", "run", "-d",
 		"--name", ContainerName,
 		"--restart", "unless-stopped",
-		"--network", NetworkName,
-		"--ip", ContainerIP,
+		"--label", LayoutLabel + "=" + cacheLayoutRev,
 		"-p", fmt.Sprintf("%s:%d:%d", bind, s.port(), ContainerPort),
 		"-v", fmt.Sprintf("%s:%s", hostshell.PosixSingleQuote(storage), "/data"),
 	}
@@ -332,8 +334,7 @@ func deploy(w io.Writer, h *host.Host, s Settings) error {
 	}
 	args = append(args, hostshell.PosixSingleQuote(s.image()))
 
-	fmt.Fprintf(w, "  cache: starting %s at %s:%d (network %s; host port %s:%d; storage %s)...\n",
-		ContainerName, ContainerIP, ContainerPort, NetworkName, bind, s.port(), storage)
+	fmt.Fprintf(w, "  cache: starting %s on %s:%d (storage %s)...\n", ContainerName, bind, s.port(), storage)
 	if _, err := h.Run(strings.Join(args, " ")); err != nil {
 		return fmt.Errorf("starting cache container: %w", err)
 	}
