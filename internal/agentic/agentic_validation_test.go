@@ -38,7 +38,7 @@ func TestValidateContainerInnerNetwork(t *testing.T) {
 				`docker exec "gh-sr-runner" sh -c 'set -eu
 ok=0
 for i in 1 2 3 4 5; do
-  ip=$(docker run --rm alpine getent hosts host.docker.internal 2>/dev/null | awk "{print \$1; exit}")
+  ip=$(docker run --rm --add-host=host.docker.internal:host-gateway alpine getent hosts host.docker.internal 2>/dev/null | awk "{print \$1; exit}")
   case "$ip" in
     "" | 127.* | ::1) ;;
     *) ok=1; break ;;
@@ -79,156 +79,6 @@ done
 		}
 		if f.DocRef == "" {
 			t.Error("DocRef should be populated")
-		}
-	})
-}
-
-func TestValidateContainerInnerResolv(t *testing.T) {
-	t.Parallel()
-
-	t.Run("non-linux short-circuits", func(t *testing.T) {
-		t.Parallel()
-		h := host.NewHost("h", config.HostConfig{OS: "darwin"})
-		h.SetConn(&prereqTestExecutor{})
-		if got := ValidateContainerInnerResolv(h, "gh-sr-runner", "agentic-1"); got != nil {
-			t.Errorf("non-linux must short-circuit, got %#v", got)
-		}
-	})
-
-	t.Run("successful check returns nil", func(t *testing.T) {
-		t.Parallel()
-		// Mock by always returning nil for the resolv check command.
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				`docker exec "gh-sr-runner" sh -c 'set -eu
-gw=$(ip -4 -o addr show docker0 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1)
-[ -n "$gw" ] || gw=10.200.0.1
-grep -Eq "^nameserver[[:space:]]+$gw([[:space:]]|$)" /etc/resolv.conf'`: ``,
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		if got := ValidateContainerInnerResolv(h, "gh-sr-runner", "agentic-1"); got != nil {
-			t.Errorf("successful check must return nil, got %#v", got)
-		}
-	})
-
-	t.Run("failing check returns container-inner-resolv warning with both runners", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateContainerInnerResolv(h, "gh-sr-runner", "agentic-1")
-		f := failureByName(t, failures, "container-inner-resolv")
-		if f.Name == "" {
-			t.Fatalf("expected container-inner-resolv failure, got %#v", failures)
-		}
-		if f.Severity != SeverityWarning {
-			t.Errorf("Severity = %q, want warning", f.Severity)
-		}
-		if !strings.Contains(f.Remediation, "gh sr rebuild agentic-1") {
-			t.Errorf("Remediation should reference gh sr rebuild, got %q", f.Remediation)
-		}
-		if !strings.Contains(f.Remediation, "docker exec gh-sr-runner") {
-			t.Errorf("Remediation should reference docker exec verification, got %q", f.Remediation)
-		}
-	})
-}
-
-func TestValidateContainerAWFServiceRouting(t *testing.T) {
-	t.Parallel()
-
-	t.Run("non-linux short-circuits", func(t *testing.T) {
-		t.Parallel()
-		h := host.NewHost("h", config.HostConfig{OS: "darwin"})
-		h.SetConn(&prereqTestExecutor{})
-		if got := ValidateContainerAWFServiceRouting(h, "gh-sr-runner", "agentic-1"); got != nil {
-			t.Errorf("non-linux must short-circuit, got %#v", got)
-		}
-	})
-
-	t.Run("successful check returns nil", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				`docker exec "gh-sr-runner" sh -c 'iptables -t nat -S PREROUTING 2>/dev/null | grep -Fq -e "-A PREROUTING -s 172.30.0.0/24 -m addrtype --dst-type LOCAL -j RETURN"'`: ``,
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		if got := ValidateContainerAWFServiceRouting(h, "gh-sr-runner", "agentic-1"); got != nil {
-			t.Errorf("successful check must return nil, got %#v", got)
-		}
-	})
-
-	t.Run("failing check returns container-awf-service-routing warning", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateContainerAWFServiceRouting(h, "gh-sr-runner", "agentic-1")
-		f := failureByName(t, failures, "container-awf-service-routing")
-		if f.Name == "" {
-			t.Fatalf("expected container-awf-service-routing failure, got %#v", failures)
-		}
-		if f.Severity != SeverityWarning {
-			t.Errorf("Severity = %q, want warning", f.Severity)
-		}
-		if !strings.Contains(f.Message, "Connection refused") {
-			t.Errorf("Message should mention 'Connection refused' symptom, got %q", f.Message)
-		}
-		if !strings.Contains(f.Remediation, "iptables -t nat -I PREROUTING") {
-			t.Errorf("Remediation should show the live iptables workaround, got %q", f.Remediation)
-		}
-	})
-}
-
-func TestValidateContainerAWF(t *testing.T) {
-	t.Parallel()
-
-	t.Run("non-linux short-circuits", func(t *testing.T) {
-		t.Parallel()
-		h := host.NewHost("h", config.HostConfig{OS: "darwin"})
-		h.SetConn(&prereqTestExecutor{})
-		if got := ValidateContainerAWF(h, "gh-sr-runner", "agentic-1"); got != nil {
-			t.Errorf("non-linux must short-circuit, got %#v", got)
-		}
-	})
-
-	t.Run("successful check returns nil", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				`docker exec "gh-sr-runner" sh -lc 'set -eu
-command -v awf >/dev/null
-sudo -n -E awf --version >/dev/null'`: ``,
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		if got := ValidateContainerAWF(h, "gh-sr-runner", "agentic-1"); got != nil {
-			t.Errorf("successful check must return nil, got %#v", got)
-		}
-	})
-
-	t.Run("failing check returns container-awf warning with live unblock hint", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateContainerAWF(h, "gh-sr-runner", "agentic-1")
-		f := failureByName(t, failures, "container-awf")
-		if f.Name == "" {
-			t.Fatalf("expected container-awf failure, got %#v", failures)
-		}
-		if f.Severity != SeverityWarning {
-			t.Errorf("Severity = %q, want warning", f.Severity)
-		}
-		if !strings.Contains(f.Message, "awf is not available") {
-			t.Errorf("Message should mention 'awf is not available', got %q", f.Message)
-		}
-		if !strings.Contains(f.Remediation, "AWF_FORCE_BINARY=1") {
-			t.Errorf("Remediation should reference the live unblock env var, got %q", f.Remediation)
 		}
 	})
 }
@@ -409,12 +259,13 @@ func TestPrereqTestExecutor_RunErrorsWhenNoResponse(t *testing.T) {
 	}
 }
 
-// TestRunContainerCheck_helpersCoverAllSixWrappers pins the contract that the
-// six ValidateContainer* wrappers in agentic.go all share the same OS-gate +
-// Run + PrereqFailure shape via runContainerCheck. Future drift (one wrapper
-// re-introducing its own OS gate, one wrapper forgetting the severity, etc.)
-// will fail here.
-func TestRunContainerCheck_helpersCoverAllSixWrappers(t *testing.T) {
+// TestRunContainerCheck_helpersCoverAllWrappers pins the contract that the
+// ValidateContainer* wrappers in agentic.go (InnerNetwork, MTU, NodeNPM — the
+// probes that also exist as standalone wrappers; docker-socket-user / zstd /
+// cache-env are fanout-only) all share the same OS-gate + Run + PrereqFailure
+// shape via runContainerCheck. Future drift (one wrapper re-introducing its
+// own OS gate, one wrapper forgetting the severity, etc.) will fail here.
+func TestRunContainerCheck_helpersCoverAllWrappers(t *testing.T) {
 	t.Parallel()
 
 	exec := &prereqTestExecutor{} // every command errors
@@ -437,13 +288,8 @@ func TestRunContainerCheck_helpersCoverAllSixWrappers(t *testing.T) {
 		want string
 	}{
 		{"InnerNetwork", func() []PrereqFailure { return ValidateContainerInnerNetwork(hostLinux(), "gh-sr-runner", "agentic-1") }, "container-inner-host-docker-internal"},
-		{"InnerResolv", func() []PrereqFailure { return ValidateContainerInnerResolv(hostLinux(), "gh-sr-runner", "agentic-1") }, "container-inner-resolv"},
-		{"AWFServiceRouting", func() []PrereqFailure {
-			return ValidateContainerAWFServiceRouting(hostLinux(), "gh-sr-runner", "agentic-1")
-		}, "container-awf-service-routing"},
 		{"MTU", func() []PrereqFailure { return ValidateContainerMTU(hostLinux(), "gh-sr-runner", "agentic-1", 1400) }, "container-mtu"},
 		{"NodeNPM", func() []PrereqFailure { return ValidateContainerNodeNPM(hostLinux(), "gh-sr-runner", "agentic-1") }, "container-node-npm"},
-		{"AWF", func() []PrereqFailure { return ValidateContainerAWF(hostLinux(), "gh-sr-runner", "agentic-1") }, "container-awf"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -474,14 +320,7 @@ func TestRunContainerCheck_helpersCoverAllSixWrappers(t *testing.T) {
 		{"InnerNetwork", func() []PrereqFailure {
 			return ValidateContainerInnerNetwork(hostNonLinux(), "gh-sr-runner", "agentic-1")
 		}},
-		{"InnerResolv", func() []PrereqFailure {
-			return ValidateContainerInnerResolv(hostNonLinux(), "gh-sr-runner", "agentic-1")
-		}},
-		{"AWFServiceRouting", func() []PrereqFailure {
-			return ValidateContainerAWFServiceRouting(hostNonLinux(), "gh-sr-runner", "agentic-1")
-		}},
 		{"NodeNPM", func() []PrereqFailure { return ValidateContainerNodeNPM(hostNonLinux(), "gh-sr-runner", "agentic-1") }},
-		{"AWF", func() []PrereqFailure { return ValidateContainerAWF(hostNonLinux(), "gh-sr-runner", "agentic-1") }},
 	}
 	for _, tc := range nonLinuxCases {
 		tc := tc

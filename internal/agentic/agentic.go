@@ -107,39 +107,30 @@ func runAWFHygieneChecks(h *host.Host, pfx, nameSuffix string, checks []awfHygie
 	return collector.wait()
 }
 
-// awfInnerHygieneChecks returns the inner-Docker (DinD runner) AWF hygiene
-// check definitions. Each remediation is pre-formatted with the outer
+// awfInnerHygieneChecks returns the inner-Docker (DinD runner) agentic hygiene
+// check definitions. gh-aw v0.88+ runs AWF rootless: the job leaves behind
+// awmg-mcpg / awf- / gh-aw containers rather than iptables state, so only
+// container leakage is probed. Each remediation is pre-formatted with the outer
 // container name so the operator running `gh sr doctor` knows which runner
-// to ssh into. Probes drop the host-side `sudo -n` because the DinD inner
-// daemon runs as root.
+// to ssh into.
 func awfInnerHygieneChecks(outerContainer string) []awfHygieneCheck {
 	return []awfHygieneCheck{
 		{
-			Name:    "awf-orphan-containers",
-			Cmd:     `docker ps -a --filter "name=awf-" --filter "name=gh-aw" --format '{{.Names}}' 2>/dev/null | head -20`,
-			Message: fmt.Sprintf("orphan gh-aw/awf containers in inner Docker (runner container %s)", outerContainer),
+			Name:    "orphan-agentic-containers",
+			Cmd:     `docker ps -a --filter "name=awmg-mcpg" --filter "name=awf-" --filter "name=gh-aw" --format '{{.Names}}' 2>/dev/null | head -20`,
+			Message: fmt.Sprintf("orphan awmg-mcpg/awf/gh-aw containers in inner Docker (runner container %s); normally reaped by the job-completed hook", outerContainer),
 			Remediation: fmt.Sprintf(`Clean up inside the runner container (outer name %s):
 
   docker exec -it %s bash
-  docker ps -a --filter "name=awf-" --format '{{.ID}}' | xargs -r docker rm -f
-  docker ps -a --filter "name=gh-aw" --format '{{.ID}}' | xargs -r docker rm -f`, outerContainer, outerContainer),
+  docker ps -a --filter "name=awmg-mcpg" --filter "name=awf-" --filter "name=gh-aw" --format '{{.ID}}' | xargs -r docker rm -f`, outerContainer, outerContainer),
 		},
 		{
-			Name:    "stale-docker-user-rules",
-			Cmd:     `iptables -L DOCKER-USER --line-numbers -n 2>/dev/null | grep -i "awf\|gh-aw" | head -20`,
-			Message: fmt.Sprintf("stale DOCKER-USER iptables rules in inner netns (runner container %s)", outerContainer),
-			Remediation: fmt.Sprintf(`Flush inner AWF egress rules when no agentic job is using this runner:
+			Name:    "orphan-agentic-networks",
+			Cmd:     `docker network ls --filter "name=awf-net" --format '{{.Name}}' 2>/dev/null | head -20`,
+			Message: fmt.Sprintf("orphan awf-net networks in inner Docker (runner container %s)", outerContainer),
+			Remediation: fmt.Sprintf(`Prune leftover job networks inside the runner container:
 
-  docker exec %s iptables -F DOCKER-USER`, outerContainer),
-		},
-		{
-			Name:    "mcpg-orphan-containers",
-			Cmd:     `docker ps -a --filter "name=gh-aw-mcpg-" --format '{{.Names}}' 2>/dev/null | head -20`,
-			Message: fmt.Sprintf("orphan gh-aw-mcpg-* containers in inner Docker (runner container %s)", outerContainer),
-			Remediation: fmt.Sprintf(`Clean up inside the runner container:
-
-  docker exec -it %s bash
-  docker ps -a --filter "name=gh-aw-mcpg-" --format '{{.ID}}' | xargs -r docker rm -f`, outerContainer),
+  docker exec %s docker network prune -f --filter "name=awf-net"`, outerContainer),
 		},
 	}
 }
@@ -154,64 +145,12 @@ func ValidateAWFHygieneInner(h *host.Host, outerContainer string) []PrereqFailur
 }
 
 // ValidateContainerInnerNetwork checks the network paths gh-aw depends on inside
-// a container-mode runner. The MCP gateway runs in the inner host network, while
-// agent/AWF child containers use the default bridge and reach the gateway via
-// host.docker.internal.
+// a container-mode runner: the inner dockerd must map
+// --add-host=host.docker.internal:host-gateway to a usable non-loopback address,
+// which is how gh-aw v0.88+ job containers (agent sandbox and awmg-mcpg gateway,
+// both started with that flag) reach gateway/services endpoints.
 func ValidateContainerInnerNetwork(h *host.Host, outerContainer, runnerName string) []PrereqFailure {
-	d, _ := containerCheckDefByName("container-inner-host-docker-internal", outerContainer, runnerName, 0)
-	return runContainerCheck(h, containerCheckSpec{
-		name:        d.Name,
-		checkCmd:    d.checkCommand(outerContainer),
-		message:     d.Message,
-		remediation: d.Remediation,
-		docRef:      d.DocRef,
-	})
-}
-
-// ValidateContainerInnerResolv checks that the runner container's /etc/resolv.conf
-// points at the bundled dnsmasq (the inner docker0 gateway). entrypoint.sh repoints it
-// there at startup so gh-aw's firewall — which auto-detects the agent sandbox's DNS
-// servers from this very file — propagates an authoritative, AWF-exempt resolver for
-// host.docker.internal to the sandbox.
-//
-// If a stale (pre-fix) image or a read-only resolv.conf leaves the OUTER host resolver
-// in place, the sandbox resolves host.docker.internal there and intermittently gets a
-// non-exempt IP. AWF's sandbox iptables only exempts the inner-bridge gateway from the
-// transparent Squid redirect, so a non-exempt answer force-proxies the MCP gateway POST
-// into Squid, which rejects the origin-form request (ERR_INVALID_URL → HTTP 400) and the
-// agent reports "MCP server(s) failed to launch". This check surfaces that latent
-// misconfiguration before a job hits it.
-func ValidateContainerInnerResolv(h *host.Host, outerContainer, runnerName string) []PrereqFailure {
-	d, _ := containerCheckDefByName("container-inner-resolv", outerContainer, runnerName, 0)
-	return runContainerCheck(h, containerCheckSpec{
-		name:        d.Name,
-		checkCmd:    d.checkCommand(outerContainer),
-		message:     d.Message,
-		remediation: d.Remediation,
-		docRef:      d.DocRef,
-	})
-}
-
-// ValidateContainerAWFServiceRouting checks that the runner container has the
-// AWF service-routing bypass installed in NAT PREROUTING.
-//
-// Without this rule, AWF agents on awf-net cannot reach workflow `services:`
-// containers (postgres/redis/etc.) via host.docker.internal:<port>. Inner dockerd
-// DNATs port-published traffic from the host gateway IP to the service container
-// IP *before* AWF's FW_WRAPPER chain in FORWARD inspects it. AWF's
-// `--allow-host-service-ports` rules match on the host gateway IP, so the post-
-// DNAT packet falls through to FW_WRAPPER's catch-all REJECT (ICMP port-
-// unreachable), surfacing as `Connection refused` for libpq/redis/etc.
-//
-// The bypass (installed by entrypoint.sh) is a single rule at the head of the
-// runner container's NAT PREROUTING chain:
-//
-//	iptables -t nat -I PREROUTING -s 172.30.0.0/24 -m addrtype --dst-type LOCAL -j RETURN
-//
-// Traffic from awf-net to any local IP of the runner container then skips DNAT
-// and is delivered to the userland docker-proxy, which forwards to the service.
-func ValidateContainerAWFServiceRouting(h *host.Host, outerContainer, runnerName string) []PrereqFailure {
-	d, _ := containerCheckDefByName("container-awf-service-routing", outerContainer, runnerName, 0)
+	d, _ := containerCheckDefByName("container-inner-host-docker-internal", outerContainer, runnerName, 0, false)
 	return runContainerCheck(h, containerCheckSpec{
 		name:        d.Name,
 		checkCmd:    d.checkCommand(outerContainer),
@@ -233,7 +172,7 @@ func ValidateContainerMTU(h *host.Host, outerContainer, runnerName string, hostE
 	if hostEgressMTU <= 0 || hostEgressMTU >= 1500 {
 		return nil
 	}
-	d, _ := containerCheckDefByName("container-mtu", outerContainer, runnerName, hostEgressMTU)
+	d, _ := containerCheckDefByName("container-mtu", outerContainer, runnerName, hostEgressMTU, false)
 	return runContainerCheck(h, containerCheckSpec{
 		name:        d.Name,
 		checkCmd:    d.checkCommand(outerContainer),
@@ -247,20 +186,7 @@ func ValidateContainerMTU(h *host.Host, outerContainer, runnerName string, hostE
 // container. gh-aw activation setup installs @actions/artifact via npm when daily AI
 // credits guardrails are enabled (safe-output-artifact-client), before actions/setup-node runs.
 func ValidateContainerNodeNPM(h *host.Host, outerContainer, runnerName string) []PrereqFailure {
-	d, _ := containerCheckDefByName("container-node-npm", outerContainer, runnerName, 0)
-	return runContainerCheck(h, containerCheckSpec{
-		name:        d.Name,
-		checkCmd:    d.checkCommand(outerContainer),
-		message:     d.Message,
-		remediation: d.Remediation,
-		docRef:      d.DocRef,
-	})
-}
-
-// ValidateContainerAWF checks that the gh-aw firewall CLI is available exactly
-// the way compiled workflows invoke it.
-func ValidateContainerAWF(h *host.Host, outerContainer, runnerName string) []PrereqFailure {
-	d, _ := containerCheckDefByName("container-awf", outerContainer, runnerName, 0)
+	d, _ := containerCheckDefByName("container-node-npm", outerContainer, runnerName, 0, false)
 	return runContainerCheck(h, containerCheckSpec{
 		name:        d.Name,
 		checkCmd:    d.checkCommand(outerContainer),
@@ -299,8 +225,14 @@ func (d containerCheckDef) checkCommand(outerContainer string) string {
 // container probes, with Message/Remediation pre-rendered against the supplied
 // outerContainer / runnerName / hostEgressMTU. The MTU probe is included only
 // when hostEgressMTU falls in the pinning window (0 < MTU < 1500), matching
-// ValidateContainerMTU's gate.
-func containerCheckDefs(outerContainer, runnerName string, hostEgressMTU int) []containerCheckDef {
+// ValidateContainerMTU's gate; the cache-env probe only when cacheEnabled
+// (runners without a local cache keep GitHub's cache service and must not
+// carry CUSTOM_ACTIONS_RESULTS_URL).
+//
+// gh-aw v0.88+ rootless notes: no resolv.conf/dnsmasq probe (no baked DNS), no
+// iptables service-routing probe (network isolation is the inner bridge
+// topology), no awf CLI/sudo probe (AWF is rootless and fetched by the job).
+func containerCheckDefs(outerContainer, runnerName string, hostEgressMTU int, cacheEnabled bool) []containerCheckDef {
 	defs := []containerCheckDef{
 		{
 			Name:       "container-inner-host-docker-internal",
@@ -308,7 +240,7 @@ func containerCheckDefs(outerContainer, runnerName string, hostEgressMTU int) []
 			InnerBody: `set -eu
 ok=0
 for i in 1 2 3 4 5; do
-  ip=$(docker run --rm alpine getent hosts host.docker.internal 2>/dev/null | awk "{print \$1; exit}")
+  ip=$(docker run --rm --add-host=host.docker.internal:host-gateway alpine getent hosts host.docker.internal 2>/dev/null | awk "{print \$1; exit}")
   case "$ip" in
     "" | 127.* | ::1) ;;
     *) ok=1; break ;;
@@ -316,55 +248,16 @@ for i in 1 2 3 4 5; do
   sleep 1
 done
 [ "$ok" -eq 1 ]`,
-			Message: fmt.Sprintf("host.docker.internal does not resolve to a usable non-loopback address inside runner container %s (baked dnsmasq/daemon.json DNS)", outerContainer),
-			Remediation: fmt.Sprintf(`Inspect the runner container's inner Docker DNS and restart/rebuild it if stale:
+			Message: fmt.Sprintf("inner dockerd in runner container %s does not map --add-host=host.docker.internal:host-gateway to a usable non-loopback address; gh-aw v0.88+ job containers (agent sandbox, awmg-mcpg gateway) rely on it", outerContainer),
+			Remediation: fmt.Sprintf(`Inspect the runner container's inner Docker and restart/rebuild it if stale:
 
   docker exec -it %s bash
-  getent hosts host.docker.internal
-  docker run --rm alpine sh -c 'getent hosts host.docker.internal'
-  docker run --rm --network host alpine sh -c 'getent hosts host.docker.internal'
   docker run --rm --add-host=host.docker.internal:host-gateway alpine sh -c 'getent hosts host.docker.internal'
 
-If add-host resolution is empty or loopback, restart the runner container. If it persists, run:
+If resolution is empty or loopback, restart the runner container. If it persists, run:
 
   gh sr rebuild %s`, outerContainer, runnerName),
 			DocRef: "agentic-workflows.md §11a",
-		},
-		{
-			Name:       "container-inner-resolv",
-			LoginShell: false,
-			InnerBody: `set -eu
-gw=$(ip -4 -o addr show docker0 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1)
-[ -n "$gw" ] || gw=10.200.0.1
-grep -Eq "^nameserver[[:space:]]+$gw([[:space:]]|$)" /etc/resolv.conf`,
-			Message: fmt.Sprintf("runner container %s /etc/resolv.conf is not pinned to the bundled dnsmasq (inner bridge gateway); the gh-aw agent sandbox can inherit the host resolver and intermittently fail MCP launch (host.docker.internal force-proxied into Squid)", outerContainer),
-			Remediation: fmt.Sprintf(`Rebuild the runner image so entrypoint.sh repoints resolv.conf at the bundled dnsmasq:
-
-  gh sr rebuild %s
-
-Verify after restart (expect a single nameserver equal to the inner docker0 gateway, e.g. 10.200.0.1):
-
-  docker exec %s cat /etc/resolv.conf
-  docker exec %s ip -4 -o addr show docker0`, runnerName, outerContainer, outerContainer),
-			DocRef: "agentic-workflows.md §11a",
-		},
-		{
-			Name:       "container-awf-service-routing",
-			LoginShell: false,
-			InnerBody:  `iptables -t nat -S PREROUTING 2>/dev/null | grep -Fq -e "-A PREROUTING -s 172.30.0.0/24 -m addrtype --dst-type LOCAL -j RETURN"`,
-			Message:    fmt.Sprintf("AWF service-routing bypass not installed in runner container %s; agentic workflows that use `services:` (postgres, redis, etc.) will see `Connection refused` on host.docker.internal", outerContainer),
-			Remediation: fmt.Sprintf(`Rebuild the runner image (entrypoint.sh installs the bypass at startup):
-
-  gh sr rebuild %s
-
-Or apply the rule live without restart (lasts until docker daemon restart):
-
-  docker exec %s iptables -t nat -I PREROUTING -s 172.30.0.0/24 -m addrtype --dst-type LOCAL -j RETURN
-
-Verify:
-
-  docker exec %s iptables -t nat -S PREROUTING | head -3`, runnerName, outerContainer, outerContainer),
-			DocRef: "agentic-workflows.md §11b",
 		},
 		{
 			Name:       "container-node-npm",
@@ -377,21 +270,42 @@ Verify:
 			DocRef: "agentic-workflows.md §8",
 		},
 		{
-			Name:       "container-awf",
-			LoginShell: true,
-			InnerBody: `set -eu
-command -v awf >/dev/null
-sudo -n -E awf --version >/dev/null`,
-			Message: fmt.Sprintf("awf is not available via sudo inside runner container %s", outerContainer),
-			Remediation: fmt.Sprintf(`Rebuild the runner image so it includes github/gh-aw-firewall:
+			Name:       "container-docker-socket-user",
+			LoginShell: false,
+			InnerBody:  `su -s /bin/sh runner -c 'docker info >/dev/null 2>&1'`,
+			Message:    fmt.Sprintf("the runner user inside runner container %s cannot talk to the inner dockerd socket; the awmg-mcpg gateway mounts that socket and needs non-root access (fork image puts runner in the docker group, gid 123)", outerContainer),
+			Remediation: fmt.Sprintf(`Rebuild the runner image so the inner dockerd socket is group-accessible to the runner user:
 
   gh sr rebuild %s
 
-For a temporary live-container unblock only:
+Verify:
 
-  docker exec %s sh -lc 'curl -sSL https://raw.githubusercontent.com/github/gh-aw-firewall/main/install.sh | AWF_FORCE_BINARY=1 bash'`, runnerName, outerContainer),
-			DocRef: "agentic-workflows.md §12",
+  docker exec %s su -s /bin/sh runner -c 'docker info >/dev/null && echo ok'`, runnerName, outerContainer),
+			DocRef: "agentic-workflows.md §11a",
 		},
+		{
+			Name:       "container-zstd",
+			LoginShell: true,
+			InnerBody:  `command -v zstd >/dev/null`,
+			Message:    fmt.Sprintf("zstd is not on PATH inside runner container %s; actions/cache restore/save and tool-cache archives need it", outerContainer),
+			Remediation: fmt.Sprintf(`Rebuild the runner image so it includes zstd:
+
+  gh sr rebuild %s`, runnerName),
+			DocRef: "agentic-workflows.md §8",
+		},
+	}
+	if cacheEnabled {
+		defs = append(defs, containerCheckDef{
+			Name:       "container-cache-env",
+			LoginShell: false,
+			InnerBody:  `grep -q '^CUSTOM_ACTIONS_RESULTS_URL=' /home/runner/.env`,
+			Message:    fmt.Sprintf("runner container %s has no CUSTOM_ACTIONS_RESULTS_URL in .env; with the cache enabled the runner must point actions/cache at the per-host cache server", outerContainer),
+			Remediation: fmt.Sprintf(`Redeploy the runner so the entrypoint writes the cache URL (check that the cache is enabled and reachable on this host):
+
+  gh sr cache deploy
+  gh sr up %s`, runnerName),
+			DocRef: "guides/local-cache.md",
+		})
 	}
 	if hostEgressMTU > 0 && hostEgressMTU < 1500 {
 		mtu := strconv.Itoa(hostEgressMTU)
@@ -425,9 +339,10 @@ If the host's real path MTU is below its NIC MTU (a tunnel the NIC is unaware of
 
 // containerCheckDefByName looks up a single probe definition by its Name tag.
 // Used by the per-check wrappers so they share the same metadata + shell body
-// as the fanout path.
-func containerCheckDefByName(name, outerContainer, runnerName string, hostEgressMTU int) (containerCheckDef, bool) {
-	for _, d := range containerCheckDefs(outerContainer, runnerName, hostEgressMTU) {
+// as the fanout path. Pass the same hostEgressMTU/cacheEnabled inputs as the
+// fanout call so gated defs resolve consistently.
+func containerCheckDefByName(name, outerContainer, runnerName string, hostEgressMTU int, cacheEnabled bool) (containerCheckDef, bool) {
+	for _, d := range containerCheckDefs(outerContainer, runnerName, hostEgressMTU, cacheEnabled) {
 		if d.Name == name {
 			return d, true
 		}
@@ -435,38 +350,33 @@ func containerCheckDefByName(name, outerContainer, runnerName string, hostEgress
 	return containerCheckDef{}, false
 }
 
-// ValidateContainerAgenticFanout runs all six agentic container prereq probes
-// (InnerNetwork, InnerResolv, AWFServiceRouting, NodeNPM, AWF, MTU) against the
-// outerContainer in a single `docker exec` invocation, replacing the six
-// separate h.Run round-trips the per-check wrappers used to issue with one.
+// ValidateContainerAgenticFanout runs all in-scope agentic container prereq
+// probes (InnerNetwork, NodeNPM, DockerSocketUser, Zstd, and the gated
+// CacheEnv/MTU) against the outerContainer in a single `docker exec`
+// invocation, replacing the separate h.Run round-trips the per-check wrappers
+// used to issue with one.
 //
 // Each probe runs in its own `{ ...; } >/dev/null 2>&1` block whose exit code
 // is captured by a trailing `echo "#<Name>:$?"`. The combined shell exits 0
 // unconditionally (trailing `true`) so h.Run always returns success and the
 // full tagged output reaches the Go side, where it's parsed line-by-line: a
-// `:1` tag emits the per-check PrereqFailure; `:0` (or no line, for the MTU
-// check skipped on hosts with nothing to pin) emits nothing.
-//
-// This is the same win-class as PR #264/#269/#285/#301/#317 — collapse
-// independent probes of the same resource into a single shell call so the
-// SSH/host-exec round-trip count drops from 6 (one per probe) to 1 per
-// container scanned by `gh sr doctor`. Material on agentic-fleet doctor
-// runs (one round-trip per instance, regardless of how many probes fail).
+// `:1` tag emits the per-check PrereqFailure; `:0` (or no line, for the gated
+// checks when their gate is off) emits nothing.
 //
 // hostEgressMTU gates the MTU check (same rule as ValidateContainerMTU):
 // 0 (unknown) or >= 1500 (standard) means there is nothing to pin, so the MTU
-// block is omitted from the combined shell. Caller-visible behaviour is
-// identical to calling the six per-check wrappers in order.
+// block is omitted. cacheEnabled=false omits the cache-env block (a runner
+// without a local cache must not carry CUSTOM_ACTIONS_RESULTS_URL).
 //
 // On a nil host, non-Linux host, or empty outerContainer the function returns
 // nil without making any SSH round-trip — same short-circuit as the
 // per-check wrappers.
-func ValidateContainerAgenticFanout(h *host.Host, outerContainer, runnerName string, hostEgressMTU int) []PrereqFailure {
+func ValidateContainerAgenticFanout(h *host.Host, outerContainer, runnerName string, hostEgressMTU int, cacheEnabled bool) []PrereqFailure {
 	if h == nil || h.OS != "linux" || outerContainer == "" {
 		return nil
 	}
-	cmd := containerAgenticFanoutCheckCommand(outerContainer, runnerName, hostEgressMTU)
-	specs := containerAgenticFanoutSpecs(outerContainer, runnerName, hostEgressMTU)
+	cmd := containerAgenticFanoutCheckCommand(outerContainer, runnerName, hostEgressMTU, cacheEnabled)
+	specs := containerAgenticFanoutSpecs(outerContainer, runnerName, hostEgressMTU, cacheEnabled)
 	out, err := h.Run(cmd)
 	if err != nil {
 		// Transport-level failure (SSH drop, etc.) — surface one synthetic
@@ -487,10 +397,11 @@ func ValidateContainerAgenticFanout(h *host.Host, outerContainer, runnerName str
 // containerAgenticFanoutCheckCommand builds the single `docker exec` command
 // that runs all in-scope agentic container probes against outerContainer. The
 // MTU block is appended only when hostEgressMTU falls in the pinning window
-// (0 < MTU < 1500), matching ValidateContainerMTU's gate so a fanout call
-// has identical observable behaviour to calling the six per-check wrappers.
-func containerAgenticFanoutCheckCommand(outerContainer, runnerName string, hostEgressMTU int) string {
-	defs := containerCheckDefs(outerContainer, runnerName, hostEgressMTU)
+// (0 < MTU < 1500), and the cache-env block only when cacheEnabled — matching
+// the gating in containerCheckDefs so a fanout call has identical observable
+// behaviour to calling the per-check wrappers.
+func containerAgenticFanoutCheckCommand(outerContainer, runnerName string, hostEgressMTU int, cacheEnabled bool) string {
+	defs := containerCheckDefs(outerContainer, runnerName, hostEgressMTU, cacheEnabled)
 	var inner strings.Builder
 	for _, d := range defs {
 		inner.WriteString("{ ")
@@ -506,13 +417,13 @@ func containerAgenticFanoutCheckCommand(outerContainer, runnerName string, hostE
 // containerAgenticFanoutSpecs returns the per-check metadata used by the
 // fanout parser to convert a `#<Name>:1` tag into the corresponding
 // PrereqFailure. The set mirrors ValidateContainerAgenticFanout's
-// containerAgenticFanoutCheckCommand body — when the MTU block is omitted,
-// the parser simply never sees a `#container-mtu:...` line and the spec is
-// silently ignored. Message and Remediation are pre-rendered against the
-// supplied outerContainer / runnerName so the output is byte-identical to
-// the per-check wrappers.
-func containerAgenticFanoutSpecs(outerContainer, runnerName string, hostEgressMTU int) map[string]PrereqFailure {
-	defs := containerCheckDefs(outerContainer, runnerName, hostEgressMTU)
+// containerAgenticFanoutCheckCommand body — when a gated block (MTU,
+// cache-env) is omitted, the parser simply never sees its `#<Name>:...` line
+// and the spec is silently ignored. Message and Remediation are pre-rendered
+// against the supplied outerContainer / runnerName so the output is
+// byte-identical to the per-check wrappers.
+func containerAgenticFanoutSpecs(outerContainer, runnerName string, hostEgressMTU int, cacheEnabled bool) map[string]PrereqFailure {
+	defs := containerCheckDefs(outerContainer, runnerName, hostEgressMTU, cacheEnabled)
 	specs := make(map[string]PrereqFailure, len(defs))
 	for _, d := range defs {
 		specs[d.Name] = PrereqFailure{
@@ -675,32 +586,32 @@ func parseDockerChainOutput(out string, specs map[string]PrereqFailure) []Prereq
 }
 
 func containerInnerNetworkCheckCommand(outerContainer string) string {
-	d, _ := containerCheckDefByName("container-inner-host-docker-internal", outerContainer, "", 0)
+	d, _ := containerCheckDefByName("container-inner-host-docker-internal", outerContainer, "", 0, false)
 	return d.checkCommand(outerContainer)
 }
 
 func containerNodeNPMCheckCommand(outerContainer string) string {
-	d, _ := containerCheckDefByName("container-node-npm", outerContainer, "", 0)
+	d, _ := containerCheckDefByName("container-node-npm", outerContainer, "", 0, false)
 	return d.checkCommand(outerContainer)
 }
 
-func containerAWFCheckCommand(outerContainer string) string {
-	d, _ := containerCheckDefByName("container-awf", outerContainer, "", 0)
+func containerDockerSocketUserCheckCommand(outerContainer string) string {
+	d, _ := containerCheckDefByName("container-docker-socket-user", outerContainer, "", 0, false)
+	return d.checkCommand(outerContainer)
+}
+
+func containerZstdCheckCommand(outerContainer string) string {
+	d, _ := containerCheckDefByName("container-zstd", outerContainer, "", 0, false)
+	return d.checkCommand(outerContainer)
+}
+
+func containerCacheEnvCheckCommand(outerContainer string) string {
+	d, _ := containerCheckDefByName("container-cache-env", outerContainer, "", 0, true)
 	return d.checkCommand(outerContainer)
 }
 
 func containerMTUCheckCommand(outerContainer string, hostEgressMTU int) string {
-	d, _ := containerCheckDefByName("container-mtu", outerContainer, "", hostEgressMTU)
-	return d.checkCommand(outerContainer)
-}
-
-func containerInnerResolvCheckCommand(outerContainer string) string {
-	d, _ := containerCheckDefByName("container-inner-resolv", outerContainer, "", 0)
-	return d.checkCommand(outerContainer)
-}
-
-func containerAWFServiceRoutingCheckCommand(outerContainer string) string {
-	d, _ := containerCheckDefByName("container-awf-service-routing", outerContainer, "", 0)
+	d, _ := containerCheckDefByName("container-mtu", outerContainer, "", hostEgressMTU, false)
 	return d.checkCommand(outerContainer)
 }
 

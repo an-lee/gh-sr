@@ -389,7 +389,16 @@ func addRunnerCmd() *cobra.Command {
 Use --org instead of --repo for organization-level runners, and --group
 to assign the runner to a runner group. Use --profile agentic for GitHub
 Agentic Workflows (gh-aw) runners; agentic runners always use container
-(Docker-in-Docker) isolation, so no runner_mode or MCP port config is needed.`,
+(Docker-in-Docker) isolation, so no runner_mode or MCP port config is needed.
+
+Agentic runners run the gh-aw v0.88+ rootless sandbox (no sudo, no iptables
+rules; the AWF firewall runs unprivileged on the inner Docker bridge) on a
+fork runner image, and point actions/cache at a per-host local cache server
+(deployed automatically; see gh sr cache and guides/local-cache.md).
+
+Workflows must be compiled with gh-aw >= v0.88 (gh aw compile). Point them
+at this runner with runs-on: self-hosted (or runs-on-slim / safe-outputs
+.runs-on in gh-aw workflow front matter).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgPath, err := config.ResolveConfigPath(cfgFile)
@@ -460,10 +469,11 @@ func configCmd() *cobra.Command {
 func doctorCmd() *cobra.Command {
 	var strict bool
 	var fix bool
+	var checkLockfiles bool
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check config, GitHub API access, and host prerequisites",
-		Long:  "Validates local paths, configuration, GitHub API access, and SSH targets. For runner_mode: native, checks host runner dirs. profile: agentic always uses container mode: checks outer Docker and --privileged, each gh-sr-<instance> container, inner dockerd, .runner inside the container, and AWF hygiene/networking on the inner Docker. See README \"Host setup\" for steps gh sr cannot automate.",
+		Long:  "Validates local paths, configuration, GitHub API access, and SSH targets. For runner_mode: native, checks host runner dirs. profile: agentic always uses container mode: checks outer Docker and --privileged, each gh-sr-<instance> container, inner dockerd, .runner inside the container, agentic rootless-sandbox hygiene (orphan awmg-mcpg/awf containers, host-gateway alias, node/zstd, docker socket access), and the local Actions cache server when enabled. See README \"Host setup\" for steps gh sr cannot automate.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := config.BootstrapEnv(); err != nil {
@@ -488,7 +498,7 @@ func doctorCmd() *cobra.Command {
 			}
 
 			w := cmd.OutOrStdout()
-			res := doctor.Run(w, cfgPath, envPath, cfg, cfgErr, gh, filterHost, filterRepo, strict)
+			res := doctor.Run(w, cfgPath, envPath, cfg, cfgErr, gh, filterHost, filterRepo, strict, checkLockfiles)
 			if fix && res.Fail > 0 && cfg != nil && cfgErr == nil {
 				fmt.Fprintln(w, "\n--- Running `gh sr setup` to attempt fixes ---")
 				mgr, err := newManager(cfg, w)
@@ -500,7 +510,7 @@ func doctorCmd() *cobra.Command {
 					fmt.Fprintln(w, "\nfix attempt completed successfully.")
 				}
 				fmt.Fprintln(w, "\n--- Re-running doctor after fix ---")
-				res = doctor.Run(w, cfgPath, envPath, cfg, cfgErr, gh, filterHost, filterRepo, strict)
+				res = doctor.Run(w, cfgPath, envPath, cfg, cfgErr, gh, filterHost, filterRepo, strict, checkLockfiles)
 			}
 			if code := doctor.ExitCode(res, strict); code != 0 {
 				os.Exit(code)
@@ -510,6 +520,7 @@ func doctorCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&strict, "strict", false, "non-zero exit if any check is WARN (default: only FAIL fails the run)")
 	cmd.Flags().BoolVar(&fix, "fix", false, "automatically attempt to fix failures by re-running setup, then re-run doctor")
+	cmd.Flags().BoolVar(&checkLockfiles, "check-lockfiles", false, "also scan each scoped repo's compiled gh-aw workflows (*.lock.yml) for retired sudo/iptables-era artifacts; FAIL means the workflow must be recompiled with gh-aw >= v0.88 (requires network)")
 	return cmd
 }
 
@@ -753,9 +764,12 @@ the runner containers, and starts them. The image includes global
 container_runner_image.extra_apt_packages from runners.yml when set (see the
 agentic workflows guide).
 
-Runner state (the .runner registration file, work directories, and Docker layer
-cache inside the container) is preserved across the rebuild, so runners stay
-registered with GitHub and do not consume a new registration token.
+Changing container_runner_image.base_image, tag, or the embedded image
+sources changes the image fingerprint; rebuild is what picks the new image up
+(doctor flags a stale fingerprint). Runner state (the .runner registration
+file, work directories, and Docker layer cache inside the container) is
+preserved across the rebuild, so runners stay registered with GitHub and do
+not consume a new registration token.
 
 Runners with runner_mode: native are skipped (no error); only runner_mode: container rows are rebuilt.`,
 		RunE: runRunnerCmd(ops.RebuildImage),

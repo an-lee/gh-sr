@@ -534,7 +534,7 @@ func (m *dashboardModel) updateGlobalMenu(key string) tea.Cmd {
 						gh = runner.NewGitHubClient(tok)
 					}
 				}
-				doctor.Run(&buf, cfgPath, envPath, cfg, nil, gh, hostF, repoF, false)
+				doctor.Run(&buf, cfgPath, envPath, cfg, nil, gh, hostF, repoF, false, false)
 				return doctorDoneMsg{out: buf.String()}
 			}
 		case 1:

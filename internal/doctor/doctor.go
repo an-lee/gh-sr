@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/an-lee/gh-sr/internal/agentic"
+	"github.com/an-lee/gh-sr/internal/cache"
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/host"
 	"github.com/an-lee/gh-sr/internal/runner"
@@ -41,7 +42,9 @@ func ExitCode(res Result, strict bool) int {
 
 // Run prints diagnostics to w. cfg and cfgErr come from config.LoadFromPath (or Load) after BootstrapEnv.
 // If cfg is nil (load error), GitHub and host checks are skipped after the configuration section.
-func Run(w io.Writer, cfgPath, envPath string, cfg *config.Config, cfgErr error, gh *runner.GitHubClient, filterHost, filterRepo string, strict bool) Result {
+// checkLockfiles additionally scans compiled gh-aw workflows (*.lock.yml) in the
+// scoped repos for retired sudo/iptables-era artifacts (GitHub API reads).
+func Run(w io.Writer, cfgPath, envPath string, cfg *config.Config, cfgErr error, gh *runner.GitHubClient, filterHost, filterRepo string, strict, checkLockfiles bool) Result {
 	var r Result
 
 	fmt.Fprintln(w, "=== Local environment ===")
@@ -130,8 +133,21 @@ func Run(w io.Writer, cfgPath, envPath string, cfg *config.Config, cfgErr error,
 		printAPIFailures(w, &r, orgResults)
 	}
 
+	if checkLockfiles {
+		fmt.Fprintln(w, "\n=== Compiled agentic workflows (--check-lockfiles) ===")
+		if gh == nil {
+			printLine(w, sevWarn, "lockfiles", "skipped: no GitHub token (run `gh auth login`)")
+			r.Warn++
+		} else {
+			repos := uniqueStringsBy(runners, func(rc config.RunnerConfig) string { return rc.Repo })
+			checkLockWorkflows(w, gh, repos, &r)
+		}
+	}
+
 	fmt.Fprintln(w, "\n=== Hosts ===")
 	hostOrder := uniqueStringsBy(runners, func(rc config.RunnerConfig) string { return rc.Host })
+	cacheSet := cache.SettingsFromConfig(cfg)
+	cacheEnabled := cacheSet != nil
 
 	type hostResult struct {
 		buf bytes.Buffer
@@ -162,7 +178,7 @@ func Run(w io.Writer, cfgPath, envPath string, cfg *config.Config, cfgErr error,
 
 			defer h.Close()
 			printLine(&hr.buf, sevOK, hostName, fmt.Sprintf("connected (%s)", addrSummary(hcfg.Addr)))
-			runHostChecks(&hr.buf, hostName, h, runners, &hr.r)
+			runHostChecks(&hr.buf, hostName, h, runners, &hr.r, cacheSet, cacheEnabled)
 		}(i, hostName)
 	}
 	hostWg.Wait()
@@ -338,8 +354,11 @@ func hasContainerModeRunners(runners []config.RunnerConfig) bool {
 }
 
 // runHostChecks runs native and/or container doctor checks for hostName using the
-// already-filtered runners slice (respects --host / --repo filters).
-func runHostChecks(w io.Writer, hostName string, h *host.Host, runners []config.RunnerConfig, r *Result) {
+// already-filtered runners slice (respects --host / --repo filters). cacheSet is
+// the effective per-host cache configuration (nil = disabled); cacheEnabled is
+// passed through so agentic container probes include the cache-env check only
+// when runners are expected to carry CUSTOM_ACTIONS_RESULTS_URL.
+func runHostChecks(w io.Writer, hostName string, h *host.Host, runners []config.RunnerConfig, r *Result, cacheSet *cache.Settings, cacheEnabled bool) {
 	hostRunners := runnersForHost(runners, hostName)
 	if hasNativeModeRunners(hostRunners) {
 		checkNative(w, hostName, h, r)
@@ -353,8 +372,9 @@ func runHostChecks(w io.Writer, hostName string, h *host.Host, runners []config.
 		if h.OS == "linux" {
 			checkContainerRunnerInstall(w, hostName, h, runners, r)
 			if hasContainerAgenticRunners(hostRunners) {
-				checkContainerAgenticInnerHygiene(w, hostName, h, runners, r)
+				checkContainerAgenticInnerHygiene(w, hostName, h, runners, r, cacheEnabled)
 			}
+			checkCacheReachability(w, hostName, h, cacheSet, r)
 		}
 	}
 	if h.OS == "linux" || h.OS == "darwin" || h.OS == "windows" {
@@ -550,8 +570,9 @@ func checkContainerRunnerInstall(w io.Writer, hostName string, h *host.Host, run
 	}
 }
 
-// checkContainerAgenticInnerHygiene runs AWF orphan and network checks against the inner Docker in each running DinD agentic runner.
-func checkContainerAgenticInnerHygiene(w io.Writer, hostName string, h *host.Host, runners []config.RunnerConfig, r *Result) {
+// checkContainerAgenticInnerHygiene runs agentic hygiene and inner-Docker prereq
+// checks against the inner Docker in each running DinD agentic runner.
+func checkContainerAgenticInnerHygiene(w io.Writer, hostName string, h *host.Host, runners []config.RunnerConfig, r *Result, cacheEnabled bool) {
 	targets := installTargetsForHost(runners, hostName, func(rc *config.RunnerConfig) bool { return rc.IsAgentic() })
 	if len(targets) == 0 {
 		return
@@ -566,7 +587,7 @@ func checkContainerAgenticInnerHygiene(w io.Writer, hostName string, h *host.Hos
 
 		out, err := runner.ContainerStateStatus(h, cname)
 		status := out
-		// Stricter than IsContainerAcceptingJobs: the inner AWF/network probes
+		// Stricter than IsContainerAcceptingJobs: the inner agentic probes
 		// below need a fully-running container, not a transient "restarting"
 		// state, so we require exactly "running".
 		if err != nil || status != "running" {
@@ -574,20 +595,73 @@ func checkContainerAgenticInnerHygiene(w io.Writer, hostName string, h *host.Hos
 		}
 
 		failures := agentic.ValidateAWFHygieneInner(h, cname)
-		// Fan the six inner-docker agentic prereq probes (NodeNPM, AWF,
-		// InnerNetwork, InnerResolv, AWFServiceRouting, MTU) into a single
-		// `docker exec` round-trip via ValidateContainerAgenticFanout. This
-		// replaces the six separate h.Run calls that used to issue per
-		// container scanned by `gh sr doctor` with one — same observable
-		// PrereqFailure surface, six fewer SSH round-trips per instance.
-		// See PR #264/#269/#285/#301/#317 for the same win-class.
-		failures = append(failures, agentic.ValidateContainerAgenticFanout(h, cname, runnerName, hostEgressMTU)...)
+		// Fan the inner-docker agentic prereq probes (InnerNetwork, NodeNPM,
+		// DockerSocketUser, Zstd, gated CacheEnv/MTU) into a single
+		// `docker exec` round-trip via ValidateContainerAgenticFanout.
+		failures = append(failures, agentic.ValidateContainerAgenticFanout(h, cname, runnerName, hostEgressMTU, cacheEnabled)...)
 		if len(failures) == 0 {
-			printLine(w, sevOK, hostName, fmt.Sprintf("container(agent): awf installed, inner Docker clean, host.docker.internal reachable, resolv.conf pinned to dnsmasq, and AWF service-routing bypass present (%s)", cname))
+			printLine(w, sevOK, hostName, fmt.Sprintf("container(agent): inner Docker clean, host-gateway alias resolvable, node/npm + zstd on PATH, socket user ok%s (%s)", cacheGateSummary(cacheEnabled), cname))
 			continue
 		}
 		printAgenticFailures(w, hostName, r, sevWarn, "container(agent): ", failures)
 	}
+}
+
+func cacheGateSummary(cacheEnabled bool) string {
+	if cacheEnabled {
+		return ", cache URL wired"
+	}
+	return ""
+}
+
+// checkCacheReachability verifies the per-host local cache server is deployed,
+// healthy, and not needlessly exposed. Skipped entirely when the cache is
+// disabled (runners then use GitHub's cache service).
+func checkCacheReachability(w io.Writer, hostName string, h *host.Host, s *cache.Settings, r *Result) {
+	if s == nil {
+		return
+	}
+	info, err := cache.Inspect(h, *s)
+	if err != nil {
+		printLine(w, sevWarn, hostName, fmt.Sprintf("cache: inspect failed: %v", err))
+		r.Warn++
+		return
+	}
+	if info.State == "" {
+		printLine(w, sevWarn, hostName, "cache: enabled but not deployed; run: gh sr cache deploy")
+		r.Warn++
+		return
+	}
+	if !info.Healthy {
+		url := info.URL
+		if url == "" {
+			url = "(no container-reachable URL resolved)"
+		}
+		printLine(w, sevFail, hostName, fmt.Sprintf("cache: server not healthy at %s; check the gh-sr-cache container logs: docker logs %s", url, cache.ContainerName))
+		r.Fail++
+		return
+	}
+	printLine(w, sevOK, hostName, fmt.Sprintf("cache: healthy at %s (storage %s)", info.URL, info.StoragePath))
+
+	// A 0.0.0.0 bind means the cache API answers on every host interface.
+	if effectiveBind(s, h) == "0.0.0.0" {
+		printLine(w, sevWarn, hostName, "cache: bound to 0.0.0.0 — the cache API is reachable from your LAN; set cache.bind_addr (e.g. the docker0 gateway IP) in runners.yml")
+		r.Warn++
+	}
+}
+
+// effectiveBind resolves the bind address the deploy actually chose: an
+// explicit cache.bind_addr wins; the auto path binds the docker0 gateway, or
+// 0.0.0.0 when no gateway was found.
+func effectiveBind(s *cache.Settings, h *host.Host) string {
+	if s.BindAddr != "" {
+		return s.BindAddr
+	}
+	gw, err := cache.ResolveGatewayIP(h)
+	if err != nil || gw == "" {
+		return "0.0.0.0"
+	}
+	return gw
 }
 
 func checkOrphanRunners(w io.Writer, hostName string, h *host.Host, runners []config.RunnerConfig, r *Result) {

@@ -15,21 +15,7 @@ import (
 // the cache is disabled (zero-value Configs without a Load are disabled — the
 // enabled default is applied by config.applyDefaults).
 func cacheSettings(cfg *config.Config) *cache.Settings {
-	if cfg == nil || !cfg.CacheEnabled() {
-		return nil
-	}
-	return &cache.Settings{
-		Enabled:          true,
-		Port:             cfg.Cache.Port,
-		BindAddr:         cfg.Cache.BindAddr,
-		StoragePath:      cfg.Cache.StoragePath,
-		RetentionDays:    cfg.Cache.RetentionDays,
-		MaxSizeBytes:     cfg.Cache.MaxSizeBytes,
-		MaxUsagePercent:  cfg.Cache.MaxUsagePercent,
-		Image:            cfg.Cache.Image,
-		ManagementAPIKey: cfg.Cache.ManagementAPIKey,
-		URLOverride:      cfg.Cache.URLOverride,
-	}
+	return cache.SettingsFromConfig(cfg)
 }
 
 // ensureCacheForHost deploys the per-host cache container before container

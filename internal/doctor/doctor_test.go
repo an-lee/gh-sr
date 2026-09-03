@@ -344,7 +344,7 @@ func TestRunHostChecks_ContainerOnlySkipsNative(t *testing.T) {
 	}
 	var buf strings.Builder
 	var r Result
-	runHostChecks(&buf, "mac", h, runners, &r)
+	runHostChecks(&buf, "mac", h, runners, &r, nil, false)
 	out := buf.String()
 	if strings.Contains(out, "native:") {
 		t.Fatalf("container-only host should skip native checks, got:\n%s", out)
@@ -359,7 +359,7 @@ func TestRunHostChecks_NonLinuxContainerFails(t *testing.T) {
 	runners := []config.RunnerConfig{
 		{Name: "aw", Host: "mac", Repo: "o/r", Profile: "agentic"},
 	}
-	runHostChecks(&buf, "mac", h, runners, &r)
+	runHostChecks(&buf, "mac", h, runners, &r, nil, false)
 	if r.Fail != 1 {
 		t.Fatalf("expected one FAIL for container mode on darwin, got %+v", r)
 	}
@@ -387,7 +387,7 @@ func TestRun_ConfigErrorSkipsGitHub(t *testing.T) {
 	var buf strings.Builder
 	cfgPath := t.TempDir() + "/missing.yml"
 	envPath := t.TempDir() + "/env"
-	res := Run(&buf, cfgPath, envPath, nil, assertError(t, "no config"), nil, "", "", false)
+	res := Run(&buf, cfgPath, envPath, nil, assertError(t, "no config"), nil, "", "", false, false)
 	if res.Fail < 1 {
 		t.Fatalf("expected at least one FAIL, got %+v", res)
 	}
@@ -446,7 +446,7 @@ func TestRun_GitHubListRunnersUsesAPI(t *testing.T) {
 	}
 
 	var buf strings.Builder
-	res := Run(&buf, cfgPath, envPath, cfg, nil, gh, "", "", false)
+	res := Run(&buf, cfgPath, envPath, cfg, nil, gh, "", "", false, false)
 
 	out := buf.String()
 	if !strings.Contains(out, "list runners OK (0 registered)") {
@@ -516,7 +516,7 @@ func TestRun_GitHubOrgListRunnersUsesAPI(t *testing.T) {
 	}
 
 	var buf strings.Builder
-	res := Run(&buf, cfgPath, envPath, cfg, nil, gh, "", "", false)
+	res := Run(&buf, cfgPath, envPath, cfg, nil, gh, "", "", false, false)
 
 	out := buf.String()
 	if !strings.Contains(out, "org my-org: list runners OK (0 registered)") {
@@ -558,7 +558,7 @@ func TestRun_GitHubOrgListRunners403ShowsHint(t *testing.T) {
 	}
 
 	var buf strings.Builder
-	res := Run(&buf, cfgPath, envPath, cfg, nil, gh, "", "", false)
+	res := Run(&buf, cfgPath, envPath, cfg, nil, gh, "", "", false, false)
 
 	out := buf.String()
 	if !strings.Contains(out, "admin:org") {
@@ -1474,7 +1474,7 @@ func TestCheckContainerAgenticInnerHygiene_Empty(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	r := Result{}
-	checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r)
+	checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r, false)
 	if called {
 		t.Fatal("checkContainerAgenticInnerHygiene must not probe when no agentic targets match")
 	}
@@ -1489,11 +1489,12 @@ func TestCheckContainerAgenticInnerHygiene_Empty(t *testing.T) {
 type agenticInnerHygieneExecutor struct {
 	mu sync.Mutex
 
-	inspectOut string
-	inspectErr error
-	mtuOut     string
-	awfOut     string
-	fanoutOut  string
+	inspectOut  string
+	inspectErr  error
+	mtuOut      string
+	orphansOut  string
+	networksOut string
+	fanoutOut   string
 
 	calls      []string
 	unexpected []string
@@ -1511,12 +1512,10 @@ func (e *agenticInnerHygieneExecutor) Run(cmd string) (string, error) {
 		return e.inspectOut, e.inspectErr
 	case strings.Contains(cmd, `echo "#container-inner-host-docker-internal:$?"`):
 		return e.fanoutOut, nil
-	case strings.Contains(cmd, `--filter "name=awf-" --filter "name=gh-aw"`):
-		return e.awfOut, nil
-	case strings.Contains(cmd, "iptables -L DOCKER-USER"):
-		return "", nil
-	case strings.Contains(cmd, `--filter "name=gh-aw-mcpg-"`):
-		return "", nil
+	case strings.Contains(cmd, `docker network ls --filter "name=awf-net"`):
+		return e.networksOut, nil
+	case strings.Contains(cmd, `--filter "name=awmg-mcpg" --filter "name=awf-" --filter "name=gh-aw"`):
+		return e.orphansOut, nil
 	default:
 		e.unexpected = append(e.unexpected, cmd)
 		return "", fmt.Errorf("unexpected command: %s", cmd)
@@ -1533,27 +1532,30 @@ func (e *agenticInnerHygieneExecutor) snapshot() (calls, unexpected []string) {
 }
 
 // TestCheckContainerAgenticInnerHygiene covers the strict running-state gate,
-// clean result, both warning sources, and the host-MTU fanout gate.
+// clean result, both hygiene warning sources, the fanout probe warning, the
+// host-MTU fanout gate, and the cache-enabled OK wording.
 func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
 	t.Parallel()
 
 	const cleanFanout = "#container-inner-host-docker-internal:0\n" +
-		"#container-inner-resolv:0\n" +
-		"#container-awf-service-routing:0\n" +
 		"#container-node-npm:0\n" +
-		"#container-awf:0"
+		"#container-docker-socket-user:0\n" +
+		"#container-zstd:0"
 
 	tests := []struct {
 		name            string
 		inspectOut      string
 		inspectErr      error
 		mtuOut          string
-		awfOut          string
+		orphansOut      string
+		networksOut     string
 		fanoutOut       string
+		cacheEnabled    bool
 		wantWarn        int
 		wantExecCalls   int
 		wantFanoutCalls int
 		wantMTUBlock    bool
+		wantCacheBlock  bool
 		wantContains    []string
 		wantNotContains []string
 	}{
@@ -1574,23 +1576,69 @@ func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
 			inspectOut:      "running\n",
 			mtuOut:          "1500\n",
 			fanoutOut:       cleanFanout,
-			wantExecCalls:   4,
-			wantFanoutCalls: 1,
-			wantContains:    []string{"container(agent): awf installed, inner Docker clean", "gh-sr-aw-1"},
-			wantNotContains: []string{"[WARN]", "[FAIL]"},
-		},
-		{
-			name:            "inner AWF orphan warning",
-			inspectOut:      "running\n",
-			mtuOut:          "1500\n",
-			awfOut:          "awf-c1\n",
-			fanoutOut:       cleanFanout,
-			wantWarn:        1,
-			wantExecCalls:   4,
+			wantExecCalls:   3,
 			wantFanoutCalls: 1,
 			wantContains: []string{
-				"container(agent): orphan gh-aw/awf containers in inner Docker",
+				"container(agent): inner Docker clean, host-gateway alias resolvable, node/npm + zstd on PATH, socket user ok (gh-sr-aw-1)",
+			},
+			wantNotContains: []string{"[WARN]", "[FAIL]", "cache URL wired"},
+		},
+		{
+			name:            "healthy with cache enabled mentions cache URL",
+			inspectOut:      "running\n",
+			mtuOut:          "1500\n",
+			fanoutOut:       cleanFanout + "\n#container-cache-env:0",
+			cacheEnabled:    true,
+			wantExecCalls:   3,
+			wantFanoutCalls: 1,
+			wantCacheBlock:  true,
+			wantContains: []string{
+				"container(agent): inner Docker clean, host-gateway alias resolvable, node/npm + zstd on PATH, socket user ok, cache URL wired (gh-sr-aw-1)",
+			},
+		},
+		{
+			name:            "cache-env missing surfaces warning when cache enabled",
+			inspectOut:      "running\n",
+			mtuOut:          "1500\n",
+			fanoutOut:       cleanFanout + "\n#container-cache-env:1",
+			cacheEnabled:    true,
+			wantWarn:        1,
+			wantExecCalls:   3,
+			wantFanoutCalls: 1,
+			wantCacheBlock:  true,
+			wantContains: []string{
+				"container(agent): runner container gh-sr-aw-1 has no CUSTOM_ACTIONS_RESULTS_URL",
+				"gh sr cache deploy",
+				"See: guides/local-cache.md",
+			},
+		},
+		{
+			name:            "orphan agentic container warning",
+			inspectOut:      "running\n",
+			mtuOut:          "1500\n",
+			orphansOut:      "awmg-mcpg-stale\n",
+			fanoutOut:       cleanFanout,
+			wantWarn:        1,
+			wantExecCalls:   3,
+			wantFanoutCalls: 1,
+			wantContains: []string{
+				"container(agent): orphan awmg-mcpg/awf/gh-aw containers in inner Docker",
 				"docker exec -it gh-sr-aw-1 bash",
+				"See: agentic-workflows.md §12",
+			},
+		},
+		{
+			name:            "orphan agentic network warning",
+			inspectOut:      "running\n",
+			mtuOut:          "1500\n",
+			networksOut:     "awf-net-old\n",
+			fanoutOut:       cleanFanout,
+			wantWarn:        1,
+			wantExecCalls:   3,
+			wantFanoutCalls: 1,
+			wantContains: []string{
+				"container(agent): orphan awf-net networks in inner Docker",
+				"docker network prune -f --filter \"name=awf-net\"",
 				"See: agentic-workflows.md §12",
 			},
 		},
@@ -1600,7 +1648,7 @@ func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
 			mtuOut:          "1500\n",
 			fanoutOut:       "#container-node-npm:1",
 			wantWarn:        1,
-			wantExecCalls:   4,
+			wantExecCalls:   3,
 			wantFanoutCalls: 1,
 			wantContains: []string{
 				"container(agent): node LTS/npm are not on PATH",
@@ -1613,10 +1661,12 @@ func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
 			inspectOut:      "running\n",
 			mtuOut:          "1400\n",
 			fanoutOut:       cleanFanout + "\n#container-mtu:0",
-			wantExecCalls:   4,
+			wantExecCalls:   3,
 			wantFanoutCalls: 1,
 			wantMTUBlock:    true,
-			wantContains:    []string{"container(agent): awf installed, inner Docker clean"},
+			wantContains: []string{
+				"container(agent): inner Docker clean, host-gateway alias resolvable, node/npm + zstd on PATH, socket user ok (gh-sr-aw-1)",
+			},
 		},
 	}
 
@@ -1624,11 +1674,12 @@ func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			exec := &agenticInnerHygieneExecutor{
-				inspectOut: tt.inspectOut,
-				inspectErr: tt.inspectErr,
-				mtuOut:     tt.mtuOut,
-				awfOut:     tt.awfOut,
-				fanoutOut:  tt.fanoutOut,
+				inspectOut:  tt.inspectOut,
+				inspectErr:  tt.inspectErr,
+				mtuOut:      tt.mtuOut,
+				orphansOut:  tt.orphansOut,
+				networksOut: tt.networksOut,
+				fanoutOut:   tt.fanoutOut,
 			}
 			h := host.NewHost("h1", config.HostConfig{OS: "linux", Addr: "local"})
 			h.SetConn(exec)
@@ -1637,7 +1688,7 @@ func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
 			}
 			var buf bytes.Buffer
 			r := Result{}
-			checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r)
+			checkContainerAgenticInnerHygiene(&buf, "h1", h, runners, &r, tt.cacheEnabled)
 
 			if r.Fail != 0 || r.Warn != tt.wantWarn {
 				t.Fatalf("counters: got %+v, want Fail=0 Warn=%d", r, tt.wantWarn)
@@ -1683,6 +1734,10 @@ func TestCheckContainerAgenticInnerHygiene(t *testing.T) {
 				hasMTUBlock := strings.Contains(fanoutCommand, `echo "#container-mtu:$?"`) && strings.Contains(fanoutCommand, "host=1400")
 				if hasMTUBlock != tt.wantMTUBlock {
 					t.Errorf("fanout MTU block = %v, want %v\ncommand: %s", hasMTUBlock, tt.wantMTUBlock, fanoutCommand)
+				}
+				hasCacheBlock := strings.Contains(fanoutCommand, `echo "#container-cache-env:$?"`)
+				if hasCacheBlock != tt.wantCacheBlock {
+					t.Errorf("fanout cache-env block = %v, want %v\ncommand: %s", hasCacheBlock, tt.wantCacheBlock, fanoutCommand)
 				}
 			}
 		})

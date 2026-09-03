@@ -8,22 +8,18 @@ import (
 	"github.com/an-lee/gh-sr/internal/host"
 )
 
-// The docker/iptables probes that ValidateAWFHygieneInner fans out across the
-// inner Docker daemon of a DinD runner container. Lifted into named constants
-// so the test assertions can reuse the same strings the function emits —
-// guard against silent refactors of the probe shapes (the previous
-// test-improver run noted that the exact-string match in prereqTestExecutor
-// is a feature, not a bug, for exactly this reason).
+// The inner-Docker hygiene probes that ValidateAWFHygieneInner fans out across
+// the inner Docker daemon of a DinD runner container, lifted into named
+// constants so the test assertions reuse the exact strings the function emits
+// (prereqTestExecutor matches commands exactly — a feature, not a bug, for
+// guarding against silent probe-shape refactors).
 //
-// Note: the inner-Docker iptables probe has no `sudo -n` prefix because the
-// DinD inner daemon runs as root.
+// Rootless era (gh-aw v0.88+): no iptables probe (AWF no longer manipulates
+// DOCKER-USER) and the orphan-container filter covers awmg-mcpg / awf- / gh-aw
+// in a single docker ps.
 const (
-	awfHygieneAwfCmd  = `docker ps -a --filter "name=awf-" --filter "name=gh-aw" --format '{{.Names}}' 2>/dev/null | head -20`
-	awfHygieneMcpgCmd = `docker ps -a --filter "name=gh-aw-mcpg-" --format '{{.Names}}' 2>/dev/null | head -20`
-
-	// The inner-Docker variant of the iptables probe — no `sudo -n`
-	// because the DinD inner daemon runs as root.
-	awfHygieneIptablesInnerCmd = `iptables -L DOCKER-USER --line-numbers -n 2>/dev/null | grep -i "awf\|gh-aw" | head -20`
+	awfHygieneOrphansCmd  = `docker ps -a --filter "name=awmg-mcpg" --filter "name=awf-" --filter "name=gh-aw" --format '{{.Names}}' 2>/dev/null | head -20`
+	awfHygieneNetworksCmd = `docker network ls --filter "name=awf-net" --format '{{.Name}}' 2>/dev/null | head -20`
 )
 
 func TestValidateAWFHygieneInner(t *testing.T) {
@@ -31,14 +27,11 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 
 	const outerContainer = "gh-sr-myinstance"
 
-	// The three inner probes are the outer ones wrapped in `docker exec "X" `.
+	// The two inner probes are the definitions wrapped in `docker exec "X" `.
 	// strconv.Quote is used by the function so the prefix is literally
 	// `docker exec "gh-sr-myinstance" ` (double-quoted, space-prefixed).
-	// The iptables probe drops the `sudo -n` prefix because the DinD inner
-	// daemon runs as root.
-	innerAwfCmd := `docker exec "gh-sr-myinstance" ` + awfHygieneAwfCmd
-	innerIptablesCmd := `docker exec "gh-sr-myinstance" ` + awfHygieneIptablesInnerCmd
-	innerMcpgCmd := `docker exec "gh-sr-myinstance" ` + awfHygieneMcpgCmd
+	innerOrphansCmd := `docker exec "gh-sr-myinstance" ` + awfHygieneOrphansCmd
+	innerNetworksCmd := `docker exec "gh-sr-myinstance" ` + awfHygieneNetworksCmd
 
 	t.Run("non-linux short-circuits", func(t *testing.T) {
 		t.Parallel()
@@ -59,9 +52,8 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 		t.Parallel()
 		exec := &prereqTestExecutor{
 			response: map[string]string{
-				innerAwfCmd:      "",
-				innerIptablesCmd: "",
-				innerMcpgCmd:     "",
+				innerOrphansCmd:  "",
+				innerNetworksCmd: "",
 			},
 		}
 		h := host.NewHost("h", config.HostConfig{OS: "linux"})
@@ -69,28 +61,27 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 		if got := ValidateAWFHygieneInner(h, outerContainer); got != nil {
 			t.Errorf("clean inner Docker must return nil, got %#v", got)
 		}
-		for _, cmd := range []string{innerAwfCmd, innerIptablesCmd, innerMcpgCmd} {
+		for _, cmd := range []string{innerOrphansCmd, innerNetworksCmd} {
 			if !exec.saw(cmd) {
 				t.Errorf("expected inner probe to run: %q", cmd)
 			}
 		}
 	})
 
-	t.Run("orphan awf inside container returns inner warning naming the container", func(t *testing.T) {
+	t.Run("orphan agentic container returns inner warning naming the container", func(t *testing.T) {
 		t.Parallel()
 		exec := &prereqTestExecutor{
 			response: map[string]string{
-				innerAwfCmd:      "awf-c1",
-				innerIptablesCmd: "",
-				innerMcpgCmd:     "",
+				innerOrphansCmd:  "awmg-mcpg-stale",
+				innerNetworksCmd: "",
 			},
 		}
 		h := host.NewHost("h", config.HostConfig{OS: "linux"})
 		h.SetConn(exec)
 		failures := ValidateAWFHygieneInner(h, outerContainer)
-		f := failureByName(t, failures, "awf-orphan-containers-inner")
+		f := failureByName(t, failures, "orphan-agentic-containers-inner")
 		if f.Name == "" {
-			t.Fatalf("expected awf-orphan-containers-inner failure, got %#v", failures)
+			t.Fatalf("expected orphan-agentic-containers-inner failure, got %#v", failures)
 		}
 		if f.Severity != SeverityWarning {
 			t.Errorf("Severity = %q, want warning", f.Severity)
@@ -112,84 +103,78 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 		if !strings.Contains(f.Remediation, "docker rm -f") {
 			t.Errorf("Remediation should pipeline cleanup, got %q", f.Remediation)
 		}
-		if len(failures) != 1 {
-			t.Errorf("expected 1 failure, got %d (%#v)", len(failures), failures)
-		}
-	})
-
-	t.Run("stale DOCKER-USER rules in inner netns returns inner warning", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				innerAwfCmd:      "",
-				innerIptablesCmd: "1  DROP  all  --  172.30.0.5  anywhere",
-				innerMcpgCmd:     "",
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateAWFHygieneInner(h, outerContainer)
-		f := failureByName(t, failures, "stale-docker-user-rules-inner")
-		if f.Name == "" {
-			t.Fatalf("expected stale-docker-user-rules-inner failure, got %#v", failures)
-		}
-		if !strings.Contains(f.Message, "inner netns") {
-			t.Errorf("Message should mention inner netns, got %q", f.Message)
-		}
-		if !strings.Contains(f.Remediation, "docker exec "+outerContainer+" iptables -F DOCKER-USER") {
-			t.Errorf("Remediation should flush via docker exec %s, got %q", outerContainer, f.Remediation)
+		if !strings.Contains(f.Remediation, "awmg-mcpg") {
+			t.Errorf("Remediation should filter the rootless-era gateway names, got %q", f.Remediation)
 		}
 		if len(failures) != 1 {
 			t.Errorf("expected 1 failure, got %d (%#v)", len(failures), failures)
 		}
 	})
 
-	t.Run("orphan MCP gateway inside container returns inner warning", func(t *testing.T) {
+	t.Run("orphan awf-net network returns inner warning", func(t *testing.T) {
 		t.Parallel()
 		exec := &prereqTestExecutor{
 			response: map[string]string{
-				innerAwfCmd:      "",
-				innerIptablesCmd: "",
-				innerMcpgCmd:     "gh-aw-mcpg-1",
+				innerOrphansCmd:  "",
+				innerNetworksCmd: "awf-net-old",
 			},
 		}
 		h := host.NewHost("h", config.HostConfig{OS: "linux"})
 		h.SetConn(exec)
 		failures := ValidateAWFHygieneInner(h, outerContainer)
-		f := failureByName(t, failures, "mcpg-orphan-containers-inner")
+		f := failureByName(t, failures, "orphan-agentic-networks-inner")
 		if f.Name == "" {
-			t.Fatalf("expected mcpg-orphan-containers-inner failure, got %#v", failures)
+			t.Fatalf("expected orphan-agentic-networks-inner failure, got %#v", failures)
+		}
+		if f.Severity != SeverityWarning {
+			t.Errorf("Severity = %q, want warning", f.Severity)
+		}
+		if !strings.Contains(f.Message, "awf-net") {
+			t.Errorf("Message should mention awf-net, got %q", f.Message)
 		}
 		if !strings.Contains(f.Message, outerContainer) {
 			t.Errorf("Message should name the runner container, got %q", f.Message)
 		}
-		if !strings.Contains(f.Remediation, "docker exec -it "+outerContainer) {
-			t.Errorf("Remediation should show docker exec -it entrypoint, got %q", f.Remediation)
+		if !strings.Contains(f.Remediation, `docker network prune -f --filter "name=awf-net"`) {
+			t.Errorf("Remediation should prune the leftover networks, got %q", f.Remediation)
 		}
 		if len(failures) != 1 {
 			t.Errorf("expected 1 failure, got %d (%#v)", len(failures), failures)
 		}
 	})
 
-	t.Run("all three inner probes fail returns three inner warnings", func(t *testing.T) {
+	t.Run("no iptables probe in the rootless era", func(t *testing.T) {
+		t.Parallel()
+		// stale-docker-user-rules was retired with the sudo/iptables sandbox:
+		// rootless AWF never touches iptables, so no probe may reference it.
+		exec := &prereqTestExecutor{response: map[string]string{}}
+		h := host.NewHost("h", config.HostConfig{OS: "linux"})
+		h.SetConn(exec)
+		_ = ValidateAWFHygieneInner(h, outerContainer)
+		for _, seen := range exec.seen {
+			if strings.Contains(seen, "iptables") {
+				t.Errorf("hygiene probe must not reference iptables (rootless era), got %q", seen)
+			}
+		}
+	})
+
+	t.Run("both inner probes fail returns two inner warnings", func(t *testing.T) {
 		t.Parallel()
 		exec := &prereqTestExecutor{
 			response: map[string]string{
-				innerAwfCmd:      "awf-c1",
-				innerIptablesCmd: "1  DROP",
-				innerMcpgCmd:     "gh-aw-mcpg-1",
+				innerOrphansCmd:  "awf-c1",
+				innerNetworksCmd: "awf-net-old",
 			},
 		}
 		h := host.NewHost("h", config.HostConfig{OS: "linux"})
 		h.SetConn(exec)
 		failures := ValidateAWFHygieneInner(h, outerContainer)
-		if len(failures) != 3 {
-			t.Fatalf("expected 3 inner failures, got %d (%#v)", len(failures), failures)
+		if len(failures) != 2 {
+			t.Fatalf("expected 2 inner failures, got %d (%#v)", len(failures), failures)
 		}
 		for _, want := range []string{
-			"awf-orphan-containers-inner",
-			"stale-docker-user-rules-inner",
-			"mcpg-orphan-containers-inner",
+			"orphan-agentic-containers-inner",
+			"orphan-agentic-networks-inner",
 		} {
 			f := failureByName(t, failures, want)
 			if f.Name == "" {
@@ -215,7 +200,7 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 		h := host.NewHost("h", config.HostConfig{OS: "linux"})
 		h.SetConn(exec)
 		_ = ValidateAWFHygieneInner(h, weirdName)
-		// Verify all three commands were prefixed with `docker exec "..." `.
+		// Verify both commands were prefixed with `docker exec "..." `.
 		// strconv.Quote("name\"with$special") = `"name\"with$special"`.
 		const expectedPrefix = `docker exec "name\"with$special" `
 		count := 0
@@ -224,8 +209,8 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 				count++
 			}
 		}
-		if count != 3 {
-			t.Errorf("expected 3 commands prefixed with %q, got %d (seen=%v)", expectedPrefix, count, exec.seen)
+		if count != 2 {
+			t.Errorf("expected 2 commands prefixed with %q, got %d (seen=%v)", expectedPrefix, count, exec.seen)
 		}
 	})
 }

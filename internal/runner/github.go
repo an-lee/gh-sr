@@ -1,10 +1,13 @@
 package runner
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -182,6 +185,70 @@ func (g *GitHubClient) DeleteRunnerScoped(scope, target string, runnerID int64) 
 		return fmt.Errorf("delete runner %d: HTTP %d: %s", runnerID, resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// LockWorkflow is one compiled gh-aw workflow file (*.lock.yml) fetched from a
+// repository's .github/workflows directory.
+type LockWorkflow struct {
+	Name    string
+	Content string
+}
+
+type contentsEntry struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type contentsFile struct {
+	Name     string `json:"name"`
+	Content  string `json:"content"`
+	Encoding string `json:"encoding"`
+}
+
+// ListLockWorkflows returns up to limit *.lock.yml files from the repo's
+// .github/workflows directory (alphabetical order, truncated at limit).
+func (g *GitHubClient) ListLockWorkflows(repo string, limit int) ([]LockWorkflow, error) {
+	listURL := fmt.Sprintf("%s/repos/%s/contents/.github/workflows", g.apiBase, repo)
+	body, err := g.get(listURL)
+	if err != nil {
+		return nil, fmt.Errorf("listing .github/workflows for %s: %w", repo, err)
+	}
+	var entries []contentsEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, fmt.Errorf("parsing workflows listing for %s: %w", repo, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Type == "file" && strings.HasSuffix(e.Name, ".lock.yml") {
+			names = append(names, e.Name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) > limit {
+		names = names[:limit]
+	}
+	out := make([]LockWorkflow, 0, len(names))
+	for _, name := range names {
+		fileURL := fmt.Sprintf("%s/repos/%s/contents/.github/workflows/%s", g.apiBase, repo, url.PathEscape(name))
+		fb, err := g.get(fileURL)
+		if err != nil {
+			return nil, fmt.Errorf("fetching %s in %s: %w", name, repo, err)
+		}
+		var f contentsFile
+		if err := json.Unmarshal(fb, &f); err != nil {
+			return nil, fmt.Errorf("parsing %s in %s: %w", name, repo, err)
+		}
+		content := f.Content
+		if f.Encoding == "base64" {
+			dec, derr := base64.StdEncoding.DecodeString(strings.ReplaceAll(content, "\n", ""))
+			if derr != nil {
+				return nil, fmt.Errorf("decoding %s in %s: %w", name, repo, derr)
+			}
+			content = string(dec)
+		}
+		out = append(out, LockWorkflow{Name: name, Content: content})
+	}
+	return out, nil
 }
 
 func (g *GitHubClient) GetLatestRunnerVersion() (string, error) {
