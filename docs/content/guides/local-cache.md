@@ -18,7 +18,7 @@ The whole `cache:` section is optional; a per-host server is deployed automatica
 ```yaml
 cache:
   enabled: true                    # default true; set false to keep using GitHub's cache service
-  port: 3000                       # host-side published port
+  port: 27420                      # host-side published port (built-in default; override on collision)
   bind_addr: 172.17.0.1            # empty = docker0 gateway IP (recommended); 0.0.0.0 = all interfaces
   storage_path: ~/.gh-sr/cache     # host directory for cached data ($HOME expansion supported)
   retention_days: 90               # 0 = server default (90)
@@ -61,6 +61,6 @@ gh sr cache remove --purge-data  # also delete the storage directory
 
 ## How a restore hits the server
 
-1. Runner starts; the entrypoint writes `CUSTOM_ACTIONS_RESULTS_URL=http://<gateway>:3000/` into the runner `.env` (only when the cache is enabled and a URL resolves).
+1. Runner starts; the entrypoint writes `CUSTOM_ACTIONS_RESULTS_URL=http://<gateway>:27420/` into the runner `.env` (only when the cache is enabled and a URL resolves).
 2. The fork runner propagates it to `actions/cache` (node) and cache hook steps.
 3. Restore/save requests go to the local server; everything else flows through to GitHub unchanged.

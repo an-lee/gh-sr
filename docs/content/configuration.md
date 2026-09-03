@@ -135,7 +135,7 @@ Optional section tuning the [local Actions cache server](guides/local-cache.md) 
 | Field | Meaning |
 |---|---|
 | `cache.enabled` | Deploy and wire the local cache server (default **`true`**). `false` keeps GitHub's cache service. |
-| `cache.port` | Host-side published port (default **3000**). |
+| `cache.port` | Host-side published port (default **27420** — fixed and uncommon so it does not collide with dev services or the ephemeral range). |
 | `cache.bind_addr` | Host address the server binds to. Empty = the **docker0 gateway IP** (containers only); `0.0.0.0` exposes the cache API on all interfaces (doctor warns). |
 | `cache.storage_path` | Host directory for cached data (`$HOME/...` allowed; default `~/.gh-sr/cache`). |
 | `cache.retention_days` | Drop entries older than N days (0 = server default 90). |

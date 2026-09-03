@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -68,12 +69,12 @@ func TestRunnerURL_precedence(t *testing.T) {
 
 	// 0.0.0.0 is not injectable; fall through to the docker0 gateway.
 	s = Settings{Enabled: true, BindAddr: "0.0.0.0"}
-	if got := s.RunnerURL(h); got != "http://172.17.0.1:3000/" {
+	if got := s.RunnerURL(h); got != fmt.Sprintf("http://172.17.0.1:%d/", DefaultPort) {
 		t.Errorf("0.0.0.0 bind + gateway: got %q", got)
 	}
 
 	s = Settings{Enabled: true}
-	if got := s.RunnerURL(h); got != "http://172.17.0.1:3000/" {
+	if got := s.RunnerURL(h); got != fmt.Sprintf("http://172.17.0.1:%d/", DefaultPort) {
 		t.Errorf("auto bind: got %q", got)
 	}
 
@@ -187,9 +188,9 @@ func TestEnsure_missingDeploys(t *testing.T) {
 	for _, want := range []string{
 		"docker run -d --name gh-sr-cache",
 		"--restart unless-stopped",
-		"-p 172.17.0.1:3000:3000",
+		fmt.Sprintf("-p 172.17.0.1:%d:%d", DefaultPort, ContainerPort),
 		"-v '/root/.gh-sr/cache':/data",
-		"-e 'API_BASE_URL=http://172.17.0.1:3000'",
+		fmt.Sprintf("-e 'API_BASE_URL=http://172.17.0.1:%d'", DefaultPort),
 		"-e 'STORAGE_DRIVER=filesystem'",
 		"-e 'STORAGE_FILESYSTEM_PATH=/data/cache'",
 		"-e 'DB_DRIVER=sqlite'",
@@ -257,7 +258,7 @@ func TestDeploy_bindFallbackWarns(t *testing.T) {
 	}
 	found := false
 	for _, c := range mock.Calls {
-		if strings.Contains(c, "-p 0.0.0.0:3000:3000") {
+		if strings.Contains(c, fmt.Sprintf("-p 0.0.0.0:%d:%d", DefaultPort, ContainerPort)) {
 			found = true
 		}
 	}
@@ -372,7 +373,7 @@ func TestPrune_success(t *testing.T) {
 	for _, c := range mock.Calls {
 		if strings.Contains(c, "curl") {
 			if !strings.Contains(c, "X-Api-Key: k1") || !strings.Contains(c, "-X DELETE") ||
-				!strings.Contains(c, "'http://172.17.0.1:3000'/management-api/cache-entries/") {
+				!strings.Contains(c, fmt.Sprintf("'http://172.17.0.1:%d'/management-api/cache-entries/", DefaultPort)) {
 				t.Errorf("unexpected prune request: %q", c)
 			}
 		}

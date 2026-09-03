@@ -36,7 +36,8 @@ type CacheConfig struct {
 	// Enabled defaults to true: a `cache:` section is only needed to tune or
 	// disable (enabled: false). Set explicitly on Load (applyDefaults).
 	Enabled *bool `yaml:"enabled,omitempty"`
-	// Port is the host-side port the server publishes on (0 = default 3000).
+	// Port is the host-side port the server publishes on (0 = built-in
+	// default 27420).
 	Port int `yaml:"port,omitempty"`
 	// BindAddr is the host address the server binds to. Empty = the docker0
 	// gateway IP (reachable from runner containers only); 0.0.0.0 exposes the

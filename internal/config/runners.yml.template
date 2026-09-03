@@ -22,7 +22,7 @@
 #
 # cache:
 #   enabled: true                     # default true on Linux hosts; set false to opt out
-#   port: 3000                        # host port for the cache API
+#   port: 27420                       # host port for the cache API (built-in default; override on collision)
 #   # bind_addr: 172.17.0.1           # default: docker0 gateway IP (containers can reach it;
 #   #                                 # 0.0.0.0 works but exposes the API to your LAN)
 #   # storage_path: ~/.gh-sr/cache    # persistent cache data on the host

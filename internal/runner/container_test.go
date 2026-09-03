@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -520,7 +521,7 @@ func TestCacheURLEnvFor(t *testing.T) {
 		t.Fatalf("disabled settings: got %q", got)
 	}
 	got := cacheURLEnvFor(h, &cache.Settings{Enabled: true})
-	if got != cacheURLDockerCreateArg("http://172.17.0.1:3000/") {
+	if got != cacheURLDockerCreateArg(fmt.Sprintf("http://172.17.0.1:%d/", cache.DefaultPort)) {
 		t.Fatalf("enabled settings: got %q", got)
 	}
 }

@@ -25,8 +25,11 @@ const (
 	// ContainerPort is the port the server listens on inside the container
 	// (Nitro default; the image exposes no port-configuration env).
 	ContainerPort = 3000
-	// DefaultPort is the host-side port when cache.port is unset.
-	DefaultPort = 3000
+	// DefaultPort is the host-side published port when cache.port is unset.
+	// Fixed and uncommon: below the Linux ephemeral range (32768-60999) so
+	// transient outbound connections never claim it, and away from frequent
+	// dev-service ports like 3000/8080, which hosts often have bound already.
+	DefaultPort = 27420
 	// DefaultStoragePath is the host-side storage dir (relative to $HOME) when
 	// cache.storage_path is unset.
 	DefaultStoragePath = "$HOME/.gh-sr/cache"
