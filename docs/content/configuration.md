@@ -136,14 +136,14 @@ Optional section tuning the [local Actions cache server](guides/local-cache.md) 
 |---|---|
 | `cache.enabled` | Deploy and wire the local cache server (default **`true`**). `false` keeps GitHub's cache service. |
 | `cache.port` | Host-side published port (default **27420** — fixed and uncommon so it does not collide with dev services or the ephemeral range). |
-| `cache.bind_addr` | Host address the server binds to. Empty = the **docker0 gateway IP** (containers only); `0.0.0.0` exposes the cache API on all interfaces (doctor warns). |
+| `cache.bind_addr` | Host-side published-port bind only (used by `gh sr cache status`/`prune`, not by runner traffic). Empty = the **docker0 gateway IP**; `0.0.0.0` exposes the cache API on all host interfaces (doctor warns). |
 | `cache.storage_path` | Host directory for cached data (`$HOME/...` allowed; default `~/.gh-sr/cache`). |
 | `cache.retention_days` | Drop entries older than N days (0 = server default 90). |
 | `cache.max_size_bytes` | Cap total cache size in bytes (0 = unbounded). |
 | `cache.max_usage_percent` | Evict when filesystem usage exceeds N percent (0 = server default 90). |
 | `cache.image` | Cache-server image override (default `ghcr.io/falcondev-oss/github-actions-cache-server:latest`; pin a digest for reproducible deploys). |
 | `cache.management_api_key` | Management API key for `gh sr cache prune` (supports `env:VAR` refs). Empty = auto-generate and persist one in the storage dir. |
-| `cache.url_override` | Replace the runner-facing cache URL verbatim (must include the scheme) — escape hatch for non-docker0 topologies. |
+| `cache.url_override` | Replace the runner-facing cache URL verbatim (must include the scheme) — escape hatch for exotic topologies. |
 
 **Unique runner names per registration scope:** GitHub registers each self-hosted runner by its **instance** name (`name-1`, `name-2`, …). That name must be **unique within the registration scope** — within a given `owner/repo` for repo-scoped runners, or **org-wide** for org-scoped runners. If two machines use the same base `name` and `count: 1` in the same scope, both try to register as `name-1` and only one registration remains active. Prefer distinct base names (for example `myapp-win` vs `myapp-linux`, or `myorg-ci` vs `myorg-gpu`) so every machine has its own GitHub runner record and `gh sr status` matches the right row.
 

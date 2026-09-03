@@ -374,7 +374,7 @@ func runHostChecks(w io.Writer, hostName string, h *host.Host, runners []config.
 			if hasContainerAgenticRunners(hostRunners) {
 				checkContainerAgenticInnerHygiene(w, hostName, h, runners, r, cacheEnabled)
 			}
-			checkCacheReachability(w, hostName, h, cacheSet, r)
+			checkCacheReachability(w, hostName, h, hostRunners, cacheSet, r)
 		}
 	}
 	if h.OS == "linux" || h.OS == "darwin" || h.OS == "windows" {
@@ -615,9 +615,10 @@ func cacheGateSummary(cacheEnabled bool) string {
 }
 
 // checkCacheReachability verifies the per-host local cache server is deployed,
-// healthy, and not needlessly exposed. Skipped entirely when the cache is
+// healthy from the host, and — probed from inside a container-mode runner —
+// actually reachable where it matters. Skipped entirely when the cache is
 // disabled (runners then use GitHub's cache service).
-func checkCacheReachability(w io.Writer, hostName string, h *host.Host, s *cache.Settings, r *Result) {
+func checkCacheReachability(w io.Writer, hostName string, h *host.Host, hostRunners []config.RunnerConfig, s *cache.Settings, r *Result) {
 	if s == nil {
 		return
 	}
@@ -642,11 +643,49 @@ func checkCacheReachability(w io.Writer, hostName string, h *host.Host, s *cache
 		return
 	}
 	printLine(w, sevOK, hostName, fmt.Sprintf("cache: healthy at %s (storage %s)", info.URL, info.StoragePath))
+	probeCacheFromRunner(w, hostName, h, hostRunners, r)
 
 	// A 0.0.0.0 bind means the cache API answers on every host interface.
 	if effectiveBind(s, h) == "0.0.0.0" {
 		printLine(w, sevWarn, hostName, "cache: bound to 0.0.0.0 — the cache API is reachable from your LAN; set cache.bind_addr (e.g. the docker0 gateway IP) in runners.yml")
 		r.Warn++
+	}
+}
+
+// probeCacheFromRunner curls the cache health endpoint from inside the first
+// container-mode runner instance on the host. The host reaches the cache
+// through the published port even when the runner path is broken — a host
+// INPUT firewall (ufw default-deny blocks the container→host-port route) or a
+// runner container created before the dedicated cache network existed — which
+// is exactly the silent blackhole that times out every upload-artifact and
+// actions/cache step while the host-side check stays green. The inner command
+// echoes PROBE_FAIL instead of failing so "curl cannot connect" is
+// distinguishable from "container not running" (the latter is already
+// reported by the runner checks and only warns here).
+func probeCacheFromRunner(w io.Writer, hostName string, h *host.Host, hostRunners []config.RunnerConfig, r *Result) {
+	inst := ""
+	for i := range hostRunners {
+		if hostRunners[i].IsContainerMode() && len(hostRunners[i].InstanceNames()) > 0 {
+			inst = hostRunners[i].InstanceNames()[0]
+			break
+		}
+	}
+	if inst == "" {
+		return
+	}
+	cname := runner.ContainerDockerName(inst)
+	out, err := h.Run(fmt.Sprintf(
+		"docker exec %s sh -c 'curl -fsS -m 5 http://%s:%d/health || echo PROBE_FAIL' 2>/dev/null",
+		runner.QuoteContainerName(cname), cache.ContainerIP, cache.ContainerPort))
+	switch {
+	case err != nil:
+		printLine(w, sevWarn, hostName, fmt.Sprintf("cache: could not probe from runner container %s: %v", cname, err))
+		r.Warn++
+	case strings.Contains(strings.TrimSpace(out), "PROBE_FAIL"):
+		printLine(w, sevFail, hostName, fmt.Sprintf("cache: not reachable from runner container %s at http://%s:%d/ (host-side health is fine); run: gh sr cache deploy && gh sr rebuild %s", cname, cache.ContainerIP, cache.ContainerPort, inst))
+		r.Fail++
+	default:
+		printLine(w, sevOK, hostName, fmt.Sprintf("cache: reachable from runner container %s at http://%s:%d/", cname, cache.ContainerIP, cache.ContainerPort))
 	}
 }
 

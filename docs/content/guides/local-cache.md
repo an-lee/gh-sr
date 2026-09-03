@@ -9,7 +9,8 @@ The server is [falcondev-oss/github-actions-cache-server](https://github.com/fal
 - **One `gh-sr-cache` container per Linux host**, shared by all container-mode runners on that host.
 - **Wiring**: the runner container receives `CUSTOM_ACTIONS_RESULTS_URL` pointing at the local server. The runner binary must come from the [falcondev fork image](https://github.com/falcondev-oss/actions-runner) — which is exactly the base gh-sr's runner image is built from — because the stock runner overrides the env var with the job message's `ACTIONS_RESULTS_URL` and silently falls back to GitHub.
 - **Artifacts are unaffected**: `upload-artifact` / `download-artifact` and other non-cache ACTIONS_RESULTS requests are proxied through the cache server back to GitHub (`DEFAULT_ACTIONS_RESULTS_URL`), so cross-host safe-outputs keep working.
-- **Binding**: the server publishes on the **docker0 gateway IP** (auto-detected, typically `172.17.0.1`) so only containers on the host can reach it — not your LAN. Without a docker0 interface it falls back to `0.0.0.0` and `gh sr doctor` warns about the exposure.
+- **Dedicated network**: the cache container and every container-mode runner join the `gh-sr` docker bridge network (subnet `10.66.0.0/24`, fixed cache IP `10.66.0.254`). Runners talk to the cache container-to-container at `http://10.66.0.254:3000/` — a path Docker's own FORWARD rules accept, deliberately not routed through a host-published port, which host firewalls (e.g. ufw's default-deny INPUT) silently block.
+- **Host-side port**: the server also publishes on the **docker0 gateway IP** (auto-detected, typically `172.17.0.1:27420`) so `gh sr cache status` / `prune` and the host-side doctor check work — it is not on the runner traffic path. Without a docker0 interface it falls back to `0.0.0.0` and `gh sr doctor` warns about the exposure.
 
 ## Configuration (runners.yml)
 
@@ -19,7 +20,7 @@ The whole `cache:` section is optional; a per-host server is deployed automatica
 cache:
   enabled: true                    # default true; set false to keep using GitHub's cache service
   port: 27420                      # host-side published port (built-in default; override on collision)
-  bind_addr: 172.17.0.1            # empty = docker0 gateway IP (recommended); 0.0.0.0 = all interfaces
+  bind_addr: 172.17.0.1            # host-side published-port bind only; empty = docker0 gateway IP; 0.0.0.0 = all interfaces
   storage_path: ~/.gh-sr/cache     # host directory for cached data ($HOME expansion supported)
   retention_days: 90               # 0 = server default (90)
   max_size_bytes: 0                # 0 = unbounded
@@ -51,9 +52,10 @@ gh sr cache remove --purge-data  # also delete the storage directory
 `gh sr doctor` (on hosts with container-mode runners) verifies the cache when enabled:
 
 - **FAIL** — the container exists but `/health` is not healthy: check `docker logs gh-sr-cache`;
+- **FAIL** — the host-side health is fine but the URL is **not reachable from a runner container** (the failure mode behind timeouts on every `upload-artifact` / `actions/cache` step): run `gh sr cache deploy && gh sr rebuild <instance>`;
 - **WARN** — enabled but not deployed: run `gh sr cache deploy`;
 - **WARN** — bound to `0.0.0.0`: the cache API answers on every host interface; set `cache.bind_addr` (e.g. the docker0 gateway IP);
-- OK — healthy at the resolved URL, with the storage path reported.
+- OK — healthy at the runner-facing URL, plus a per-runner reachability probe result.
 
 `gh sr doctor` also reports `container-cache-env` on agentic instances whose runner `.env` is missing `CUSTOM_ACTIONS_RESULTS_URL` (fix with `gh sr up <name>` after deploying the cache).
 
@@ -61,6 +63,6 @@ gh sr cache remove --purge-data  # also delete the storage directory
 
 ## How a restore hits the server
 
-1. Runner starts; the entrypoint writes `CUSTOM_ACTIONS_RESULTS_URL=http://<gateway>:27420/` into the runner `.env` (only when the cache is enabled and a URL resolves).
+1. Runner starts; the entrypoint writes `CUSTOM_ACTIONS_RESULTS_URL=http://10.66.0.254:3000/` into the runner `.env` (only when the cache is enabled).
 2. The fork runner propagates it to `actions/cache` (node) and cache hook steps.
-3. Restore/save requests go to the local server; everything else flows through to GitHub unchanged.
+3. Restore/save requests go to the local server over the dedicated `gh-sr` docker network; everything else flows through to GitHub unchanged.

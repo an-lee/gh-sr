@@ -495,10 +495,24 @@ func cacheURLDockerCreateArg(url string) string {
 	return "  -e GH_SR_CACHE_URL=" + hostshell.PosixSingleQuote(url) + " \\\n"
 }
 
+// runnerNetworkDockerCreateArg returns the `--network <cache net>` fragment
+// for the `docker create` command when the per-host cache is enabled, or ""
+// otherwise. Runner containers must join the cache's dedicated bridge so
+// results-API traffic reaches the cache container directly (a path Docker's
+// FORWARD rules accept regardless of the host INPUT firewall). The network is
+// guaranteed to exist by then: every container-mode ops flow runs cache Ensure
+// before creating containers.
+func runnerNetworkDockerCreateArg(s *cache.Settings) string {
+	if s == nil || !s.Enabled {
+		return ""
+	}
+	return "  --network " + cache.NetworkName
+}
+
 // cacheURLEnvFor resolves the per-host cache URL and returns the docker-create
-// env line for it ("" when the cache is disabled or no container-reachable
-// address exists — e.g. no docker0 gateway). The deploy-side Ensure already
-// warns about the fallback bind in that case.
+// env line for it ("" when the cache is disabled). The URL is the cache
+// container's fixed address on the dedicated gh-sr network; the deploy-side
+// Ensure has already created the network and container by this point.
 func cacheURLEnvFor(h *host.Host, s *cache.Settings) string {
 	if s == nil || !s.Enabled {
 		return ""
@@ -625,6 +639,7 @@ func (m *Manager) createContainerInstance(h *host.Host, rc config.RunnerConfig, 
 	dockerdTimeoutEnv := dockerdStartTimeoutDockerCreateArg(m.containerDockerdStartTimeout())
 	bootstrapRetriesEnv := bootstrapMaxRetriesDockerCreateArg(m.containerBootstrapMaxRetries())
 	cacheURLEnv := cacheURLEnvFor(h, m.Cache)
+	networkArg := runnerNetworkDockerCreateArg(m.Cache)
 	restartPolicy := containerRestartPolicy()
 
 	// Build the `docker create` command. We use `--restart unless-stopped` so any
@@ -643,6 +658,7 @@ docker create \
   --privileged \
   --shm-size=2g \
   --restart %s \
+%s \
   -v %s:/runner-state \
   -e GH_SR_RUNNER_NAME=%s \
   -e GH_SR_RUNNER_TOKEN=%s \
@@ -654,6 +670,7 @@ docker create \
 		hostshell.PosixSingleQuote(stateDir),
 		hostshell.PosixSingleQuote(containerName(instanceName)),
 		hostshell.PosixSingleQuote(restartPolicy),
+		networkArg,
 		hostshell.PosixSingleQuote(stateDir),
 		hostshell.PosixSingleQuote(instanceName),
 		hostshell.PosixSingleQuote(regToken),
