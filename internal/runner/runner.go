@@ -24,6 +24,14 @@ type Manager struct {
 	// ContainerImageExtraApt is global extra apt packages for the gh-sr/agentic-runner
 	// image (from runners.yml container_runner_image). Set by ops before container setup.
 	ContainerImageExtraApt []string
+	// ContainerImageBaseImage is the base (fork) runner image the gh-sr/agentic-runner
+	// image derives FROM (from runners.yml container_runner_image.base_image). Empty
+	// means the DefaultForkRunnerImage constant; see containerImageBaseImage().
+	ContainerImageBaseImage string
+	// CacheURL is the local Actions cache server base URL (trailing slash) injected
+	// into container runners as CUSTOM_ACTIONS_RESULTS_URL. Empty = use GitHub's
+	// cache service. Set by ops from the cache section of runners.yml.
+	CacheURL string
 	// ContainerMTU, when > 0, forces the inner/outer Docker MTU for container-mode runners
 	// (overriding host egress MTU auto-detection). From runners.yml
 	// container_runner_image.mtu; set by ops before container setup. 0 = auto-detect.
@@ -79,6 +87,16 @@ func (m *Manager) containerImageExtraApt() []string {
 		return nil
 	}
 	return m.ContainerImageExtraApt
+}
+
+// containerImageBaseImage returns the configured fork base image, defaulting to
+// DefaultForkRunnerImage when unset so Manager works in zero-config contexts
+// (tests, native-only hosts) without ops wiring.
+func (m *Manager) containerImageBaseImage() string {
+	if m == nil || m.ContainerImageBaseImage == "" {
+		return DefaultForkRunnerImage
+	}
+	return m.ContainerImageBaseImage
 }
 
 // containerMTU returns the configured MTU override for container runners (0 = auto-detect).
@@ -286,8 +304,8 @@ func (m *Manager) Status(h *host.Host, rc config.RunnerConfig) ([]RunnerStatus, 
 	// labels join, and the container-image layout revision all return the same
 	// result for every instance of a given RunnerConfig (effectiveLabelsCore
 	// ignores the instance index; ContainerImageLayoutRevision only depends on
-	// m.GhSrVersion + m.containerImageExtraApt, which are static during one
-	// Status() call). Computing them once outside the loop saves N-1
+	// m.GhSrVersion + m.containerImageBaseImage() + m.containerImageExtraApt(),
+	// which are static during one Status() call). Computing them once outside the loop saves N-1
 	// effectiveLabelsCore slice builds, N-1 strings.Join calls, and N-1
 	// ContainerImageLayoutRevision invocations per Status() invocation; for a
 	// Count=10 RunnerConfig that is 9 wasted slice headers + 9 wasted join
@@ -301,7 +319,7 @@ func (m *Manager) Status(h *host.Host, rc config.RunnerConfig) ([]RunnerStatus, 
 
 	var expectedLayoutRev string
 	if isContainer {
-		expectedLayoutRev = ContainerImageLayoutRevision(m.GhSrVersion, m.containerImageExtraApt())
+		expectedLayoutRev = ContainerImageLayoutRevision(m.GhSrVersion, m.containerImageBaseImage(), m.containerImageExtraApt())
 	}
 
 	names := rc.InstanceNames()

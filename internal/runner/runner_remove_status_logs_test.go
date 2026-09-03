@@ -249,18 +249,17 @@ func TestManagerStatus_nativeIteratesAllInstances(t *testing.T) {
 func TestManagerStatus_containerPopulatesImageAndBuild(t *testing.T) {
 	t.Parallel()
 
-	// Pin GhSrVersion + no extra apt so ContainerImageLayoutRevision is
-	// stable across the two instances (and we can assert the exact
+	// Pin GhSrVersion + default base + no extra apt so ContainerImageLayoutRevision
+	// is stable across the two instances (and we can assert the exact
 	// expected value). Compute it once before wiring the mock so the
 	// RunFn closure can drive instance 1 with the matching revision
 	// → "ok (<short>)".
 	m := &Manager{
-		GitHub:                 NewGitHubClient(""),
-		GhSrVersion:            "1.2.3",
-		ContainerImageExtraApt: nil,
-		Out:                    io.Discard,
+		GitHub:      NewGitHubClient(""),
+		GhSrVersion: "1.2.3",
+		Out:         io.Discard,
 	}
-	expected := ContainerImageLayoutRevision(m.GhSrVersion, m.containerImageExtraApt())
+	expected := ContainerImageLayoutRevision(m.GhSrVersion, m.containerImageBaseImage(), m.containerImageExtraApt())
 	mock := &testutil.MockExecutor{
 		RunFn: func(cmd string) (string, error) {
 			// containerLocalStatusOneShot runs its full pipeline as one

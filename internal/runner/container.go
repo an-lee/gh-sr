@@ -38,15 +38,18 @@ const (
 )
 
 // ContainerImageLayoutRevision returns a short hex fingerprint of the embedded
-// container image layout (Dockerfile, manifests, entrypoint, wrapper), gh-sr
-// CLI version, and extra apt package list. It changes when any of those inputs change.
-func ContainerImageLayoutRevision(ghSrVersion string, extraApt []string) string {
+// container image layout (Dockerfile, apt manifest, entrypoint, job hooks), the
+// fork base image ref, gh-sr CLI version, and extra apt package list. It changes
+// when any of those inputs change.
+func ContainerImageLayoutRevision(ghSrVersion, baseImage string, extraApt []string) string {
 	if ghSrVersion == "" {
 		ghSrVersion = "unknown"
 	}
 	var b strings.Builder
-	b.WriteString("gh-sr-container-image/v1\x00")
+	b.WriteString("gh-sr-container-image/v2\x00")
 	b.WriteString(ghSrVersion)
+	b.WriteByte(0)
+	b.WriteString(baseImage)
 	b.WriteByte(0)
 	for _, p := range containerRunnerImageExtraSorted(extraApt) {
 		b.WriteString(p)
@@ -55,9 +58,6 @@ func ContainerImageLayoutRevision(ghSrVersion string, extraApt []string) string 
 	b.WriteString(agenticRunnerDockerfile)
 	b.WriteString(agenticRunnerAptPackagesCore)
 	b.WriteString(agenticRunnerEntrypoint)
-	b.WriteString(agenticRunnerDockerWrapper)
-	b.WriteString(agenticRunnerDaemonJSON)
-	b.WriteString(agenticRunnerDnsmasqConf)
 	b.WriteString(agenticRunnerJobStartedHook)
 	b.WriteString(agenticRunnerJobCompletedHook)
 	sum := sha256.Sum256([]byte(b.String()))
@@ -84,9 +84,12 @@ func containerRunnerImageExtraSorted(extra []string) []string {
 }
 
 // ContainerRunnerImageTag returns the Docker image reference for the container runner
-// (e.g. gh-sr/agentic-runner:2.320.0 or gh-sr/agentic-runner:2.320.0-xa1b2c3d when extras are set).
-func ContainerRunnerImageTag(actionsRunnerVersion string, extraApt []string) string {
-	base := fmt.Sprintf("%s:%s", AgenticRunnerImageTag, actionsRunnerVersion)
+// built on top of baseImage (e.g. gh-sr/agentic-runner:2.337.0 or
+// gh-sr/agentic-runner:2.337.0-xa1b2c3d when extras are set). The local tag derives
+// from the base image's tag so a base_image bump in runners.yml produces a new local
+// tag and triggers a rebuild.
+func ContainerRunnerImageTag(baseImage string, extraApt []string) string {
+	base := fmt.Sprintf("%s:%s", AgenticRunnerImageTag, baseImageTag(baseImage))
 	sorted := containerRunnerImageExtraSorted(extraApt)
 	if len(sorted) == 0 {
 		return base
@@ -94,6 +97,29 @@ func ContainerRunnerImageTag(actionsRunnerVersion string, extraApt []string) str
 	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
 	suffix := hex.EncodeToString(sum[:])[:8]
 	return base + "-x" + suffix
+}
+
+// baseImageTag extracts the tag/digest portion of a container image reference for
+// use in the local image tag: the part after the last ':' that is not inside the
+// registry host (no ':' in the repo path means the ref is untagged → "latest"), or
+// a short digest marker for `repo@sha256:...` pins.
+func baseImageTag(baseImage string) string {
+	ref := baseImage
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		ref = ref[i+1:]
+	}
+	if i := strings.Index(ref, "@"); i >= 0 {
+		digest := ref[i+1:]
+		digest = strings.TrimPrefix(digest, "sha256:")
+		if len(digest) > 12 {
+			digest = digest[:12]
+		}
+		return "d" + digest
+	}
+	if i := strings.LastIndex(ref, ":"); i >= 0 {
+		return ref[i+1:]
+	}
+	return "latest"
 }
 
 // ContainerDockerName returns the deterministic Docker container name for a runner instance.
@@ -154,10 +180,10 @@ type ContainerReadinessReport struct {
 	// Only meaningful when State is "running" or "restarting"; false
 	// otherwise.
 	InnerDockerdOK bool
-	// Registered is true iff /home/runner/actions-runner/.runner is present
-	// inside the container (the actions runner has finished its config.sh
-	// step). Only meaningful when State is "running" or "restarting";
-	// false otherwise.
+	// Registered is true iff /home/runner/.runner is present inside the
+	// container (the actions runner has finished its config.sh step; the fork
+	// base image keeps the runner binaries directly in /home/runner). Only
+	// meaningful when State is "running" or "restarting"; false otherwise.
 	Registered bool
 }
 
@@ -228,7 +254,7 @@ func ProbeDinDContainerReadiness(h *host.Host, cname string) (ContainerReadiness
 	// unchanged: "dockerd-ok" sets InnerDockerdOK, "ok" sets Registered,
 	// and either token being absent leaves the corresponding bool false.
 	out, _ := h.Run(DockerExecCommand(cname, `sh -c 'docker info >/dev/null 2>&1 && echo dockerd-ok || echo no
-test -f /home/runner/actions-runner/.runner && echo ok || echo no'`))
+test -f /home/runner/.runner && echo ok || echo no'`))
 	for _, line := range strings.Split(out, "\n") {
 		switch strings.TrimSpace(line) {
 		case "dockerd-ok":
@@ -248,9 +274,9 @@ test -f /home/runner/actions-runner/.runner && echo ok || echo no'`))
 //     cache. It survives container restarts and per-job resets so jobs never re-pull
 //     gh-aw's (large) images. The per-job reset hooks never prune images/volumes.
 //   - PER-JOB scratch: the gh-aw runtime tree (/tmp/gh-aw, inside the container rootfs),
-//     leftover inner containers/networks, and AWF iptables rules are wiped before and
-//     after every job by /opt/gh-sr/hooks/job-{started,completed}.sh, so each job starts
-//     from a pristine inner environment.
+//     leftover inner containers/networks are wiped before and after every job by
+//     /opt/gh-sr/hooks/job-{started,completed}.sh, so each job starts from a pristine
+//     inner environment.
 func containerStateDir(h *host.Host, instanceName string) string {
 	return h.RunnerDir(instanceName)
 }
@@ -359,15 +385,15 @@ func (m *Manager) setupContainer(h *host.Host, rc config.RunnerConfig) error {
 		return fmt.Errorf("%s: ensuring host Docker: %w", rc.Name, err)
 	}
 
-	// Resolve runner version, host arch, and image tag.
-	version, arch, imageTag, err := m.resolveRunnerImageInputs(h)
+	// Resolve the fork base image and derived local tag.
+	baseImage, imageTag, err := m.resolveContainerImageInputs(h)
 	if err != nil {
 		return err
 	}
 
 	fmt.Fprintf(m.out(), "  %s: checking container runner image %s...\n", rc.Name, imageTag)
 
-	built, err := m.buildRunnerImageIfMissing(h, imageTag, version, arch, func() {
+	built, err := m.buildRunnerImageIfMissing(h, imageTag, baseImage, func() {
 		fmt.Fprintf(m.out(), "  %s: building container runner image (this may take several minutes)...\n", rc.Name)
 	})
 	if err != nil {
@@ -457,6 +483,17 @@ func dockerdStartTimeoutDockerCreateArg(seconds int) string {
 
 func bootstrapMaxRetriesDockerCreateArg(maxRetries int) string {
 	return dockerCreateEnvLineIf("GH_SR_BOOTSTRAP_MAX_RETRIES", maxRetries, maxRetries > 0)
+}
+
+// cacheURLDockerCreateArg returns the `-e GH_SR_CACHE_URL=<url>` line for the
+// `docker create` command when a per-host Actions cache server URL is configured,
+// or "" when the runner should send cache traffic to GitHub as usual. The
+// entrypoint forwards a non-empty value to the runner as CUSTOM_ACTIONS_RESULTS_URL.
+func cacheURLDockerCreateArg(url string) string {
+	if url == "" {
+		return ""
+	}
+	return "  -e GH_SR_CACHE_URL=" + hostshell.PosixSingleQuote(url) + " \\\n"
 }
 
 // containerRestartPolicy returns the Docker --restart policy used for every
@@ -577,6 +614,7 @@ func (m *Manager) createContainerInstance(h *host.Host, rc config.RunnerConfig, 
 	mtuEnv := mtuDockerCreateArg(m.resolveContainerMTU(h))
 	dockerdTimeoutEnv := dockerdStartTimeoutDockerCreateArg(m.containerDockerdStartTimeout())
 	bootstrapRetriesEnv := bootstrapMaxRetriesDockerCreateArg(m.containerBootstrapMaxRetries())
+	cacheURLEnv := cacheURLDockerCreateArg(m.CacheURL)
 	restartPolicy := containerRestartPolicy()
 
 	// Build the `docker create` command. We use `--restart unless-stopped` so any
@@ -602,7 +640,7 @@ docker create \
   -e GH_SR_RUNNER_LABELS=%s \
   -e GH_SR_RUNNER_GROUP=%s \
   -e GH_SR_RUNNER_EPHEMERAL=%s \
-%s%s%s  %s`,
+%s%s%s%s  %s`,
 		hostshell.PosixSingleQuote(stateDir),
 		hostshell.PosixSingleQuote(containerName(instanceName)),
 		hostshell.PosixSingleQuote(restartPolicy),
@@ -616,6 +654,7 @@ docker create \
 		mtuEnv,
 		dockerdTimeoutEnv,
 		bootstrapRetriesEnv,
+		cacheURLEnv,
 		hostshell.PosixSingleQuote(imageTag),
 	)
 
@@ -766,7 +805,7 @@ func (m *Manager) removeContainer(h *host.Host, rc config.RunnerConfig, instance
 	removeTok, err := m.GitHub.GetRemovalTokenScoped(rc.Scope(), rc.ScopeTarget())
 	if err == nil {
 		// Run inside the container if it's still alive; ignore errors.
-		inner := "su - runner -c " + hostshell.PosixSingleQuote("cd /home/runner/actions-runner && ./config.sh remove --token "+removeTok)
+		inner := "su - runner -c " + hostshell.PosixSingleQuote("cd /home/runner && ./config.sh remove --token "+removeTok)
 		_, _ = h.Run(DockerExecCommand(cName, inner+" 2>/dev/null || true"))
 	}
 
@@ -910,8 +949,8 @@ func (m *Manager) rebuildContainerImage(h *host.Host, rc config.RunnerConfig) er
 		))
 	}
 
-	// Resolve runner version, host arch, and image tag.
-	version, arch, imageTag, err := m.resolveRunnerImageInputs(h)
+	// Resolve the fork base image and derived local tag.
+	baseImage, imageTag, err := m.resolveContainerImageInputs(h)
 	if err != nil {
 		return err
 	}
@@ -924,7 +963,7 @@ func (m *Manager) rebuildContainerImage(h *host.Host, rc config.RunnerConfig) er
 	_, _ = h.Run(fmt.Sprintf("docker rmi -f %s 2>/dev/null || true", hostshell.PosixSingleQuote(imageTag)))
 
 	fmt.Fprintf(m.out(), "  %s: building container runner image %s (this may take several minutes)...\n", rc.Name, imageTag)
-	if err := buildAgenticRunnerImage(h, imageTag, version, arch, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
+	if err := buildAgenticRunnerImage(h, imageTag, baseImage, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
 		return fmt.Errorf("building container runner image: %w", err)
 	}
 	fmt.Fprintf(m.out(), "  %s: image built: %s\n", rc.Name, imageTag)
@@ -982,19 +1021,14 @@ func containerImageExists(h *host.Host, imageTag string) (bool, error) {
 	return ok, nil
 }
 
-// resolveRunnerImageInputs resolves the runner version, host arch, and image tag
-// for the container runner image. It collapses the version→arch→tag preamble that
-// was previously duplicated verbatim across setupContainer / rebuildContainerImage
-// / ContainerEnvironment.Provision (closes the triplication flagged by #228).
-// The GitHubClient caches the version response so repeat calls are cheap.
-func (m *Manager) resolveRunnerImageInputs(h *host.Host) (version, arch, imageTag string, err error) {
-	version, err = m.GitHub.GetLatestRunnerVersion()
-	if err != nil {
-		return "", "", "", fmt.Errorf("resolving runner version: %w", err)
-	}
-	arch = archForGitHub(h.Arch)
-	imageTag = ContainerRunnerImageTag(version, m.containerImageExtraApt())
-	return version, arch, imageTag, nil
+// resolveContainerImageInputs resolves the fork base image ref and the derived
+// local image tag for the container runner image. The runner version is baked
+// into the fork base image, so — unlike the old tarball-based build — no GitHub
+// API round-trip is needed here and the build works offline.
+func (m *Manager) resolveContainerImageInputs(h *host.Host) (baseImage, imageTag string, err error) {
+	baseImage = m.containerImageBaseImage()
+	imageTag = ContainerRunnerImageTag(baseImage, m.containerImageExtraApt())
+	return baseImage, imageTag, nil
 }
 
 // buildRunnerImageIfMissing checks whether the container runner image with the
@@ -1012,7 +1046,7 @@ func (m *Manager) resolveRunnerImageInputs(h *host.Host) (version, arch, imageTa
 // "building container runner image (this may take several minutes)..." heads-up
 // for a multi-minute build). Provision passes nil to stay silent, matching its
 // historical behavior.
-func (m *Manager) buildRunnerImageIfMissing(h *host.Host, imageTag, version, arch string, onBuild func()) (built bool, err error) {
+func (m *Manager) buildRunnerImageIfMissing(h *host.Host, imageTag, baseImage string, onBuild func()) (built bool, err error) {
 	exists, err := containerImageExists(h, imageTag)
 	if err != nil {
 		return false, fmt.Errorf("checking image: %w", err)
@@ -1023,7 +1057,7 @@ func (m *Manager) buildRunnerImageIfMissing(h *host.Host, imageTag, version, arc
 	if onBuild != nil {
 		onBuild()
 	}
-	if err := buildAgenticRunnerImage(h, imageTag, version, arch, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
+	if err := buildAgenticRunnerImage(h, imageTag, baseImage, m.GhSrVersion, m.containerImageExtraApt()); err != nil {
 		return false, fmt.Errorf("building container runner image: %w", err)
 	}
 	return true, nil
@@ -1038,12 +1072,13 @@ func embedTextForRemoteWrite(s string) string {
 	return strings.ReplaceAll(s, "GHSR_EOF", "GHSR_E0F")
 }
 
-// buildAgenticRunnerImage uploads the embedded Dockerfile+entrypoint to the host
-// and builds the image via `docker build`.
-func buildAgenticRunnerImage(h *host.Host, imageTag, runnerVersion, runnerArch, ghSrVersion string, extraApt []string) error {
+// buildAgenticRunnerImage uploads the embedded Dockerfile+entrypoint+hooks to the
+// host and builds the image via `docker build`, with baseImage (the fork runner
+// image ref) passed through as the FORK_RUNNER_IMAGE build-arg.
+func buildAgenticRunnerImage(h *host.Host, imageTag, baseImage, ghSrVersion string, extraApt []string) error {
 	buildDir := "/tmp/gh-sr-agentic-runner-build"
 
-	// Write the 8 build-context files via the shared helpers. writeRemoteHeredocFile
+	// Write the 6 build-context files via the shared helpers. writeRemoteHeredocFile
 	// creates the parent directory on the host, and writeRemoteHeredocExecutable
 	// additionally chmods the file +x — so each site collapses to a single call.
 	if err := writeRemoteHeredocFile(h, buildDir+"/Dockerfile", agenticRunnerDockerfile); err != nil {
@@ -1070,19 +1105,6 @@ func buildAgenticRunnerImage(h *host.Host, imageTag, runnerVersion, runnerArch, 
 	if err := writeRemoteHeredocExecutable(h, buildDir+"/entrypoint.sh", agenticRunnerEntrypoint); err != nil {
 		return err
 	}
-	if err := writeRemoteHeredocExecutable(h, buildDir+"/docker-wrapper.sh", agenticRunnerDockerWrapper); err != nil {
-		return err
-	}
-
-	// Write baked inner-Docker network configs (Pillar 2: deterministic DNS, single dockerd start).
-	for _, f := range []struct{ name, content string }{
-		{"daemon.json", agenticRunnerDaemonJSON},
-		{"dnsmasq-gh-sr.conf", agenticRunnerDnsmasqConf},
-	} {
-		if err := writeRemoteHeredocFile(h, buildDir+"/"+f.name, f.content); err != nil {
-			return err
-		}
-	}
 
 	// Write per-job reset hooks into the build context (Pillar 1). The helper mkdirs
 	// the parent of every path, so the explicit `mkdir -p buildDir/hooks` is gone.
@@ -1096,13 +1118,12 @@ func buildAgenticRunnerImage(h *host.Host, imageTag, runnerVersion, runnerArch, 
 	}
 
 	// Build (stamp labels so gh sr status can compare layout to this binary).
-	rev := ContainerImageLayoutRevision(ghSrVersion, extraApt)
+	rev := ContainerImageLayoutRevision(ghSrVersion, baseImage, extraApt)
 	labelRev := hostshell.PosixSingleQuote(dockerLabelImageRevision + "=" + rev)
 	labelCLI := hostshell.PosixSingleQuote(dockerLabelCLIVersion + "=" + ghSrVersion)
 	buildCmd := fmt.Sprintf(
-		"docker build --build-arg RUNNER_VERSION=%s --build-arg RUNNER_ARCH=%s --label %s --label %s -t %s %s",
-		hostshell.PosixSingleQuote(runnerVersion),
-		hostshell.PosixSingleQuote(runnerArch),
+		"docker build --build-arg FORK_RUNNER_IMAGE=%s --label %s --label %s -t %s %s",
+		hostshell.PosixSingleQuote(baseImage),
 		labelRev,
 		labelCLI,
 		hostshell.PosixSingleQuote(imageTag),

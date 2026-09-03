@@ -71,32 +71,6 @@ func envTestRig(t *testing.T, mock host.Executor, regTokStatus int) *ContainerEn
 	return m.NewContainerEnvironment(h, rc, 0, "aw-1")
 }
 
-// envTestRigVersionFail builds an env like envTestRig but forces the GitHub
-// version endpoint to return 500 so the resolveRunnerImageInputs failure
-// branch in Provision is exercised.
-func envTestRigVersionFail(t *testing.T, mock host.Executor) *ContainerEnvironment {
-	t.Helper()
-	ts := combinedGitHubStub(t, http.StatusInternalServerError, "", http.StatusOK, "reg")
-
-	h := host.NewHost("h", config.HostConfig{OS: "linux", Addr: "runner@vps", Arch: "amd64"})
-	h.SetConn(mock)
-
-	m := &Manager{
-		GitHub:      NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
-		GhSrVersion: "1.2.3",
-		Out:         io.Discard,
-	}
-	rc := config.RunnerConfig{
-		Name:       "aw",
-		Repo:       "o/r",
-		Host:       "h",
-		Count:      1,
-		Profile:    "agentic",
-		RunnerMode: config.RunnerModeContainer,
-	}
-	return m.NewContainerEnvironment(h, rc, 0, "aw-1")
-}
-
 // TestContainerEnvironmentProvision_nonLinuxReturnsError pins the early
 // guard: ContainerEnvironment.Provision refuses non-Linux hosts with a clear
 // "container is only supported on Linux hosts" message and does NOT shell
@@ -151,33 +125,6 @@ func TestContainerEnvironmentProvision_alreadyPresentShortCircuits(t *testing.T)
 	}
 	if probeOnly != 1 {
 		t.Errorf("probe calls = %d, want 1 (presence check only)", probeOnly)
-	}
-}
-
-// TestContainerEnvironmentProvision_propagatesVersionError pins the
-// resolveRunnerImageInputs failure branch: when the GitHub version API
-// returns 500, Provision must surface the wrapped error verbatim and stop
-// before any image-build or docker-create call.
-func TestContainerEnvironmentProvision_propagatesVersionError(t *testing.T) {
-	t.Parallel()
-
-	mock := &testutil.MockExecutor{
-		RunFn: func(cmd string) (string, error) {
-			if strings.Contains(cmd, "docker inspect --format=") {
-				return "no\n", nil
-			}
-			t.Errorf("Provision(version-error) must stop after resolveRunnerImageInputs, got: %s", cmd)
-			return "", nil
-		},
-	}
-	env := envTestRigVersionFail(t, mock)
-
-	err := env.Provision()
-	if err == nil {
-		t.Fatalf("Provision(version-error) = nil, want error")
-	}
-	if !strings.Contains(err.Error(), "resolving runner version") {
-		t.Errorf("Provision(version-error) must wrap with 'resolving runner version: %%w', got: %v", err)
 	}
 }
 

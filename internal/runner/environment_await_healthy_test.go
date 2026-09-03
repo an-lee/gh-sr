@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -54,17 +53,16 @@ func fakeHost(t *testing.T, mock host.Executor) *host.Host {
 	return h
 }
 
-// readinessMock returns a mock executor that recognises the readiness triad
+// readinessMock returns a mock executor that recognises the readiness signals
 // the production code probes for. stateAnswer drives the `docker inspect`
 // probe; the inner-dockerd + registered signals come from the same combined
-// `docker exec` script as production (echo dockerd-ok / echo ok). dnsErr
-// controls the agentic DNS gate (only triggered when state is ready AND
-// agentic=true).
+// `docker exec` script as production (echo dockerd-ok / echo ok).
 //
 // The returned mock also fails the test if the production code reaches a
 // command we did not anticipate — that catches regressions that emit extra
-// probes (e.g. an accidental per-iteration image inspect).
-func readinessMock(t *testing.T, stateAnswer, dockerd, registered string, dnsErr error) *testutil.MockExecutor {
+// probes (e.g. an accidental per-iteration image inspect or a resurrected
+// DNS gate).
+func readinessMock(t *testing.T, stateAnswer, dockerd, registered string) *testutil.MockExecutor {
 	t.Helper()
 	return &testutil.MockExecutor{
 		RunFn: func(cmd string) (string, error) {
@@ -73,15 +71,9 @@ func readinessMock(t *testing.T, stateAnswer, dockerd, registered string, dnsErr
 				return stateAnswer + "\n", nil
 			case strings.Contains(cmd, "docker exec") &&
 				strings.Contains(cmd, "docker info") &&
-				strings.Contains(cmd, "/home/runner/actions-runner/.runner"):
+				strings.Contains(cmd, "/home/runner/.runner"):
 				// ProbeDinDContainerReadiness's combined inner probe.
 				return dockerd + "\n" + registered + "\n", nil
-			case strings.Contains(cmd, "dig +short host.docker.internal"):
-				// innerHostDockerInternalReadyCommand's DNS gate (agentic only).
-				if dnsErr != nil {
-					return "", dnsErr
-				}
-				return "10.200.0.1\n", nil
 			default:
 				t.Errorf("readinessMock: unexpected command reached the host: %s", cmd)
 				return "", nil
@@ -93,18 +85,19 @@ func readinessMock(t *testing.T, stateAnswer, dockerd, registered string, dnsErr
 // TestContainerAwaitHealthy_returnsNilImmediatelyWhenReady pins the success
 // path: a single readiness probe reports running + dockerd-ok + registered,
 // so the loop must return nil on the FIRST iteration without sleeping or
-// re-probing.
+// re-probing (rootless gh-aw resolves host.docker.internal via its own
+// --add-host, so there is no extra DNS gate after the triad).
 func TestContainerAwaitHealthy_returnsNilImmediatelyWhenReady(t *testing.T) {
 	// Not t.Parallel(): this test mutates the package-level nowFn / sleepFn
 	// via installFakeClock. Parallel tests would race on those globals.
 
-	mock := readinessMock(t, "running", "dockerd-ok", "ok", nil)
+	mock := readinessMock(t, "running", "dockerd-ok", "ok")
 	h := fakeHost(t, mock)
 
 	start := time.Unix(1_700_000_000, 0)
 	fc := installFakeClock(t, start)
 
-	if err := containerAwaitHealthy(h, "aw-1", false, 30*time.Second); err != nil {
+	if err := containerAwaitHealthy(h, "aw-1", 30*time.Second); err != nil {
 		t.Fatalf("containerAwaitHealthy(ready) = %v, want nil", err)
 	}
 	// Sanity: the fake clock must not have advanced — the loop must have
@@ -114,66 +107,17 @@ func TestContainerAwaitHealthy_returnsNilImmediatelyWhenReady(t *testing.T) {
 	}
 }
 
-// TestContainerAwaitHealthy_nonAgenticSkipsDNSCheck pins the agentic=false
-// branch: even if the DNS probe would error, the loop must return nil on the
-// first readiness check without ever invoking h.Run for the dig command.
-// This is the contract that makes non-agentic container mode work without
-// the agentic DNS shim.
-func TestContainerAwaitHealthy_nonAgenticSkipsDNSCheck(t *testing.T) {
-	mock := readinessMock(t, "running", "dockerd-ok", "ok", errors.New("dns unreachable"))
-	h := fakeHost(t, mock)
-
-	start := time.Unix(1_700_000_000, 0)
-	installFakeClock(t, start)
-
-	if err := containerAwaitHealthy(h, "aw-1", false, 30*time.Second); err != nil {
-		t.Fatalf("containerAwaitHealthy(non-agentic) = %v, want nil", err)
-	}
-}
-
-// TestContainerAwaitHealthy_agenticDNSFailureExpiresDeadline pins the
-// agentic DNS gate: when state is ready but h.Run for the inner dig probe
-// fails, the loop must keep retrying (with the fake clock advancing past
-// deadline) and return the DNS gate message.
-//
-// Note: production does NOT wrap the underlying dns error — the gate
-// rewrites it as "host.docker.internal not resolving via baked DNS inside
-// <cname>" — so we assert the rewritten message, not errors.Is.
-func TestContainerAwaitHealthy_agenticDNSFailureExpiresDeadline(t *testing.T) {
-	dnsSentinel := errors.New("dns probe ssh failure")
-	mock := readinessMock(t, "running", "dockerd-ok", "ok", dnsSentinel)
-	h := fakeHost(t, mock)
-
-	start := time.Unix(1_700_000_000, 0)
-	fc := installFakeClock(t, start)
-
-	// timeout = 4s; the loop probes at T0, T0+2, T0+4 (the deadline check is
-	// not strictly-after at T0+4) and returns from the T0+6 probe, so the
-	// deadline branch is genuinely exercised rather than short-circuited.
-	err := containerAwaitHealthy(h, "aw-1", true, 4*time.Second)
-	if err == nil {
-		t.Fatalf("containerAwaitHealthy(agentic-dns-fail) = nil, want error")
-	}
-	if !strings.Contains(err.Error(), "host.docker.internal not resolving via baked DNS inside gh-sr-aw-1") {
-		t.Errorf("containerAwaitHealthy(agentic-dns-fail) must keep the DNS gate message, got: %v", err)
-	}
-	// Sanity: the fake clock must have advanced (loop must have actually iterated).
-	if !fc.now.After(start.Add(4 * time.Second)) {
-		t.Errorf("fake clock did not advance past deadline; loop may have short-circuited")
-	}
-}
-
 // TestContainerAwaitHealthy_innerDockerdNotRespondingExpiresDeadline pins
 // the readiness report's InnerDockerdOK=false branch: the loop must record
 // "inner dockerd not responding" as lastErr and surface it after deadline.
 func TestContainerAwaitHealthy_innerDockerdNotRespondingExpiresDeadline(t *testing.T) {
-	mock := readinessMock(t, "running", "no", "ok", nil)
+	mock := readinessMock(t, "running", "no", "ok")
 	h := fakeHost(t, mock)
 
 	start := time.Unix(1_700_000_000, 0)
 	installFakeClock(t, start)
 
-	err := containerAwaitHealthy(h, "aw-1", false, 4*time.Second)
+	err := containerAwaitHealthy(h, "aw-1", 4*time.Second)
 	if err == nil {
 		t.Fatalf("containerAwaitHealthy(no-dockerd) = nil, want error")
 	}
@@ -187,13 +131,13 @@ func TestContainerAwaitHealthy_innerDockerdNotRespondingExpiresDeadline(t *testi
 // yet registered" as lastErr and surface it after deadline. dockerd-ok is
 // still true so the InnerDockerdOK branch is bypassed.
 func TestContainerAwaitHealthy_notRegisteredExpiresDeadline(t *testing.T) {
-	mock := readinessMock(t, "running", "dockerd-ok", "no", nil)
+	mock := readinessMock(t, "running", "dockerd-ok", "no")
 	h := fakeHost(t, mock)
 
 	start := time.Unix(1_700_000_000, 0)
 	installFakeClock(t, start)
 
-	err := containerAwaitHealthy(h, "aw-1", false, 4*time.Second)
+	err := containerAwaitHealthy(h, "aw-1", 4*time.Second)
 	if err == nil {
 		t.Fatalf("containerAwaitHealthy(no-register) = nil, want error")
 	}
@@ -206,13 +150,13 @@ func TestContainerAwaitHealthy_notRegisteredExpiresDeadline(t *testing.T) {
 // "missing" state branch: when the docker inspect probe returns missing, the
 // loop must record "container <name> not found" and surface it after deadline.
 func TestContainerAwaitHealthy_missingContainerExpiresDeadline(t *testing.T) {
-	mock := readinessMock(t, "missing", "", "", nil)
+	mock := readinessMock(t, "missing", "", "")
 	h := fakeHost(t, mock)
 
 	start := time.Unix(1_700_000_000, 0)
 	installFakeClock(t, start)
 
-	err := containerAwaitHealthy(h, "aw-1", false, 4*time.Second)
+	err := containerAwaitHealthy(h, "aw-1", 4*time.Second)
 	if err == nil {
 		t.Fatalf("containerAwaitHealthy(missing) = nil, want error")
 	}
@@ -225,13 +169,13 @@ func TestContainerAwaitHealthy_missingContainerExpiresDeadline(t *testing.T) {
 // fallback: when the inspect probe returns "" (probe ran but produced no
 // output), the loop must treat it as missing, not as a free-form state.
 func TestContainerAwaitHealthy_emptyStateTreatedAsMissing(t *testing.T) {
-	mock := readinessMock(t, "", "", "", nil)
+	mock := readinessMock(t, "", "", "")
 	h := fakeHost(t, mock)
 
 	start := time.Unix(1_700_000_000, 0)
 	installFakeClock(t, start)
 
-	err := containerAwaitHealthy(h, "aw-1", false, 4*time.Second)
+	err := containerAwaitHealthy(h, "aw-1", 4*time.Second)
 	if err == nil {
 		t.Fatalf("containerAwaitHealthy(empty) = nil, want error")
 	}
@@ -244,13 +188,13 @@ func TestContainerAwaitHealthy_emptyStateTreatedAsMissing(t *testing.T) {
 // branch: any non-accepting state that is not "missing"/"" falls into the
 // `state is %q` formatter and surfaces with the original Docker state name.
 func TestContainerAwaitHealthy_exitedStateExpiresDeadline(t *testing.T) {
-	mock := readinessMock(t, "exited", "", "", nil)
+	mock := readinessMock(t, "exited", "", "")
 	h := fakeHost(t, mock)
 
 	start := time.Unix(1_700_000_000, 0)
 	installFakeClock(t, start)
 
-	err := containerAwaitHealthy(h, "aw-1", false, 4*time.Second)
+	err := containerAwaitHealthy(h, "aw-1", 4*time.Second)
 	if err == nil {
 		t.Fatalf("containerAwaitHealthy(exited) = nil, want error")
 	}
@@ -265,13 +209,13 @@ func TestContainerAwaitHealthy_exitedStateExpiresDeadline(t *testing.T) {
 // return nil. Guards against a future regression that narrows the acceptance
 // set to only "running" (see issue #275).
 func TestContainerAwaitHealthy_restartingIsAccepting(t *testing.T) {
-	mock := readinessMock(t, "restarting", "dockerd-ok", "ok", nil)
+	mock := readinessMock(t, "restarting", "dockerd-ok", "ok")
 	h := fakeHost(t, mock)
 
 	start := time.Unix(1_700_000_000, 0)
 	installFakeClock(t, start)
 
-	if err := containerAwaitHealthy(h, "aw-1", false, 30*time.Second); err != nil {
+	if err := containerAwaitHealthy(h, "aw-1", 30*time.Second); err != nil {
 		t.Fatalf("containerAwaitHealthy(restarting) = %v, want nil", err)
 	}
 }
@@ -292,7 +236,7 @@ func TestContainerAwaitHealthy_recoversAfterTransitions(t *testing.T) {
 					return "missing\n", nil
 				}
 				return "running\n", nil
-			case strings.Contains(cmd, "docker info") && strings.Contains(cmd, "/home/runner/actions-runner/.runner"):
+			case strings.Contains(cmd, "docker info") && strings.Contains(cmd, "/home/runner/.runner"):
 				return "dockerd-ok\nok\n", nil
 			default:
 				t.Errorf("unexpected command: %s", cmd)
@@ -305,7 +249,7 @@ func TestContainerAwaitHealthy_recoversAfterTransitions(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	installFakeClock(t, start)
 
-	if err := containerAwaitHealthy(h, "aw-1", false, 30*time.Second); err != nil {
+	if err := containerAwaitHealthy(h, "aw-1", 30*time.Second); err != nil {
 		t.Fatalf("containerAwaitHealthy(recover) = %v, want nil", err)
 	}
 	if probeCount != 2 {
@@ -315,20 +259,19 @@ func TestContainerAwaitHealthy_recoversAfterTransitions(t *testing.T) {
 
 // TestAwaitHealthyOrchestrator_delegatesToContainerAwaitHealthy pins the
 // Environment interface contract: ContainerEnvironment.AwaitHealthy must
-// delegate to containerAwaitHealthy with the configured timeout and the
-// runner's agentic flag, and must surface the readiness error verbatim.
-// We assert the agentic=true path because it exercises the inner DNS h.Run
-// call, distinguishing this from a no-op stub.
+// delegate to containerAwaitHealthy with the configured timeout and must
+// surface the readiness error verbatim. We assert the deadline-expiry path
+// (readiness triad never satisfied), which distinguishes a real delegation
+// from a no-op stub that would return nil.
 func TestAwaitHealthyOrchestrator_delegatesToContainerAwaitHealthy(t *testing.T) {
-	dnsSentinel := errors.New("dns probe failed")
-	mock := readinessMock(t, "running", "dockerd-ok", "ok", dnsSentinel)
+	mock := readinessMock(t, "running", "no", "ok")
 	h := fakeHost(t, mock)
 
 	// Manager is not needed by AwaitHealthy beyond what NewContainerEnvironment
 	// already requires, but Out must be non-nil to avoid nil-deref in any future
 	// logging additions.
 	m := &Manager{Out: io.Discard}
-	rc := config.RunnerConfig{Name: "aw", Repo: "o/r", Host: "h", Count: 1, Profile: "agentic", RunnerMode: config.RunnerModeContainer}
+	rc := config.RunnerConfig{Name: "aw", Repo: "o/r", Host: "h", Count: 1, RunnerMode: config.RunnerModeContainer}
 	env := m.NewContainerEnvironment(h, rc, 0, "aw-1")
 
 	start := time.Unix(1_700_000_000, 0)
@@ -336,9 +279,9 @@ func TestAwaitHealthyOrchestrator_delegatesToContainerAwaitHealthy(t *testing.T)
 
 	err := env.AwaitHealthy(4 * time.Second)
 	if err == nil {
-		t.Fatalf("env.AwaitHealthy(agentic-dns-fail) = nil, want error")
+		t.Fatalf("env.AwaitHealthy(no-dockerd) = nil, want error")
 	}
-	if !strings.Contains(err.Error(), "host.docker.internal not resolving via baked DNS inside gh-sr-aw-1") {
-		t.Errorf("env.AwaitHealthy(agentic-dns-fail) = %v, want DNS gate message", err)
+	if !strings.Contains(err.Error(), "inner dockerd not responding inside gh-sr-aw-1") {
+		t.Errorf("env.AwaitHealthy(no-dockerd) = %v, want inner-dockerd message", err)
 	}
 }

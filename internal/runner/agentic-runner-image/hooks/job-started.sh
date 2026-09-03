@@ -11,19 +11,16 @@
 #      job/service (`services:`) containers and network. So removing ALL inner containers
 #      here cannot touch the current job's containers; it only reaps leftovers from a
 #      previous job whose completed-hook did not run (e.g. the runner was killed mid-job).
-#   2. (Re)assert the AWF service-routing bypass so workflow `services:` reachability
-#      survives any flush.
-#   3. Verify the inner dockerd is responsive. This is the only hard failure: if
+#   2. Verify the inner dockerd is responsive. This is the only hard failure: if
 #      dockerd is down the job cannot run anyway, and failing here surfaces a clear
 #      message in "Set up runner" instead of a confusing failure minutes later.
 #
-# Never removes images / volumes — the /runner-state/docker-data image cache is
+# The hook runs as the runner user and talks to the inner dockerd through the
+# /var/run/docker.sock socket (group `docker`, which the runner is in). Never
+# removes images / volumes — the /runner-state/docker-data image cache is
 # preserved so the job does not re-pull gh-aw's images.
 
 set +e
-export PATH="/opt/gh-sr/docker-shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-AWF_SUBNET="${GH_SR_AWF_SUBNET:-172.30.0.0/24}"
 
 log() { echo "[gh-sr:job-started] $*"; }
 
@@ -31,20 +28,9 @@ log() { echo "[gh-sr:job-started] $*"; }
 log "resetting inner environment to a pristine state (image cache preserved)..."
 docker ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1
 docker network prune -f >/dev/null 2>&1
-if command -v iptables >/dev/null 2>&1; then
-    sudo -n iptables -F DOCKER-USER >/dev/null 2>&1
-fi
-sudo -n rm -rf /tmp/gh-aw >/dev/null 2>&1 || rm -rf /tmp/gh-aw >/dev/null 2>&1
+rm -rf /tmp/gh-aw >/dev/null 2>&1
 
-# 2. (Re)assert the AWF service-routing bypass (idempotent): exempt AWF-subnet
-#    traffic destined to a local IP from inner dockerd's DOCKER chain DNAT so AWF
-#    agents can reach workflow `services:` published ports. Mirrors entrypoint.sh.
-if command -v iptables >/dev/null 2>&1; then
-    while sudo -n iptables -t nat -D PREROUTING -s "${AWF_SUBNET}" -m addrtype --dst-type LOCAL -j RETURN >/dev/null 2>&1; do :; done
-    sudo -n iptables -t nat -I PREROUTING -s "${AWF_SUBNET}" -m addrtype --dst-type LOCAL -j RETURN >/dev/null 2>&1
-fi
-
-# 3. Ensure the inner dockerd is responsive (entrypoint starts it before run.sh;
+# 2. Ensure the inner dockerd is responsive (entrypoint starts it before run.sh;
 #    this guards against a daemon that died between jobs).
 for i in $(seq 1 30); do
     if docker info >/dev/null 2>&1; then

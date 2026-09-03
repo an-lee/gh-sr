@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/an-lee/gh-sr/internal/config"
@@ -36,23 +35,5 @@ func TestNewContainerEnvironment(t *testing.T) {
 	}
 	if env.instanceIndex != 1 {
 		t.Errorf("instanceIndex = %d, want 1", env.instanceIndex)
-	}
-}
-
-// TestInnerHostDockerInternalReadyCommand verifies the readiness DNS gate queries the
-// baked dnsmasq for host.docker.internal and rejects loopback answers.
-func TestInnerHostDockerInternalReadyCommand(t *testing.T) {
-	t.Parallel()
-	cmd := innerHostDockerInternalReadyCommand("agentic-1")
-	for _, want := range []string{
-		"docker exec",
-		"gh-sr-agentic-1",
-		"host.docker.internal",
-		"10.200.0.1",
-		"127.*",
-	} {
-		if !strings.Contains(cmd, want) {
-			t.Fatalf("readiness DNS probe must contain %q, got:\n%s", want, cmd)
-		}
 	}
 }

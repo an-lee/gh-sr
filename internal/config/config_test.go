@@ -1038,6 +1038,57 @@ func TestValidate_containerRunnerImage_mtu(t *testing.T) {
 	}
 }
 
+func TestValidate_containerRunnerImage_baseImage(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		ref     string
+		wantErr bool
+	}{
+		{"empty = default fork image", "", false},
+		{"registry with tag", "ghcr.io/falcondev-oss/actions-runner:2.337.0", false},
+		{"bare name with tag", "gh-sr/base:v1", false},
+		{"digest pin", "ghcr.io/falcondev-oss/actions-runner@sha256:" + strings.Repeat("a", 64), false},
+		{"uppercase tag (repo must stay lowercase)", "ghcr.io/foo/base:V1", false},
+		{"uppercase repo path", "ghcr.io/foo/Base:V1", true},
+		{"spaces", "ghcr.io/foo/bar baz", true},
+		{"missing tag colon", "ghcr.io/foo/bar:", true},
+		{"truncated digest", "ghcr.io/foo/bar@sha256:abc", true},
+		{"scheme prefix", "https://ghcr.io/foo/bar", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := Config{
+				Hosts:                map[string]HostConfig{"h": {Addr: "local", OS: "linux", Arch: "amd64"}},
+				Runners:              []RunnerConfig{{Name: "r", Repo: "o/r", Host: "h", RunnerMode: RunnerModeContainer}},
+				ContainerRunnerImage: ContainerRunnerImageConfig{BaseImage: tc.ref},
+			}
+			err := cfg.Validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("base_image=%q: expected error, got nil", tc.ref)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("base_image=%q: unexpected error: %v", tc.ref, err)
+			}
+		})
+	}
+}
+
+func TestConfig_ContainerRunnerImageBaseImage(t *testing.T) {
+	t.Parallel()
+	if got := (&Config{ContainerRunnerImage: ContainerRunnerImageConfig{BaseImage: "example.com/base:9"}}).ContainerRunnerImageBaseImage(); got != "example.com/base:9" {
+		t.Fatalf("ContainerRunnerImageBaseImage = %q", got)
+	}
+	if got := (&Config{}).ContainerRunnerImageBaseImage(); got != "" {
+		t.Fatalf("ContainerRunnerImageBaseImage (unset) = %q, want empty", got)
+	}
+	var nilCfg *Config
+	if got := nilCfg.ContainerRunnerImageBaseImage(); got != "" {
+		t.Fatalf("ContainerRunnerImageBaseImage (nil) = %q, want empty", got)
+	}
+}
+
 func TestConfig_ContainerRunnerImageMTU(t *testing.T) {
 	t.Parallel()
 	if got := (&Config{ContainerRunnerImage: ContainerRunnerImageConfig{MTU: 1460}}).ContainerRunnerImageMTU(); got != 1460 {

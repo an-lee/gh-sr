@@ -6,7 +6,6 @@ ca-certificates
 chromium
 chromium-chromedriver
 curl
-dnsmasq
 dnsutils
 git
 gnupg
@@ -34,3 +33,4 @@ sudo
 tar
 uidmap
 unzip
+zstd

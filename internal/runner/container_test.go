@@ -7,9 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -135,109 +132,88 @@ func TestAgenticRunnerImageTag(t *testing.T) {
 
 func TestContainerRunnerImageTag(t *testing.T) {
 	t.Parallel()
-	base := AgenticRunnerImageTag + ":2.320.0"
-	if got := ContainerRunnerImageTag("2.320.0", nil); got != base {
+	fork := DefaultForkRunnerImage
+	base := AgenticRunnerImageTag + ":2.337.0"
+	if got := ContainerRunnerImageTag(fork, nil); got != base {
 		t.Errorf("empty extras: got %q want %q", got, base)
 	}
-	if got := ContainerRunnerImageTag("2.320.0", []string{}); got != base {
+	if got := ContainerRunnerImageTag(fork, []string{}); got != base {
 		t.Errorf("empty slice: got %q want %q", got, base)
 	}
-	a := ContainerRunnerImageTag("2.320.0", []string{"sqlite3", "ffmpeg"})
-	b := ContainerRunnerImageTag("2.320.0", []string{"ffmpeg", "sqlite3"})
+	a := ContainerRunnerImageTag(fork, []string{"sqlite3", "ffmpeg"})
+	b := ContainerRunnerImageTag(fork, []string{"ffmpeg", "sqlite3"})
 	if a != b {
 		t.Errorf("order should not matter: %q vs %q", a, b)
 	}
 	if want := base + "-x908d9db2"; a != want {
 		t.Errorf("tag with extras: got %q want %q", a, want)
 	}
-	dup := ContainerRunnerImageTag("1.0.0", []string{"curl", "curl"})
-	once := ContainerRunnerImageTag("1.0.0", []string{"curl"})
+	dup := ContainerRunnerImageTag(fork, []string{"curl", "curl"})
+	once := ContainerRunnerImageTag(fork, []string{"curl"})
 	if dup != once {
 		t.Errorf("duplicates should be ignored: got %q vs %q", dup, once)
 	}
+	// A base_image bump must change the local tag (that is what triggers a rebuild):
+	// digest pins shorten to "d" + first 12 digest chars; untagged refs map to "latest".
+	digest := fork[:strings.LastIndex(fork, ":")] + "@sha256:" + strings.Repeat("ab", 32)
+	if got := ContainerRunnerImageTag(digest, nil); got != AgenticRunnerImageTag+":dabababababab" {
+		t.Errorf("digest-pinned base: got %q, want %q", got, AgenticRunnerImageTag+":dabababababab")
+	}
+	untagged := "ghcr.io/falcondev-oss/actions-runner"
+	if got := ContainerRunnerImageTag(untagged, nil); got != AgenticRunnerImageTag+":latest" {
+		t.Errorf("untagged base: got %q, want %q", got, AgenticRunnerImageTag+":latest")
+	}
 }
 
-// TestAgenticRunnerDockerWrapperIsMinimalShim verifies the redesigned docker shim
-// only injects the MCP gateway --hostname and has dropped the old racy supervisor /
-// MCP-URL rewriter / AWF add-host injection (now handled by baked DNS + job hooks).
-func TestAgenticRunnerDockerWrapperIsMinimalShim(t *testing.T) {
+// TestAgenticRunnerDockerfileRootlessBase pins the rootless image contract: the
+// Dockerfile derives FROM the fork runner base (passed as the FORK_RUNNER_IMAGE
+// build-arg, which carries the CUSTOM_ACTIONS_RESULTS_URL override) and the apt
+// manifest installs zstd (the Actions-cache compression codec the fork runner
+// needs for cache upload/download).
+func TestAgenticRunnerDockerfileRootlessBase(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
-		"is_mcpg_invocation",
-		"has_hostname_arg",
-		"has_name_arg",
-		"--hostname gh-aw-mcpg",
-		"--name \"gh-aw-mcpg-ghsr-",
-		"GH_SR_DOCKER_WRAPPER_REAL",
-		"ghcr.io/github/gh-aw-mcpg:",
+		"ARG FORK_RUNNER_IMAGE",
+		"FROM ${FORK_RUNNER_IMAGE}",
 	} {
-		if !strings.Contains(agenticRunnerDockerWrapper, want) {
-			t.Fatalf("docker-wrapper must contain %q", want)
+		if !strings.Contains(agenticRunnerDockerfile, want) {
+			t.Fatalf("Dockerfile must contain %q, got:\n%s", want, agenticRunnerDockerfile)
 		}
 	}
-	// The heavy supervisor / URL-rewriter must stay gone (naming is just a flag, not a supervisor).
-	for _, forbidden := range []string{
-		"rewrite_claude_mcp_gateway_urls",
-		"cleanup_mcpg_container",
-		"mcpg_docker_child_pid",
-		"GH_SR_MCP_REWRITE_TARGET_IP",
-		"needs_awf_agent_bridge_host",
-		"resolve_awf_host_route_target",
-		"--cidfile",
-		"mktemp",
-		"watcher_start",
-	} {
-		if strings.Contains(agenticRunnerDockerWrapper, forbidden) {
-			t.Fatalf("docker-wrapper must no longer contain removed shim logic %q", forbidden)
-		}
+	if !strings.Contains(agenticRunnerAptPackagesCore, "zstd") {
+		t.Fatal("apt-packages-core.txt must install zstd (Actions-cache compression codec)")
 	}
 }
 
-func TestAgenticRunnerDockerWrapperHeaderDocumentsHooks(t *testing.T) {
+// TestAgenticRunnerImageForbidsRetiredHacks guards the rootless cutover: gh-aw
+// v0.88 runs AWF rootless (isolation via inner-Docker topology, its own
+// --add-host=host.docker.internal:host-gateway), so the sudo-era layers — docker
+// shim, baked DNS/dnsmasq, the 10.200.0.1 bip pin, the iptables NAT bypass, AWF or
+// gh-aw preinstall, NOPASSWD sudoers — must never reappear in any embedded file.
+func TestAgenticRunnerImageForbidsRetiredHacks(t *testing.T) {
 	t.Parallel()
-	for _, want := range []string{
-		"runner_mode: container",
-		"/opt/gh-sr/docker-shim/docker",
-		"job-started.sh",
-		"job-completed.sh",
-	} {
-		if !strings.Contains(agenticRunnerDockerWrapper, want) {
-			t.Fatalf("docker-wrapper header should mention %q", want)
-		}
+	files := map[string]string{
+		"Dockerfile":            agenticRunnerDockerfile,
+		"apt-packages-core.txt": agenticRunnerAptPackagesCore,
+		"entrypoint.sh":         agenticRunnerEntrypoint,
+		"job-started.sh":        agenticRunnerJobStartedHook,
+		"job-completed.sh":      agenticRunnerJobCompletedHook,
 	}
-}
-
-// TestAgenticRunnerInnerDockerDNSBaked verifies host.docker.internal DNS is baked
-// into the image (daemon.json + dnsmasq config), not rewritten at runtime, and that
-// inner containers never use loopback DNS (which would point at the child container).
-func TestAgenticRunnerInnerDockerDNSBaked(t *testing.T) {
-	t.Parallel()
-	if !strings.Contains(agenticRunnerDaemonJSON, `"bip": "10.200.0.1/24"`) {
-		t.Fatalf("daemon.json should pin the default-bridge gateway, got:\n%s", agenticRunnerDaemonJSON)
-	}
-	if !strings.Contains(agenticRunnerDaemonJSON, `"10.200.0.1"`) {
-		t.Fatalf("daemon.json should point inner DNS at the bridge gateway, got:\n%s", agenticRunnerDaemonJSON)
-	}
-	if strings.Contains(agenticRunnerDaemonJSON, "127.0.0.1") {
-		t.Fatal("inner Docker DNS must not be loopback (points at the child container itself)")
-	}
-	// The inner bridge must NOT live on 172.17.x: that is the host's default Docker
-	// bridge subnet the outer runner container sits on, and overlapping it black-holes
-	// the container's outbound traffic (see daemon.json / dnsmasq comments).
-	if strings.Contains(agenticRunnerDaemonJSON, "172.17.0.") {
-		t.Fatalf("daemon.json bip must not overlap the host default bridge (172.17.0.0/16), got:\n%s", agenticRunnerDaemonJSON)
-	}
-	if !strings.Contains(agenticRunnerDnsmasqConf, "address=/host.docker.internal/10.200.0.1") {
-		t.Fatalf("dnsmasq config should answer host.docker.internal with the bridge gateway, got:\n%s", agenticRunnerDnsmasqConf)
-	}
-	// Inspect only the active directives (ignore explanatory comments) to ensure the
-	// bridge does not overlap the host default bridge 172.17.0.0/16.
-	for _, line := range strings.Split(agenticRunnerDnsmasqConf, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
-			continue
-		}
-		if strings.Contains(line, "172.17.0.") {
-			t.Fatalf("dnsmasq directive must not overlap the host default bridge (172.17.0.0/16): %q", line)
+	for name, content := range files {
+		for _, forbidden := range []string{
+			"docker-wrapper",
+			"docker-shim",
+			"dnsmasq",
+			"NOPASSWD",
+			"10.200.0.1",
+			"resolv.conf",
+			"install_awf_binary",
+			"iptables -t nat",
+			"gh-aw-firewall/main/install.sh",
+		} {
+			if strings.Contains(content, forbidden) {
+				t.Fatalf("%s must not contain the retired hack %q", name, forbidden)
+			}
 		}
 	}
 }
@@ -283,19 +259,48 @@ func TestAgenticRunnerEntrypointWiresJobHooks(t *testing.T) {
 	}
 }
 
+// TestAgenticRunnerEntrypointRootlessWiring pins the fork-runner era wiring: the
+// runner lives at /home/runner (fork image layout), config.sh gets --disableupdate
+// (the fork's CUSTOM_ACTIONS_RESULTS_URL-aware runner must never self-update back to
+// stock behavior), and GH_SR_CACHE_URL is forwarded as CUSTOM_ACTIONS_RESULTS_URL in
+// both .env and RUNNER_ENV so cache traffic hits the local cache server.
+func TestAgenticRunnerEntrypointRootlessWiring(t *testing.T) {
+	t.Parallel()
+	for _, want := range []string{
+		`RUNNER_DIR="/home/runner"`,
+		"--disableupdate",
+		`CUSTOM_ACTIONS_RESULTS_URL=${GH_SR_CACHE_URL}`,
+		`RUNNER_TOOL_CACHE="/home/runner/.toolcache"`,
+		"gh-aw-mcpg:latest", // pre-pull vocabulary (rootless gh-aw image set)
+	} {
+		if !strings.Contains(agenticRunnerEntrypoint, want) {
+			t.Fatalf("entrypoint should contain %q, got:\n%s", want, agenticRunnerEntrypoint)
+		}
+	}
+	// `su -` resets the environment, so RUNNER_ENV must re-export the cache URL for
+	// the runner user too (config.sh and run.sh both run through su -).
+	if !strings.Contains(agenticRunnerEntrypoint, `RUNNER_ENV="${RUNNER_ENV} CUSTOM_ACTIONS_RESULTS_URL='${GH_SR_CACHE_URL}'"`) {
+		t.Fatal("RUNNER_ENV must re-export CUSTOM_ACTIONS_RESULTS_URL for the runner user")
+	}
+}
+
 // TestAgenticRunnerJobHooksReset verifies the per-job reset hooks perform the
-// deterministic teardown (containers, networks, AWF iptables, /tmp/gh-aw) and that
-// the completed hook always exits 0.
+// deterministic teardown (containers, networks, /tmp/gh-aw) using the rootless-era
+// vocabulary (awmg-/awf-/gh-aw names; gh-aw-mcpg + firewall-stack ancestors — the
+// cli-proxy sidecar reuses the gh-aw-mcpg image, so no separate ancestor is needed)
+// and that the completed hook always exits 0.
 func TestAgenticRunnerJobHooksReset(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
 		"docker network prune -f",
-		"iptables -F DOCKER-USER",
 		"rm -rf /tmp/gh-aw",
-		"name=gh-aw-mcpg",
+		"name=awmg-",
 		"name=awf-",
+		"name=gh-aw",
 		"ancestor=$img",
+		"ghcr.io/github/gh-aw-mcpg",
 		"ghcr.io/github/gh-aw-firewall/agent",
+		"ghcr.io/github/gh-aw-firewall/api-proxy",
 		"exit 0",
 	} {
 		if !strings.Contains(agenticRunnerJobCompletedHook, want) {
@@ -305,8 +310,7 @@ func TestAgenticRunnerJobHooksReset(t *testing.T) {
 	for _, want := range []string{
 		"docker ps -aq",
 		"docker network prune -f",
-		"PREROUTING",
-		"172.30.0.0/24",
+		"rm -rf /tmp/gh-aw",
 		"docker info",
 	} {
 		if !strings.Contains(agenticRunnerJobStartedHook, want) {
@@ -338,170 +342,6 @@ func TestAgenticRunnerJobHooksPreserveImageCache(t *testing.T) {
 	}
 }
 
-// TestDockerWrapperInjection runs docker-wrapper.sh with GH_SR_DOCKER_WRAPPER_REAL=/bin/echo
-// so argv transformations are observable without a Docker daemon.
-func TestDockerWrapperInjection(t *testing.T) {
-	t.Parallel()
-	wrapper := filepath.Join("agentic-runner-image", "docker-wrapper.sh")
-	if _, err := os.Stat(wrapper); err != nil {
-		t.Fatalf("docker-wrapper.sh: %v", err)
-	}
-
-	echoWrap := func(t *testing.T, args ...string) string {
-		t.Helper()
-		cmd := exec.Command("bash", append([]string{wrapper}, args...)...)
-		cmd.Env = append(os.Environ(), "GH_SR_DOCKER_WRAPPER_REAL=/bin/echo")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("bash %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-
-	t.Run("mcpg_run_injects_hostname_and_name", func(t *testing.T) {
-		t.Parallel()
-		// run gets both --hostname and a deterministic gh-aw-mcpg-ghsr-* name (random
-		// suffix), and the caller's original args are preserved after the injected flags.
-		got := echoWrap(t, "run", "-i", "--rm", "--network", "host", "ghcr.io/github/gh-aw-mcpg:1.0.0")
-		if !strings.HasPrefix(got, "run --hostname gh-aw-mcpg --name gh-aw-mcpg-ghsr-") {
-			t.Fatalf("got %q, want prefix 'run --hostname gh-aw-mcpg --name gh-aw-mcpg-ghsr-'", got)
-		}
-		if !strings.HasSuffix(got, " -i --rm --network host ghcr.io/github/gh-aw-mcpg:1.0.0") {
-			t.Fatalf("got %q, original args must be preserved after injected flags", got)
-		}
-	})
-
-	t.Run("mcpg_create_injects_hostname_only", func(t *testing.T) {
-		t.Parallel()
-		// create is not named (gh-aw launches the gateway via run, and a create+start
-		// flow would break if we renamed the created container).
-		got := echoWrap(t, "create", "--network", "host", "ghcr.io/github/gh-aw-mcpg:1.0.0")
-		want := "create --hostname gh-aw-mcpg --network host ghcr.io/github/gh-aw-mcpg:1.0.0"
-		if got != want {
-			t.Fatalf("got %q want %q", got, want)
-		}
-	})
-
-	t.Run("mcpg_run_respects_caller_name", func(t *testing.T) {
-		t.Parallel()
-		got := echoWrap(t, "run", "--name", "custom-gw", "ghcr.io/github/gh-aw-mcpg:1")
-		want := "run --hostname gh-aw-mcpg --name custom-gw ghcr.io/github/gh-aw-mcpg:1"
-		if got != want {
-			t.Fatalf("got %q want %q (must not override caller --name)", got, want)
-		}
-		if strings.Contains(got, "gh-aw-mcpg-ghsr-") {
-			t.Fatalf("got %q, must not inject our name when caller set --name", got)
-		}
-	})
-
-	t.Run("mcpg_hostname_present_passthrough", func(t *testing.T) {
-		t.Parallel()
-		got := echoWrap(t, "run", "--hostname", "custom", "ghcr.io/github/gh-aw-mcpg:1")
-		if strings.Contains(got, "--hostname gh-aw-mcpg") {
-			t.Fatalf("got %q, must not duplicate hostname", got)
-		}
-		if !strings.Contains(got, "--hostname custom") {
-			t.Fatalf("got %q, caller hostname must be preserved", got)
-		}
-		if !strings.Contains(got, "--name gh-aw-mcpg-ghsr-") {
-			t.Fatalf("got %q, run should still get a gh-sr gateway name", got)
-		}
-	})
-
-	t.Run("awf_agent_passthrough_unmodified", func(t *testing.T) {
-		t.Parallel()
-		// Networking is handled by baked DNS now; the shim no longer injects --add-host.
-		got := echoWrap(t, "run", "--rm", "ghcr.io/github/gh-aw-firewall/agent:2.3.4")
-		want := "run --rm ghcr.io/github/gh-aw-firewall/agent:2.3.4"
-		if got != want {
-			t.Fatalf("got %q want %q", got, want)
-		}
-	})
-
-	t.Run("passthrough_non_aw", func(t *testing.T) {
-		t.Parallel()
-		args := []string{"run", "--rm", "alpine:latest", "sh", "-c", "true"}
-		got := echoWrap(t, args...)
-		want := strings.Join(args, " ")
-		if got != want {
-			t.Fatalf("got %q want %q", got, want)
-		}
-	})
-
-	t.Run("mcpg_no_add_host_injected", func(t *testing.T) {
-		t.Parallel()
-		got := echoWrap(t, "run", "ghcr.io/github/gh-aw-mcpg:agent-test")
-		if !strings.Contains(got, "--hostname gh-aw-mcpg") {
-			t.Fatalf("expected mcpg hostname injection, got %q", got)
-		}
-		if strings.Contains(got, "--add-host") {
-			t.Fatalf("shim must not inject --add-host anymore, got %q", got)
-		}
-	})
-}
-
-// TestDockerWrapperMcpgForwardsStdin verifies gh-aw's piped MCP gateway JSON reaches
-// the real docker child. Because the shim `exec`s docker, stdin passes through with no
-// supervisor.
-func TestDockerWrapperMcpgForwardsStdin(t *testing.T) {
-	t.Parallel()
-	tmp := t.TempDir()
-	stdinLog := filepath.Join(tmp, "stdin-captured.txt")
-	fakeDocker := filepath.Join(tmp, "docker")
-	script := `#!/bin/bash
-set -euo pipefail
-cmd=${1:-}
-shift || true
-if [[ "$cmd" == "run" ]]; then
-	cat >"${FAKE_DOCKER_STDIN_LOG:?}"
-fi
-exit 0
-`
-	if err := os.WriteFile(fakeDocker, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	wrapper := filepath.Join("agentic-runner-image", "docker-wrapper.sh")
-	if _, err := os.Stat(wrapper); err != nil {
-		t.Fatalf("docker-wrapper.sh: %v", err)
-	}
-
-	payload := `{"gateway":{"port":80,"domain":"host.docker.internal"}}`
-	cmd := exec.Command("bash", "-c", `printf '%s' "$GHSR_PAYLOAD" | bash "$GHSR_WRAPPER" run -i --rm --network host ghcr.io/github/gh-aw-mcpg:1.0.0`)
-	cmd.Env = append(os.Environ(),
-		"GHSR_PAYLOAD="+payload,
-		"GHSR_WRAPPER="+wrapper,
-		"GH_SR_DOCKER_WRAPPER_REAL="+fakeDocker,
-		"FAKE_DOCKER_STDIN_LOG="+stdinLog,
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("wrapper stdin pipe: %v\n%s", err, out)
-	}
-
-	got, err := os.ReadFile(stdinLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != payload {
-		t.Fatalf("gateway stdin: got %q want %q", got, payload)
-	}
-}
-
-func TestAgenticRunnerDockerfileInstallsAWF(t *testing.T) {
-	t.Parallel()
-
-	for _, want := range []string{
-		"https://raw.githubusercontent.com/github/gh-aw-firewall/main/install.sh",
-		"AWF_FORCE_BINARY=1",
-		"awf --version",
-	} {
-		if !strings.Contains(agenticRunnerDockerfile, want) {
-			t.Fatalf("Dockerfile should install and verify awf with %q, got:\n%s", want, agenticRunnerDockerfile)
-		}
-	}
-}
-
 func TestAgenticRunnerDockerfileInstallsNodeLTS(t *testing.T) {
 	t.Parallel()
 
@@ -517,15 +357,15 @@ func TestAgenticRunnerDockerfileInstallsNodeLTS(t *testing.T) {
 	}
 }
 
-// TestAgenticRunnerDockerfileBakesNetworkAndHooks verifies the Dockerfile bakes the
-// deterministic network config and installs the per-job reset hooks.
-func TestAgenticRunnerDockerfileBakesNetworkAndHooks(t *testing.T) {
+// TestAgenticRunnerDockerfileBakesHooksAndEntrypoint verifies the Dockerfile installs
+// the per-job reset hooks and the entrypoint, and wires ENTRYPOINT to it.
+func TestAgenticRunnerDockerfileBakesHooksAndEntrypoint(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
-		"COPY daemon.json /etc/docker/daemon.json",
-		"COPY dnsmasq-gh-sr.conf /etc/dnsmasq.d/gh-sr.conf",
 		"COPY hooks/job-started.sh /opt/gh-sr/hooks/job-started.sh",
 		"COPY hooks/job-completed.sh /opt/gh-sr/hooks/job-completed.sh",
+		"COPY entrypoint.sh /entrypoint.sh",
+		`ENTRYPOINT ["/entrypoint.sh"]`,
 	} {
 		if !strings.Contains(agenticRunnerDockerfile, want) {
 			t.Fatalf("Dockerfile should bake %q, got:\n%s", want, agenticRunnerDockerfile)
@@ -560,51 +400,27 @@ func TestAgenticRunnerDockerfileSymlinksHostedToolCache(t *testing.T) {
 	}
 }
 
-func TestAgenticRunnerDockerfileDockerShimLayout(t *testing.T) {
-	t.Parallel()
-	for _, want := range []string{
-		"/opt/gh-sr/docker-shim/docker",
-		"COPY docker-wrapper.sh /opt/gh-sr/docker-shim/docker",
-		"/etc/profile.d/gh-sr-docker-shim.sh",
-		"Defaults:runner secure_path=",
-		"/opt/gh-sr/docker-shim:",
-		"visudo -cf /etc/sudoers.d/runner-secure-path",
-	} {
-		if !strings.Contains(agenticRunnerDockerfile, want) {
-			t.Fatalf("Dockerfile should contain %q, got:\n%s", want, agenticRunnerDockerfile)
-		}
-	}
-	if strings.Contains(agenticRunnerDockerfile, "COPY docker-wrapper.sh /usr/local/bin/docker") {
-		t.Fatal("Dockerfile should not install docker-wrapper at /usr/local/bin/docker")
-	}
-}
-
-func TestAgenticRunnerEntrypointPrependsDockerShimPATH(t *testing.T) {
-	t.Parallel()
-	if !strings.Contains(agenticRunnerEntrypoint, "PATH=/opt/gh-sr/docker-shim:\\$PATH") {
-		t.Fatalf("entrypoint RUNNER_ENV should prepend docker shim PATH, got:\n%s", agenticRunnerEntrypoint)
-	}
-}
-
-// TestAgenticRunnerEntrypointPinsMTU verifies the entrypoint pins the inner-bridge MTU
-// (daemon.json), the outer egress interface MTU, and installs an MSS clamp when the
-// host egress MTU (GH_SR_HOST_MTU) is below 1500 — the fix for reduced-MTU host networks
-// that otherwise break large-packet TLS handshakes (e.g. actions/setup-go).
+// TestAgenticRunnerEntrypointPinsMTU verifies the entrypoint pins the inner-bridge
+// MTU (mtu-only daemon.json written before the single dockerd start) and the outer
+// egress interface MTU when the host egress MTU (GH_SR_HOST_MTU) is below 1500 — the
+// fix for reduced-MTU host networks that otherwise break large-packet TLS handshakes
+// (e.g. actions/setup-go). The rootless cutover dropped the MSS clamp: TCP advertises
+// a matching MSS from the pinned MTUs alone.
 func TestAgenticRunnerEntrypointPinsMTU(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
 		"GH_SR_HOST_MTU",
-		`"mtu":`,            // injected into daemon.json
-		"write_daemon_json", // single daemon.json emitter (before the one dockerd start)
-		"ip link set dev",   // lower the outer container's egress interface MTU
-		"clamp-mss-to-pmtu", // belt-and-suspenders MSS clamp for forwarded inner traffic
+		`"mtu":`,                    // injected into the mtu-only daemon.json
+		"> /etc/docker/daemon.json", // write must precede the one dockerd start
+		"ip link set dev",           // lower the outer container's egress interface MTU
 	} {
 		if !strings.Contains(agenticRunnerEntrypoint, want) {
 			t.Fatalf("entrypoint should pin MTU: missing %q", want)
 		}
 	}
-	// The MTU write must still go through the single pre-dockerd daemon.json path: the
-	// daemon.json redirect lives inside write_daemon_json, before the one dockerd start.
+	if strings.Contains(agenticRunnerEntrypoint, "clamp-mss-to-pmtu") {
+		t.Fatal("rootless entrypoint must not re-add the iptables MSS clamp")
+	}
 	// (TestAgenticRunnerEntrypointStartsDockerdOnce enforces the ordering invariant.)
 	if strings.Count(agenticRunnerEntrypoint, "dockerd \\") != 1 {
 		t.Fatal("MTU changes must not add a second dockerd start")
@@ -669,6 +485,21 @@ func TestBootstrapMaxRetriesDockerCreateArg(t *testing.T) {
 	}
 }
 
+// TestCacheURLDockerCreateArg pins the local-cache injection contract: a
+// non-empty cache URL becomes a single-quoted -e GH_SR_CACHE_URL line (the
+// entrypoint forwards it to the runner as CUSTOM_ACTIONS_RESULTS_URL), and an
+// empty URL emits nothing so the runner keeps GitHub's cache service.
+func TestCacheURLDockerCreateArg(t *testing.T) {
+	t.Parallel()
+	if got := cacheURLDockerCreateArg(""); got != "" {
+		t.Fatalf("empty URL should omit env, got %q", got)
+	}
+	got := cacheURLDockerCreateArg("http://172.17.0.1:3000/")
+	if !strings.Contains(got, "-e GH_SR_CACHE_URL=") || !strings.Contains(got, "'http://172.17.0.1:3000/'") {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestDockerCreateEnvLineIf(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -697,27 +528,27 @@ func TestDockerCreateEnvLineIf(t *testing.T) {
 // by constructing the expected command string rather than executing it).
 func TestBuildAgenticRunnerImageCmdShape(t *testing.T) {
 	t.Parallel()
-	version := "2.320.0"
-	arch := "x64"
-	imageTag := AgenticRunnerImageTag + ":" + version
+	baseImage := DefaultForkRunnerImage
+	imageTag := ContainerRunnerImageTag(baseImage, nil)
 	ghVer := "vtest"
-	rev := ContainerImageLayoutRevision(ghVer, nil)
+	rev := ContainerImageLayoutRevision(ghVer, baseImage, nil)
 	labelRev := hostshell.PosixSingleQuote(dockerLabelImageRevision + "=" + rev)
 	labelCLI := hostshell.PosixSingleQuote(dockerLabelCLIVersion + "=" + ghVer)
 
 	// Replicate the docker build command from buildAgenticRunnerImage.
-	buildCmd := "docker build --build-arg RUNNER_VERSION=" + hostshell.PosixSingleQuote(version) +
-		" --build-arg RUNNER_ARCH=" + hostshell.PosixSingleQuote(arch) +
+	buildCmd := "docker build --build-arg FORK_RUNNER_IMAGE=" + hostshell.PosixSingleQuote(baseImage) +
 		" --label " + labelRev +
 		" --label " + labelCLI +
 		" -t " + hostshell.PosixSingleQuote(imageTag) +
 		" " + hostshell.PosixSingleQuote("/tmp/gh-sr-agentic-runner-build")
 
-	if !strings.Contains(buildCmd, "RUNNER_VERSION=") {
-		t.Error("build cmd must pass RUNNER_VERSION build-arg")
+	if !strings.Contains(buildCmd, "--build-arg FORK_RUNNER_IMAGE="+hostshell.PosixSingleQuote(baseImage)) {
+		t.Error("build cmd must pass the fork base image as the FORK_RUNNER_IMAGE build-arg")
 	}
-	if !strings.Contains(buildCmd, "RUNNER_ARCH=") {
-		t.Error("build cmd must pass RUNNER_ARCH build-arg")
+	// The runner version/arch are baked into the fork base image: the build must not
+	// re-introduce the old tarball build-args (they would imply a GitHub API lookup).
+	if strings.Contains(buildCmd, "RUNNER_VERSION=") || strings.Contains(buildCmd, "RUNNER_ARCH=") {
+		t.Error("build cmd must not pass RUNNER_VERSION/RUNNER_ARCH build-args (fork base bakes the runner)")
 	}
 	if !strings.Contains(buildCmd, "--label ") {
 		t.Error("build cmd must pass image revision labels")
@@ -900,17 +731,23 @@ func TestContainerLocalStatusImageAndRevision_one_ssh_round_trip(t *testing.T) {
 
 func TestContainerImageLayoutRevision_stable(t *testing.T) {
 	t.Parallel()
-	a := ContainerImageLayoutRevision("1.0.0", []string{"curl"})
-	b := ContainerImageLayoutRevision("1.0.0", []string{"curl"})
+	base := DefaultForkRunnerImage
+	a := ContainerImageLayoutRevision("1.0.0", base, []string{"curl"})
+	b := ContainerImageLayoutRevision("1.0.0", base, []string{"curl"})
 	if a != b {
 		t.Fatalf("expected stable revision, %q vs %q", a, b)
 	}
 	if len(a) != 12 {
 		t.Fatalf("expected 12 hex chars, got %q len %d", a, len(a))
 	}
-	c := ContainerImageLayoutRevision("1.0.0", []string{"git"})
-	if c == a {
+	if c := ContainerImageLayoutRevision("1.0.0", base, []string{"git"}); c == a {
 		t.Fatal("different extras should change revision")
+	}
+	if c := ContainerImageLayoutRevision("1.0.0", "ghcr.io/falcondev-oss/actions-runner:9.9.9", []string{"curl"}); c == a {
+		t.Fatal("a different base image should change revision")
+	}
+	if c := ContainerImageLayoutRevision("1.0.1", base, []string{"curl"}); c == a {
+		t.Fatal("a different gh-sr version should change revision")
 	}
 }
 
@@ -1193,9 +1030,6 @@ func TestContainersPresentOneShot(t *testing.T) {
 // call is required.
 func TestSetupContainer_ContainersPresenceOneSshRoundTrip(t *testing.T) {
 	t.Parallel()
-	ts := httptest.NewServer(releaseHandler("v2.330.0"))
-	defer ts.Close()
-
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
 		switch {
 		case strings.Contains(cmd, "docker --version"):
@@ -1212,7 +1046,7 @@ func TestSetupContainer_ContainersPresenceOneSshRoundTrip(t *testing.T) {
 	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
 	h.SetConn(mock)
-	m := &Manager{GitHub: NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL)}
+	m := &Manager{}
 	rc := config.RunnerConfig{
 		Name:       "multi",
 		Repo:       "o/r",
@@ -1578,14 +1412,9 @@ func TestSetupContainer_ensureDockerBeforeImageBuild(t *testing.T) {
 // TestSetupContainer_emitsBuildProgressMessageWhenImageMissing pins the
 // user-visible progress line that setupContainer must emit BEFORE a multi-minute
 // Docker build when the image is absent: "building container runner image (this
-// may take several minutes)...". Regression guard for the resolveRunnerImageInputs
-// / buildRunnerImageIfMissing refactor (#228), which had to preserve this heads-up
-// via the helper's onBuild hook rather than dropping it.
+// may take several minutes)..." — via buildRunnerImageIfMissing's onBuild hook.
 func TestSetupContainer_emitsBuildProgressMessageWhenImageMissing(t *testing.T) {
 	t.Parallel()
-	ts := httptest.NewServer(releaseHandler("v2.330.0"))
-	defer ts.Close()
-
 	var out bytes.Buffer
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
 		switch {
@@ -1611,10 +1440,7 @@ func TestSetupContainer_emitsBuildProgressMessageWhenImageMissing(t *testing.T) 
 	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
 	h.SetConn(mock)
-	m := &Manager{
-		GitHub: NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
-		Out:    &out,
-	}
+	m := &Manager{Out: &out}
 	rc := config.RunnerConfig{
 		Name:       "aw-runner",
 		Repo:       "o/r",
@@ -1672,88 +1498,45 @@ func TestSetupContainer_propagatesDockerGroupPending(t *testing.T) {
 	}
 }
 
-// releaseHandler builds an httptest handler that responds to /repos/actions/runner/releases/latest
-// with the given tag. Centralized so resolveRunnerImageInputs and rebuild-related tests
-// share the same fixture.
-func releaseHandler(tag string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/actions/runner/releases/latest" {
-			http.NotFound(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(releaseResponse{TagName: tag})
-	}
-}
-
-// TestManager_resolveRunnerImageInputs verifies the resolved (version, arch, imageTag)
-// triple: version comes from GitHub, arch from archForGitHub(h.Arch), imageTag from
-// ContainerRunnerImageTag(version, extraApt). This is the triplicated preamble that
-// #228 flagged across setupContainer / rebuildContainerImage / Provision.
-func TestManager_resolveRunnerImageInputs(t *testing.T) {
+// TestManager_resolveContainerImageInputs verifies the resolved (baseImage, imageTag)
+// pair: baseImage defaults to the fork runner image, imageTag derives from the base
+// tag plus the extra-apt suffix. The runner version is baked into the fork base, so
+// no GitHub API call is involved and the resolution works offline.
+func TestManager_resolveContainerImageInputs(t *testing.T) {
 	t.Parallel()
-	ts := httptest.NewServer(releaseHandler("v2.330.0"))
-	defer ts.Close()
-
-	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
-		if strings.Contains(cmd, "docker image inspect") {
-			return "yes", nil // image present so buildRunnerImageIfMissing is short-circuited
-		}
-		return "", nil
-	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
-	h.SetConn(mock)
+	h.SetConn(&testutil.MockExecutor{})
 	m := &Manager{
-		GitHub:                 NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
 		GhSrVersion:            "1.2.3",
 		ContainerImageExtraApt: []string{"sqlite3", "ffmpeg"},
 	}
 
-	version, arch, imageTag, err := m.resolveRunnerImageInputs(h)
+	baseImage, imageTag, err := m.resolveContainerImageInputs(h)
 	if err != nil {
-		t.Fatalf("resolveRunnerImageInputs: %v", err)
+		t.Fatalf("resolveContainerImageInputs: %v", err)
 	}
-	if version != "2.330.0" {
-		t.Errorf("version: got %q, want %q", version, "2.330.0")
+	if baseImage != DefaultForkRunnerImage {
+		t.Errorf("baseImage: got %q, want %q", baseImage, DefaultForkRunnerImage)
 	}
-	if arch != archForGitHub("amd64") {
-		t.Errorf("arch: got %q, want %q", arch, archForGitHub("amd64"))
-	}
-	wantTag := ContainerRunnerImageTag("2.330.0", []string{"sqlite3", "ffmpeg"})
+	wantTag := ContainerRunnerImageTag(DefaultForkRunnerImage, []string{"sqlite3", "ffmpeg"})
 	if imageTag != wantTag {
 		t.Errorf("imageTag: got %q, want %q", imageTag, wantTag)
 	}
 
-	// arm64 arch path.
-	h2 := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "arm64"})
-	h2.SetConn(mock)
-	_, arch2, _, err := m.resolveRunnerImageInputs(h2)
+	// An explicit container_runner_image.base_image overrides the default.
+	m2 := &Manager{ContainerImageBaseImage: "ghcr.io/falcondev-oss/actions-runner:9.9.9"}
+	base2, tag2, err := m2.resolveContainerImageInputs(h)
 	if err != nil {
-		t.Fatalf("resolveRunnerImageInputs(arm64): %v", err)
+		t.Fatalf("resolveContainerImageInputs(override): %v", err)
 	}
-	if arch2 != archForGitHub("arm64") {
-		t.Errorf("arch(arm64): got %q, want %q", arch2, archForGitHub("arm64"))
+	if base2 != "ghcr.io/falcondev-oss/actions-runner:9.9.9" || tag2 != ContainerRunnerImageTag("ghcr.io/falcondev-oss/actions-runner:9.9.9", nil) {
+		t.Errorf("override: got (%q, %q)", base2, tag2)
 	}
-}
 
-// TestManager_resolveRunnerImageInputs_propagatesVersionError verifies the helper
-// wraps a GitHub release-fetch failure as "resolving runner version: %w" — matching
-// the historical call-site error so user-visible output is unchanged.
-func TestManager_resolveRunnerImageInputs_propagatesVersionError(t *testing.T) {
-	t.Parallel()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
-	defer ts.Close()
-	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
-	h.SetConn(&testutil.MockExecutor{})
-	m := &Manager{GitHub: NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL)}
-
-	_, _, _, err := m.resolveRunnerImageInputs(h)
-	if err == nil {
-		t.Fatal("expected error from GitHub 404, got nil")
-	}
-	if !strings.Contains(err.Error(), "resolving runner version:") {
-		t.Errorf("error should wrap with %q, got: %v", "resolving runner version:", err)
+	// The resolution must not hit the network: an unconfigured GitHub client is fine.
+	m3 := &Manager{}
+	if _, _, err := m3.resolveContainerImageInputs(h); err != nil {
+		t.Fatalf("resolveContainerImageInputs(zero-config): %v", err)
 	}
 }
 
@@ -1761,9 +1544,6 @@ func TestManager_resolveRunnerImageInputs_propagatesVersionError(t *testing.T) {
 // not invoke the docker build path.
 func TestManager_buildRunnerImageIfMissing_alreadyPresent(t *testing.T) {
 	t.Parallel()
-	ts := httptest.NewServer(releaseHandler("v2.330.0"))
-	defer ts.Close()
-
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
 		if strings.Contains(cmd, "docker image inspect") {
 			return "yes", nil
@@ -1775,12 +1555,9 @@ func TestManager_buildRunnerImageIfMissing_alreadyPresent(t *testing.T) {
 	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
 	h.SetConn(mock)
-	m := &Manager{
-		GitHub:      NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
-		GhSrVersion: "1.2.3",
-	}
+	m := &Manager{GhSrVersion: "1.2.3"}
 
-	built, err := m.buildRunnerImageIfMissing(h, "gh-sr/agentic-runner:v2.330.0-base", "2.330.0", "x64", func() {
+	built, err := m.buildRunnerImageIfMissing(h, "gh-sr/agentic-runner:2.337.0", DefaultForkRunnerImage, func() {
 		t.Errorf("onBuild must not fire when image already exists")
 	})
 	if err != nil {
@@ -1795,9 +1572,6 @@ func TestManager_buildRunnerImageIfMissing_alreadyPresent(t *testing.T) {
 // invoking the docker build path.
 func TestManager_buildRunnerImageIfMissing_buildsWhenMissing(t *testing.T) {
 	t.Parallel()
-	ts := httptest.NewServer(releaseHandler("v2.330.0"))
-	defer ts.Close()
-
 	sawBuild := false
 	onBuildBeforeBuild := false // onBuild must fire before the docker build command
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
@@ -1812,12 +1586,9 @@ func TestManager_buildRunnerImageIfMissing_buildsWhenMissing(t *testing.T) {
 	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
 	h.SetConn(mock)
-	m := &Manager{
-		GitHub:      NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
-		GhSrVersion: "1.2.3",
-	}
+	m := &Manager{GhSrVersion: "1.2.3"}
 
-	built, err := m.buildRunnerImageIfMissing(h, "gh-sr/agentic-runner:v2.330.0-base", "2.330.0", "x64", func() {
+	built, err := m.buildRunnerImageIfMissing(h, "gh-sr/agentic-runner:2.337.0", DefaultForkRunnerImage, func() {
 		onBuildBeforeBuild = !sawBuild // true only if no build command ran yet
 	})
 	if err != nil {
@@ -1851,12 +1622,9 @@ func TestManager_buildRunnerImageIfMissing_buildErrorWrapsMessage(t *testing.T) 
 	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
 	h.SetConn(mock)
-	m := &Manager{
-		GitHub:      NewGitHubClient("pat"),
-		GhSrVersion: "1.2.3",
-	}
+	m := &Manager{GhSrVersion: "1.2.3"}
 
-	built, err := m.buildRunnerImageIfMissing(h, "gh-sr/agentic-runner:2.330.0-base", "2.330.0", "x64", nil)
+	built, err := m.buildRunnerImageIfMissing(h, "gh-sr/agentic-runner:2.337.0", DefaultForkRunnerImage, nil)
 	if err == nil {
 		t.Fatal("expected error from docker build failure, got nil")
 	}
@@ -1964,28 +1732,25 @@ func TestQuoteContainerName_SpacesAndPunctuation(t *testing.T) {
 // shape of the per-instance teardown in rebuildContainerImage: each
 // instance's `docker stop` and `docker rm -f` must run in a single
 // h.Run call (chained in one shell) instead of as two separate round-trips.
-// Saves N SSH round-trips for an N-instance rebuild. The mock deliberately
-// fails the GitHub release lookup so the function returns immediately after
-// the teardown loop, leaving only the captured stop+rm calls to inspect.
+// Saves N SSH round-trips for an N-instance rebuild.
 func TestRebuildContainerImage_chainsStopAndRemovePerInstance(t *testing.T) {
 	t.Parallel()
-	// GitHub server returns 500 so resolveRunnerImageInputs errors out
-	// after the teardown loop runs.
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	defer ts.Close()
-
 	var calls []string
 	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
 		calls = append(calls, cmd)
+		// Fail the image build so rebuildContainerImage returns right after
+		// the teardown loop, leaving only the captured teardown calls (plus
+		// the best-effort rmi) to inspect.
+		if strings.Contains(cmd, "docker build") {
+			return "", errors.New("build aborted")
+		}
 		return "", nil
 	}}
 	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
 	h.SetConn(mock)
 	m := &Manager{
-		GitHub:      NewGitHubClientWithHTTP("pat", ts.Client(), ts.URL),
 		GhSrVersion: "1.2.3",
+		Out:         io.Discard,
 	}
 	rc := config.RunnerConfig{
 		Name:       "aw-runner",
@@ -1996,8 +1761,8 @@ func TestRebuildContainerImage_chainsStopAndRemovePerInstance(t *testing.T) {
 		Count:      3,
 	}
 
-	// We expect rebuildContainerImage to return the GitHub-fetch error,
-	// but only after the teardown loop has captured all N chained calls.
+	// The rebuild flow returns the build error, but only after the teardown
+	// loop has captured all N chained calls.
 	_ = m.rebuildContainerImage(h, rc)
 
 	// Count chained stop+rm calls and bare stop/rm calls.
@@ -2266,7 +2031,7 @@ func TestManagerStartContainerRecoversStaleRegistration(t *testing.T) {
 			return "running\n", nil
 		case strings.Contains(cmd, `docker exec "gh-sr-ci-1" sh -c`) &&
 			strings.Contains(cmd, "docker info") &&
-			strings.Contains(cmd, "test -f /home/runner/actions-runner/.runner"):
+			strings.Contains(cmd, "test -f /home/runner/.runner"):
 			return "dockerd-ok\nok\n", nil
 		default:
 			return "", nil
@@ -2329,7 +2094,7 @@ func TestProbeDinDContainerReadiness_RunningHealthy(t *testing.T) {
 			switch {
 			case strings.Contains(cmd, "docker inspect --format '{{.State.Status}}'"):
 				return "running\n", nil
-			case strings.Contains(cmd, `docker exec "gh-sr-x" sh -c`) && strings.Contains(cmd, "docker info") && strings.Contains(cmd, "test -f /home/runner/actions-runner/.runner"):
+			case strings.Contains(cmd, `docker exec "gh-sr-x" sh -c`) && strings.Contains(cmd, "docker info") && strings.Contains(cmd, "test -f /home/runner/.runner"):
 				return "dockerd-ok\nok\n", nil
 			default:
 				t.Errorf("unexpected h.Run call: %q", cmd)
@@ -2365,7 +2130,7 @@ func TestProbeDinDContainerReadiness_RestartingInnerDown(t *testing.T) {
 			switch {
 			case strings.Contains(cmd, "docker inspect --format '{{.State.Status}}'"):
 				return "restarting\n", nil
-			case strings.Contains(cmd, `docker exec "gh-sr-x" sh -c`) && strings.Contains(cmd, "docker info") && strings.Contains(cmd, "test -f /home/runner/actions-runner/.runner"):
+			case strings.Contains(cmd, `docker exec "gh-sr-x" sh -c`) && strings.Contains(cmd, "docker info") && strings.Contains(cmd, "test -f /home/runner/.runner"):
 				return "no\nno\n", nil
 			default:
 				return "", nil

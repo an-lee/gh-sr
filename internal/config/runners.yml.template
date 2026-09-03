@@ -2,11 +2,14 @@
 # Edit this file, then run: gh sr up
 # Authentication: run `gh auth login` — gh sr uses the GitHub CLI token only.
 
-# Optional: extra Debian packages for the locally built container runner image
-# (runner_mode: container). Applies globally; the image tag gains a suffix when set.
+# Optional: customize the locally built container runner image (runner_mode: container).
+# Applies globally; the image tag gains a suffix when extra_apt_packages is set.
+# base_image pins the fork actions-runner base image (tag or @sha256 digest);
+# changing it requires `gh sr rebuild <name>`.
 # See docs: guides/agentic-workflows.md (container mode).
 #
 # container_runner_image:
+#   base_image: ghcr.io/falcondev-oss/actions-runner:2.337.0
 #   extra_apt_packages:
 #     - ffmpeg
 #     - sqlite3

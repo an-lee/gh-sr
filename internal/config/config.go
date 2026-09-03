@@ -27,6 +27,11 @@ type Config struct {
 // ContainerRunnerImageConfig controls optional customization of the locally built
 // gh-sr/agentic-runner Docker image (runner_mode: container).
 type ContainerRunnerImageConfig struct {
+	// BaseImage is the fork actions-runner base image the gh-sr/agentic-runner image
+	// derives FROM (e.g. ghcr.io/falcondev-oss/actions-runner:2.337.0, optionally
+	// pinned by digest). Empty = the built-in default. Changing it changes the image
+	// layout revision, so existing containers need `gh sr rebuild <name>`.
+	BaseImage string `yaml:"base_image,omitempty"`
 	// ExtraAptPackages lists additional Debian package names to install in the
 	// image at build time (Ubuntu main archive only in v1).
 	ExtraAptPackages []string `yaml:"extra_apt_packages,omitempty"`
@@ -69,6 +74,26 @@ const (
 )
 
 var debianPackageNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
+
+// dockerImageRefPattern accepts a Docker image reference: optional registry host
+// (with optional port), lowercase repo path, optional tag, optional sha256 digest.
+var dockerImageRefPattern = regexp.MustCompile(`^(?:[a-z0-9.-]+(?::[0-9]+)?/)?[a-z0-9._/-]+(?::[a-zA-Z0-9_.-]{1,128})?(?:@sha256:[a-f0-9]{64})?$`)
+
+func validateDockerImageRef(field, ref string) error {
+	if ref == "" {
+		return nil
+	}
+	if len(ref) > 512 {
+		return fmt.Errorf("%s: image reference too long (max 512 characters)", field)
+	}
+	if strings.TrimSpace(ref) != ref {
+		return fmt.Errorf("%s: image reference must not have surrounding whitespace (got %q)", field, ref)
+	}
+	if !dockerImageRefPattern.MatchString(ref) {
+		return fmt.Errorf("%s: invalid image reference %q (expected [registry/]repo[:tag][@sha256:digest])", field, ref)
+	}
+	return nil
+}
 
 func validateRunnerName(name string) error {
 	if name == "" || !isASCIIAlphaNumeric(name[0]) {
@@ -154,6 +179,9 @@ func validateContainerRunnerImage(img *ContainerRunnerImageConfig) error {
 		return fmt.Errorf("container_runner_image.start_stagger_seconds: must be 0 (default %d) or between 0 and %d (got %d)",
 			defaultContainerStartStaggerSeconds, maxContainerStartStaggerSeconds, img.StartStaggerSeconds)
 	}
+	if err := validateDockerImageRef("container_runner_image.base_image", img.BaseImage); err != nil {
+		return err
+	}
 	if len(img.ExtraAptPackages) == 0 {
 		return nil
 	}
@@ -175,6 +203,15 @@ func validateContainerRunnerImage(img *ContainerRunnerImageConfig) error {
 		}
 	}
 	return nil
+}
+
+// ContainerRunnerImageBaseImage returns the configured fork base image reference
+// ("" = caller decides the default).
+func (c *Config) ContainerRunnerImageBaseImage() string {
+	if c == nil {
+		return ""
+	}
+	return c.ContainerRunnerImage.BaseImage
 }
 
 // ContainerRunnerImageExtraAptPackages returns a copy of extra apt package names
