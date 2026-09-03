@@ -14,6 +14,10 @@ imports:
   - shared/runtime.md
 safe-outputs:
   report-failure-as-issue: false
+  threat-detection:
+    runs-on:
+      - self-hosted
+      - agentic
   create-pull-request-review-comment:
     max: 5
     side: RIGHT
@@ -27,8 +31,10 @@ safe-outputs:
 description: Performs critical code review with a focus on edge cases, potential bugs, and code quality issues
 runs-on:
   - self-hosted
-  - linux
-runs-on-slim: self-hosted
+  - agentic
+runs-on-slim:
+  - self-hosted
+  - agentic
 source: githubnext/agentics/workflows/grumpy-reviewer.md@1c6668b751c51af8571f01204ceffb19362e0f66
 timeout-minutes: 10
 tools:

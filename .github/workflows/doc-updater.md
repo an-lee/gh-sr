@@ -31,6 +31,10 @@ imports:
   - shared/runtime.md
 safe-outputs:
   report-failure-as-issue: false
+  threat-detection:
+    runs-on:
+      - self-hosted
+      - agentic
   create-pull-request:
     draft: false
     expires: 2d
@@ -43,8 +47,10 @@ description: Automatically reviews and updates documentation based on recent cod
 name: Documentation Updater
 runs-on:
   - self-hosted
-  - linux
-runs-on-slim: self-hosted
+  - agentic
+runs-on-slim:
+  - self-hosted
+  - agentic
 source: githubnext/agentics/workflows/doc-updater.md@1c6668b751c51af8571f01204ceffb19362e0f66
 timeout-minutes: 30
 tools:

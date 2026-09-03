@@ -32,6 +32,10 @@ imports:
   - shared/runtime.md
 safe-outputs:
   report-failure-as-issue: false
+  threat-detection:
+    runs-on:
+      - self-hosted
+      - agentic
   add-comment:
     hide-older-comments: true
     max: 10
@@ -70,8 +74,10 @@ description: |
   Always methodical, measurement-driven, and mindful of trade-offs.
 runs-on:
   - self-hosted
-  - linux
-runs-on-slim: self-hosted
+  - agentic
+runs-on-slim:
+  - self-hosted
+  - agentic
 source: githubnext/agentics/workflows/perf-improver.md@1c6668b751c51af8571f01204ceffb19362e0f66
 timeout-minutes: 60
 tools:

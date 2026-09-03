@@ -50,7 +50,9 @@ permissions: {}
 
 jobs:
   route:
-    runs-on: self-hosted
+    runs-on: 
+      - self-hosted
+      - agentic
     timeout-minutes: 15
     permissions:
       actions: write
