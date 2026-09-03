@@ -73,7 +73,12 @@ func linuxInstanceProbe(h *host.Host, instance string, includeDir bool) (linuxIn
 	if err != nil {
 		return result, err
 	}
-	for _, line := range strings.Split(out, "\n") {
+	// SplitSeq avoids the upfront []string allocation that strings.Split makes
+	// for the entire marker output before iteration. linuxInstanceProbe runs
+	// once per Status tick per native Linux instance and once per orphan
+	// cleanup pass, so the alloc drop compounds at both rates (see
+	// BenchmarkLinuxInstanceProbe).
+	for line := range strings.SplitSeq(out, "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
 		case trimmed == "D":

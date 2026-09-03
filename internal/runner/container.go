@@ -254,7 +254,11 @@ func ProbeDinDContainerReadiness(h *host.Host, cname string) (ContainerReadiness
 	// and either token being absent leaves the corresponding bool false.
 	out, _ := h.Run(DockerExecCommand(cname, `sh -c 'docker info >/dev/null 2>&1 && echo dockerd-ok || echo no
 test -f /home/runner/.runner && echo ok || echo no'`))
-	for _, line := range strings.Split(out, "\n") {
+	// SplitSeq avoids the upfront []string allocation that strings.Split makes
+	// for the entire probe output before iteration. This runs once per Status
+	// tick per container-mode instance, so the alloc drop compounds at the
+	// per-tick / per-host rate (see BenchmarkProbeDinDContainerReadiness).
+	for line := range strings.SplitSeq(out, "\n") {
 		switch strings.TrimSpace(line) {
 		case "dockerd-ok":
 			rep.InnerDockerdOK = true
