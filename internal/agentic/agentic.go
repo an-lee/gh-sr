@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/an-lee/gh-sr/internal/host"
+	"github.com/an-lee/gh-sr/internal/hostshell"
 	"github.com/an-lee/gh-sr/internal/runner"
 )
 
@@ -218,7 +219,7 @@ func (d containerCheckDef) checkCommand(outerContainer string) string {
 	if d.LoginShell {
 		flag = "-lc"
 	}
-	return runner.DockerExecCommand(outerContainer, "sh "+flag+" '"+d.InnerBody+"'")
+	return runner.DockerExecCommand(outerContainer, "sh "+flag+" "+hostshell.PosixSingleQuote(d.InnerBody))
 }
 
 // containerCheckDefs returns the definitions for all in-scope agentic
@@ -411,7 +412,7 @@ func containerAgenticFanoutCheckCommand(outerContainer, runnerName string, hostE
 		inner.WriteString(":$?\"\n")
 	}
 	inner.WriteString("true")
-	return runner.DockerExecCommand(outerContainer, "sh -lc '"+inner.String()+"'")
+	return runner.DockerExecCommand(outerContainer, "sh -lc "+hostshell.PosixSingleQuote(inner.String()))
 }
 
 // containerAgenticFanoutSpecs returns the per-check metadata used by the

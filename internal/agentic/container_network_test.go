@@ -40,7 +40,10 @@ func TestContainerDockerSocketUserCheckCommand(t *testing.T) {
 	for _, want := range []string{
 		"docker exec",
 		"gh-sr-rune-agentic-1",
-		"su -s /bin/sh runner -c 'docker info >/dev/null 2>&1'",
+		// InnerBody is PosixSingleQuote-embedded: its own single quotes are
+		// escaped ('\'''), which is what keeps the outer shell from mangling
+		// the probe.
+		`su -s /bin/sh runner -c '\''docker info >/dev/null 2>&1'\'''`,
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Fatalf("expected command to contain %q, got:\n%s", want, cmd)
@@ -75,7 +78,7 @@ func TestContainerCacheEnvCheckCommand(t *testing.T) {
 	for _, want := range []string{
 		"docker exec",
 		"gh-sr-rune-agentic-1",
-		"grep -q '^CUSTOM_ACTIONS_RESULTS_URL=' /home/runner/.env",
+		`grep -q '\''^CUSTOM_ACTIONS_RESULTS_URL='\'' /home/runner/.env`,
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Fatalf("expected command to contain %q, got:\n%s", want, cmd)
