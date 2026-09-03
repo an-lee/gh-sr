@@ -17,6 +17,14 @@ import (
 // AgenticRunnerImageTag is the local Docker image tag built by gh sr setup.
 const AgenticRunnerImageTag = "gh-sr/agentic-runner"
 
+// Base images for the container runner image build and the per-host cache server.
+// Both are overridable via runners.yml (container_runner_image.base_image and
+// cache.image); pin by digest for reproducible builds.
+const (
+	DefaultForkRunnerImage  = "ghcr.io/falcondev-oss/actions-runner:2.337.0"
+	DefaultCacheServerImage = "ghcr.io/falcondev-oss/github-actions-cache-server:latest"
+)
+
 // Docker image labels stamped at build time (see buildAgenticRunnerImage).
 const (
 	dockerLabelImageRevision = "gh-sr.image-revision"
