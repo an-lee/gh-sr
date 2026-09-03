@@ -449,7 +449,13 @@ func containerAgenticFanoutSpecs(outerContainer, runnerName string, hostEgressMT
 // per-check wrappers would have produced.
 func parseContainerAgenticFanoutOutput(out string, specs map[string]PrereqFailure) []PrereqFailure {
 	var failures []PrereqFailure
-	for _, line := range strings.Split(out, "\n") {
+	// SplitSeq avoids the upfront []string allocation that strings.Split makes
+	// for the full tagged stdout (incidental stderr noise + probe blocks +
+	// trailing cleanup lines). The parser only keeps entries that match
+	// `#<name>:1`, so the dropped strings.Split slice lands directly in
+	// per-call GC pressure for the `gh sr doctor` ValidateContainerAgenticFanout
+	// probe that runs once per orchestrator invocation.
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.HasPrefix(line, "#") {
 			continue
@@ -559,7 +565,11 @@ func dockerChainSpecs(variant string) map[string]PrereqFailure {
 // which matches probe-block order in dockerChainCheckCommand.
 func parseDockerChainOutput(out string, specs map[string]PrereqFailure) []PrereqFailure {
 	var failures []PrereqFailure
-	for _, line := range strings.Split(out, "\n") {
+	// SplitSeq avoids the upfront []string allocation that strings.Split makes
+	// for the full tagged stdout. parseDockerChainOutput powers the docker
+	// CLI / daemon / privileged probe trio consumed by
+	// ValidateContainerPrereqs on the `gh sr doctor` hot path.
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.HasPrefix(line, "#") {
 			continue
