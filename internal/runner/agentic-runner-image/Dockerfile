@@ -23,6 +23,11 @@
 ARG FORK_RUNNER_IMAGE
 FROM ${FORK_RUNNER_IMAGE}
 
+# The fork base ends with `USER runner`; every build step below needs root
+# (apt-get, keyrings, chown). Runtime must stay root too: entrypoint.sh starts
+# the inner dockerd and drops to the runner user itself via `su -`.
+USER root
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Core system dependencies (manifest: apt-packages-core.txt). iptables/iproute2
@@ -103,4 +108,7 @@ RUN chmod +x /opt/gh-sr/hooks/job-started.sh /opt/gh-sr/hooks/job-completed.sh
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Container starts as root (see USER root above): the entrypoint boots the inner
+# dockerd before switching to the runner user for the actions runner loop.
+USER root
 ENTRYPOINT ["/entrypoint.sh"]

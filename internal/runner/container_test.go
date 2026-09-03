@@ -177,6 +177,7 @@ func TestAgenticRunnerDockerfileRootlessBase(t *testing.T) {
 	for _, want := range []string{
 		"ARG FORK_RUNNER_IMAGE",
 		"FROM ${FORK_RUNNER_IMAGE}",
+		"USER root",
 	} {
 		if !strings.Contains(agenticRunnerDockerfile, want) {
 			t.Fatalf("Dockerfile must contain %q, got:\n%s", want, agenticRunnerDockerfile)
