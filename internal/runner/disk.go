@@ -257,9 +257,9 @@ func buildDirSizesPOSIXScript(instance string) string {
 	return fmt.Sprintf(`
 %sif [ ! -d "$dir" ]; then echo "0 0 0 0"; exit 0; fi
 if du --max-depth=0 "$dir" >/dev/null 2>&1; then
-  out=$(du --max-depth=1 -k "$dir" 2>/dev/null)
+  out=$(du --max-depth=1 -k "$dir" 2>/dev/null || true)
 else
-  out=$(du -d 1 -k "$dir" 2>/dev/null)
+  out=$(du -d 1 -k "$dir" 2>/dev/null || true)
 fi
 if [ -z "$out" ]; then echo "0 0 0 0"; exit 0; fi
 total=0; work=0; temp=0; docker=0
@@ -320,9 +320,9 @@ func buildDirSizesBatchPOSIXScript(instances []string) string {
 	b.WriteString(`  dir="$base/$inst"` + "\n")
 	b.WriteString(`  if [ ! -d "$dir" ]; then printf '%s\t0\t0\t0\t0\n' "$inst"; continue; fi` + "\n")
 	b.WriteString(`  if du --max-depth=0 "$dir" >/dev/null 2>&1; then` + "\n")
-	b.WriteString(`    out=$(du --max-depth=1 -k "$dir" 2>/dev/null)` + "\n")
+	b.WriteString(`    out=$(du --max-depth=1 -k "$dir" 2>/dev/null || true)` + "\n")
 	b.WriteString("  else\n")
-	b.WriteString(`    out=$(du -d 1 -k "$dir" 2>/dev/null)` + "\n")
+	b.WriteString(`    out=$(du -d 1 -k "$dir" 2>/dev/null || true)` + "\n")
 	b.WriteString("  fi\n")
 	b.WriteString(`  if [ -z "$out" ]; then printf '%s\t0\t0\t0\t0\n' "$inst"; continue; fi` + "\n")
 	b.WriteString("  total=0; work=0; temp=0; docker=0\n")
