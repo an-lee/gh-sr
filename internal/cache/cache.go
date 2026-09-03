@@ -108,7 +108,8 @@ func ResolveGatewayIP(h *host.Host) (string, error) {
 // parseGatewayIPOutput extracts the IPv4 address from `ip -4 -o addr show
 // docker0` output: "2: docker0    inet 172.17.0.1/16 brd ... " → "172.17.0.1".
 func parseGatewayIPOutput(out string) string {
-	for _, line := range strings.Split(out, "\n") {
+	// SplitSeq avoids the upfront []string allocation that strings.Split makes.
+	for line := range strings.SplitSeq(out, "\n") {
 		fields := strings.Fields(line)
 		for i, f := range fields {
 			if f != "inet" || i+1 >= len(fields) {

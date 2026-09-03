@@ -504,7 +504,7 @@ func printAgenticFailures(w io.Writer, hostName string, r *Result, defaultSev, p
 		}
 		printLine(w, sev, hostName, prefix+f.Message)
 		if f.Remediation != "" {
-			for _, line := range strings.Split(f.Remediation, "\n") {
+			for line := range strings.SplitSeq(f.Remediation, "\n") {
 				fmt.Fprintf(w, "       %s\n", line)
 			}
 		}
