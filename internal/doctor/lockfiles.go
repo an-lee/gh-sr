@@ -76,7 +76,8 @@ func AnalyzeLockWorkflow(name, content string) []LockFinding {
 // lockCompilerVersion extracts the compiler_version from a lock.yml front
 // matter; "" when absent or unparseable.
 func lockCompilerVersion(content string) string {
-	for _, line := range strings.Split(content, "\n") {
+	// SplitSeq avoids the upfront []string allocation that strings.Split makes.
+	for line := range strings.SplitSeq(content, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "compiler_version:") {
 			continue

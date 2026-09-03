@@ -16,7 +16,7 @@ func ApplyEnvFile(path string) error {
 		}
 		return fmt.Errorf("reading env file: %w", err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
