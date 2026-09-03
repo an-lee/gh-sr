@@ -150,6 +150,11 @@ for i in $(seq 1 "${DOCKERD_START_TIMEOUT}"); do
     if docker info &>/dev/null 2>&1; then
         echo "[entrypoint] dockerd is up"
         rm -f "${DOCKERD_FAILURES_FILE}"
+        # Self-heal a marker left by a previous failed boot: a successful boot
+        # must clear it, or status/doctor keep reporting "failed" for a healthy
+        # runner (a host-side rm cannot reach it — the state dir may be
+        # root-owned, while this entrypoint runs as root in the container).
+        rm -f "${BOOTSTRAP_FAILED_FILE}"
         break
     fi
     if [ "$i" -eq "${DOCKERD_START_TIMEOUT}" ]; then
