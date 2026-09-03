@@ -1,0 +1,4 @@
+- [Commands](commands.md) — validated build/test/bench/vet/fmt commands for baizhiheizi/gh-sr
+- [Opportunities](opportunities.md) — optimization backlog, prioritized by impact and feasibility
+- [Work log](work.md) — completed perf-improver PRs and their measurements
+- [Run history](runs.md) — round-robin task history + backlog cursor for next run
