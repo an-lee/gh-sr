@@ -15,9 +15,12 @@ models:
       models:
         deepseek-v4-flash:
           cost:
-            input: 0.14
-            output: 0.28
-            cache_read: 0.0028
+            # Per-token dollar rates (gh-aw-firewall overlay spec, models.dev
+            # style) — NOT $/1M list prices; see engine-minimax.md. DeepSeek
+            # list pricing: $0.14/$0.28/$0.0028 per 1M.
+            input: "1.4e-07"
+            output: "2.8e-07"
+            cache_read: "2.8e-09"
 network:
   allowed:
     - defaults

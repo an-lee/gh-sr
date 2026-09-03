@@ -15,9 +15,14 @@ models:
       models:
         MiniMax-M3:
           cost:
-            input: 1.20
-            output: 4.80
-            cache_read: 0.24
+            # Per-token dollar rates (gh-aw-firewall's provider overlay spec,
+            # models.dev style): the api-proxy multiplies these by 1e6, so
+            # $/1M list prices here would inflate AI-credit accounting ~1e6x
+            # and trip the non-overridable 10,000-AIC hard cap on the first
+            # request. MiniMax-M3 list pricing: $1.20/$4.80/$0.24 per 1M.
+            input: "1.2e-06"
+            output: "4.8e-06"
+            cache_read: "2.4e-07"
 network:
   allowed:
     - defaults
