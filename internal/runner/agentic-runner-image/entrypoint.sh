@@ -117,6 +117,13 @@ if [ -n "${BRIDGE_MTU}" ]; then
 fi
 
 # ── 3. Inner dockerd (single start) ─────────────────────────────────────────────
+# A previous boot may have ended without dockerd shutting down cleanly (crash,
+# registration failure, host power loss). Its pid/socket files survive a
+# `docker restart` in the container filesystem, and the stale containerd pid
+# file makes the new dockerd refuse to start ("process with PID N is still
+# running") for as long as the fresh pid namespace happens to reuse that PID.
+# No dockerd is running at this point, so any leftover is stale — remove it.
+rm -rf /run/docker /var/run/docker.pid /var/run/docker.sock 2>/dev/null || true
 echo "[entrypoint] starting dockerd..."
 dockerd \
     --data-root="${DOCKER_DATA_ROOT}" \

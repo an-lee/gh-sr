@@ -266,7 +266,10 @@ func TestAgenticRunnerEntrypointWiresJobHooks(t *testing.T) {
 // runner lives at /home/runner (fork image layout), config.sh gets --disableupdate
 // (the fork's CUSTOM_ACTIONS_RESULTS_URL-aware runner must never self-update back to
 // stock behavior), and GH_SR_CACHE_URL is forwarded as CUSTOM_ACTIONS_RESULTS_URL in
-// both .env and RUNNER_ENV so cache traffic hits the local cache server.
+// both .env and RUNNER_ENV so cache traffic hits the local cache server. It also
+// pins the stale inner-dockerd runtime cleanup: pid/socket files surviving a
+// container restart otherwise make the next boot's dockerd refuse to start
+// ("process with PID N is still running") and burn through the bootstrap retries.
 func TestAgenticRunnerEntrypointRootlessWiring(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
@@ -275,6 +278,7 @@ func TestAgenticRunnerEntrypointRootlessWiring(t *testing.T) {
 		`CUSTOM_ACTIONS_RESULTS_URL=${GH_SR_CACHE_URL}`,
 		`RUNNER_TOOL_CACHE="/home/runner/.toolcache"`,
 		"gh-aw-mcpg:latest", // pre-pull vocabulary (rootless gh-aw image set)
+		"rm -rf /run/docker /var/run/docker.pid /var/run/docker.sock",
 	} {
 		if !strings.Contains(agenticRunnerEntrypoint, want) {
 			t.Fatalf("entrypoint should contain %q, got:\n%s", want, agenticRunnerEntrypoint)
