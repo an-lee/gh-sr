@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/an-lee/gh-sr/internal/cache"
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/host"
 	"github.com/an-lee/gh-sr/internal/hostshell"
@@ -497,6 +498,30 @@ func TestCacheURLDockerCreateArg(t *testing.T) {
 	got := cacheURLDockerCreateArg("http://172.17.0.1:3000/")
 	if !strings.Contains(got, "-e GH_SR_CACHE_URL=") || !strings.Contains(got, "'http://172.17.0.1:3000/'") {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestCacheURLEnvFor(t *testing.T) {
+	t.Parallel()
+	if got := cacheURLEnvFor(nil, nil); got != "" {
+		t.Fatalf("nil settings: got %q", got)
+	}
+
+	mock := &testutil.MockExecutor{RunFn: func(cmd string) (string, error) {
+		if strings.Contains(cmd, "ip -4 -o addr show docker0") {
+			return "2: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\\n", nil
+		}
+		return "", nil
+	}}
+	h := host.NewHost("h", config.HostConfig{Addr: "runner@vps", OS: "linux", Arch: "amd64"})
+	h.SetConn(mock)
+
+	if got := cacheURLEnvFor(h, &cache.Settings{Enabled: false}); got != "" {
+		t.Fatalf("disabled settings: got %q", got)
+	}
+	got := cacheURLEnvFor(h, &cache.Settings{Enabled: true})
+	if got != cacheURLDockerCreateArg("http://172.17.0.1:3000/") {
+		t.Fatalf("enabled settings: got %q", got)
 	}
 }
 

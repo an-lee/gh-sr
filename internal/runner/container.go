@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/an-lee/gh-sr/internal/cache"
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/host"
 	"github.com/an-lee/gh-sr/internal/hostshell"
@@ -17,13 +18,11 @@ import (
 // AgenticRunnerImageTag is the local Docker image tag built by gh sr setup.
 const AgenticRunnerImageTag = "gh-sr/agentic-runner"
 
-// Base images for the container runner image build and the per-host cache server.
-// Both are overridable via runners.yml (container_runner_image.base_image and
-// cache.image); pin by digest for reproducible builds.
-const (
-	DefaultForkRunnerImage  = "ghcr.io/falcondev-oss/actions-runner:2.337.0"
-	DefaultCacheServerImage = "ghcr.io/falcondev-oss/github-actions-cache-server:latest"
-)
+// DefaultForkRunnerImage is the base (fork) runner image for the container
+// runner image build, overridable via runners.yml
+// container_runner_image.base_image; pin by digest for reproducible builds.
+// The cache server image default lives in the cache package (cache.DefaultImage).
+const DefaultForkRunnerImage = "ghcr.io/falcondev-oss/actions-runner:2.337.0"
 
 // Docker image labels stamped at build time (see buildAgenticRunnerImage).
 const (
@@ -486,7 +485,7 @@ func bootstrapMaxRetriesDockerCreateArg(maxRetries int) string {
 }
 
 // cacheURLDockerCreateArg returns the `-e GH_SR_CACHE_URL=<url>` line for the
-// `docker create` command when a per-host Actions cache server URL is configured,
+// `docker create` command when a per-host Actions cache server URL is resolved,
 // or "" when the runner should send cache traffic to GitHub as usual. The
 // entrypoint forwards a non-empty value to the runner as CUSTOM_ACTIONS_RESULTS_URL.
 func cacheURLDockerCreateArg(url string) string {
@@ -494,6 +493,17 @@ func cacheURLDockerCreateArg(url string) string {
 		return ""
 	}
 	return "  -e GH_SR_CACHE_URL=" + hostshell.PosixSingleQuote(url) + " \\\n"
+}
+
+// cacheURLEnvFor resolves the per-host cache URL and returns the docker-create
+// env line for it ("" when the cache is disabled or no container-reachable
+// address exists — e.g. no docker0 gateway). The deploy-side Ensure already
+// warns about the fallback bind in that case.
+func cacheURLEnvFor(h *host.Host, s *cache.Settings) string {
+	if s == nil || !s.Enabled {
+		return ""
+	}
+	return cacheURLDockerCreateArg(s.RunnerURL(h))
 }
 
 // containerRestartPolicy returns the Docker --restart policy used for every
@@ -614,7 +624,7 @@ func (m *Manager) createContainerInstance(h *host.Host, rc config.RunnerConfig, 
 	mtuEnv := mtuDockerCreateArg(m.resolveContainerMTU(h))
 	dockerdTimeoutEnv := dockerdStartTimeoutDockerCreateArg(m.containerDockerdStartTimeout())
 	bootstrapRetriesEnv := bootstrapMaxRetriesDockerCreateArg(m.containerBootstrapMaxRetries())
-	cacheURLEnv := cacheURLDockerCreateArg(m.CacheURL)
+	cacheURLEnv := cacheURLEnvFor(h, m.Cache)
 	restartPolicy := containerRestartPolicy()
 
 	// Build the `docker create` command. We use `--restart unless-stopped` so any

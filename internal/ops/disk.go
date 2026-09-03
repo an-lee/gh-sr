@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/an-lee/gh-sr/internal/cache"
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/runner"
 	"github.com/an-lee/gh-sr/internal/table"
@@ -150,6 +151,20 @@ func CollectDiskUsage(w io.Writer, cfg *config.Config, mgr *runner.Manager, filt
 				entry.Busy = statusMaps.busy[key]
 				entry.Remote = statusMaps.remote[key]
 				results[i].entries = append(results[i].entries, entry)
+			}
+
+			// Host-level entry for the local cache server storage (Linux only —
+			// the cache container is only deployed there).
+			if s := cacheSettings(cfg); s != nil && hcfg.OS == "linux" {
+				path, bytes, mErr := cache.MeasureStorage(h, *s)
+				results[i].entries = append(results[i].entries, runner.DiskUsageEntry{
+					Host:       g.name,
+					Instance:   cache.ContainerName,
+					Path:       path,
+					Mode:       "cache",
+					TotalBytes: bytes,
+					Err:        mErr,
+				})
 			}
 		}(i, g)
 	}

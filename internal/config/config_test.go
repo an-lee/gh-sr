@@ -1233,3 +1233,106 @@ func TestRunnerConfig_DisplayTarget(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_cacheEnabledByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runners.yml")
+	content := `
+hosts:
+  h1:
+    addr: a@b
+    os: linux
+    arch: amd64
+runners:
+  - name: r1
+    repo: o/r
+    host: h1
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.CacheEnabled() {
+		t.Error("cache should default to enabled after Load")
+	}
+
+	path2 := filepath.Join(dir, "runners-off.yml")
+	off := content + "cache:\n  enabled: false\n"
+	if err := os.WriteFile(path2, []byte(off), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg2, err := Load(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.CacheEnabled() {
+		t.Error("cache.enabled: false must disable the cache")
+	}
+
+	// Zero-value configs (no Load) stay disabled so tests/ops don't probe hosts
+	// that were never configured for a cache.
+	if (&Config{}).CacheEnabled() {
+		t.Error("zero-value Config must not enable the cache")
+	}
+}
+
+func TestValidate_cache(t *testing.T) {
+	t.Parallel()
+	valid := CacheConfig{
+		Enabled:          boolPtr(true),
+		Port:             3000,
+		BindAddr:         "172.17.0.1",
+		RetentionDays:    90,
+		MaxSizeBytes:     1024,
+		MaxUsagePercent:  90,
+		Image:            "ghcr.io/falcondev-oss/github-actions-cache-server:v1",
+		ManagementAPIKey: "k",
+		URLOverride:      "http://10.0.0.5:3000/",
+	}
+	if err := validateCache(&valid); err != nil {
+		t.Fatalf("valid cache config rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		mut  func(*CacheConfig)
+		frag string
+	}{
+		{"port_low", func(c *CacheConfig) { c.Port = -1 }, "cache.port"},
+		{"port_high", func(c *CacheConfig) { c.Port = 65536 }, "cache.port"},
+		{"bind_addr", func(c *CacheConfig) { c.BindAddr = "not-an-ip" }, "cache.bind_addr"},
+		{"retention", func(c *CacheConfig) { c.RetentionDays = -5 }, "cache.retention_days"},
+		{"retention_high", func(c *CacheConfig) { c.RetentionDays = 4000 }, "cache.retention_days"},
+		{"max_size", func(c *CacheConfig) { c.MaxSizeBytes = -1 }, "cache.max_size_bytes"},
+		{"max_usage", func(c *CacheConfig) { c.MaxUsagePercent = 101 }, "cache.max_usage_percent"},
+		{"image", func(c *CacheConfig) { c.Image = "https://evil" }, "cache.image"},
+		{"url_override_scheme", func(c *CacheConfig) { c.URLOverride = "ftp://h:3000/" }, "cache.url_override"},
+		{"url_override_host", func(c *CacheConfig) { c.URLOverride = "http://" }, "cache.url_override"},
+		{"key_too_long", func(c *CacheConfig) { c.ManagementAPIKey = strings.Repeat("k", 513) }, "cache.management_api_key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := valid
+			tc.mut(&cfg)
+			err := validateCache(&cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.frag) {
+				t.Errorf("validateCache() = %v, want error containing %q", err, tc.frag)
+			}
+		})
+	}
+}
+
+func TestResolveEnvRefs_cacheManagementKey(t *testing.T) {
+	t.Setenv("GH_SR_CACHE_KEY", "from-env")
+	cfg := &Config{Cache: CacheConfig{ManagementAPIKey: "env:GH_SR_CACHE_KEY"}}
+	cfg.resolveEnvRefs()
+	if cfg.Cache.ManagementAPIKey != "from-env" {
+		t.Errorf("management_api_key env ref: got %q", cfg.Cache.ManagementAPIKey)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

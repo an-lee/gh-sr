@@ -83,6 +83,7 @@ With no subcommand, gh sr opens the interactive dashboard on a terminal; use gh 
 		logsCmd(),
 		cleanupCmd(),
 		diskCmd(),
+		cacheCmd(),
 		updateCmd(),
 		removeCmd(),
 		serviceCmd(),
@@ -656,6 +657,90 @@ func restartCmd() *cobra.Command {
 		Short: "Restart runners (stop then start)",
 		RunE:  runRunnerCmd(ops.Restart),
 	}
+}
+
+// cacheCmd groups the per-host local Actions cache server management commands.
+// The server is deployed automatically before container runner setup/start
+// (when enabled); these commands inspect or uninstall it explicitly.
+func cacheCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cache",
+		Short: "Manage the per-host local Actions cache server",
+		Long: `Deploy and manage a local GitHub Actions cache server (falcondev-oss
+github-actions-cache-server, one gh-sr-cache container per Linux host) so
+container runners serve actions/cache traffic from the host instead of GitHub's
+cache service. Artifacts and other non-cache traffic still pass through to
+GitHub, so safe-outputs keep working across hosts.
+
+The server is deployed automatically before container runner setup/start when
+cache.enabled is not false in runners.yml; use these commands to inspect it,
+prune stored entries, or uninstall it. gh sr remove never deletes the cache —
+gh sr cache remove is the only uninstall path.`,
+	}
+	cmd.AddCommand(cacheStatusCmd(), cacheDeployCmd(), cachePruneCmd(), cacheRemoveCmd())
+	return cmd
+}
+
+func cacheStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show cache server state, health, and storage per host",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return ops.CacheStatus(cmd.OutOrStdout(), cfg, filterHost)
+		},
+	}
+}
+
+func cacheDeployCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "deploy",
+		Short: "Deploy (or start) the cache server container on hosts",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return ops.CacheDeploy(cmd.OutOrStdout(), cfg, filterHost)
+		},
+	}
+}
+
+func cachePruneCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "prune",
+		Short: "Delete all cache entries via the management API (best-effort)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return ops.CachePrune(cmd.OutOrStdout(), cfg, filterHost)
+		},
+	}
+}
+
+func cacheRemoveCmd() *cobra.Command {
+	var purgeData bool
+	cmd := &cobra.Command{
+		Use:   "remove",
+		Short: "Stop and remove the cache server container",
+		Long: `Stops and removes the gh-sr-cache container. With --purge-data, also deletes
+the storage directory (all cached data plus the generated management key).
+Runner removal (gh sr remove) never touches the cache.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return ops.CacheRemove(cmd.OutOrStdout(), cfg, filterHost, purgeData)
+		},
+	}
+	cmd.Flags().BoolVar(&purgeData, "purge-data", false, "also delete the cache storage directory (all cached data)")
+	return cmd
 }
 
 func rebuildCmd() *cobra.Command {

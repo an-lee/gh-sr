@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"runtime"
@@ -22,6 +24,44 @@ type Config struct {
 	Hosts                map[string]HostConfig      `yaml:"hosts"`
 	Runners              []RunnerConfig             `yaml:"runners"`
 	ContainerRunnerImage ContainerRunnerImageConfig `yaml:"container_runner_image,omitempty"`
+	Cache                CacheConfig                `yaml:"cache,omitempty"`
+}
+
+// CacheConfig configures the per-host local Actions cache server
+// (falcondev-oss/github-actions-cache-server, deployed as the gh-sr-cache
+// container). Cache traffic from runner_mode: container runners is served
+// from the host instead of GitHub's cache service; artifacts and other
+// ACTIONS_RESULTS traffic still pass through to GitHub.
+type CacheConfig struct {
+	// Enabled defaults to true: a `cache:` section is only needed to tune or
+	// disable (enabled: false). Set explicitly on Load (applyDefaults).
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// Port is the host-side port the server publishes on (0 = default 3000).
+	Port int `yaml:"port,omitempty"`
+	// BindAddr is the host address the server binds to. Empty = the docker0
+	// gateway IP (reachable from runner containers only); 0.0.0.0 exposes the
+	// cache API on every host interface.
+	BindAddr string `yaml:"bind_addr,omitempty"`
+	// StoragePath is the host directory for cached data ("$HOME/..." allowed;
+	// empty = $HOME/.gh-sr/cache).
+	StoragePath string `yaml:"storage_path,omitempty"`
+	// RetentionDays drops entries older than N days (0 = server default 90).
+	RetentionDays int `yaml:"retention_days,omitempty"`
+	// MaxSizeBytes caps the total cache size (0 = unbounded; the server also
+	// enforces max_usage_percent on its own).
+	MaxSizeBytes int64 `yaml:"max_size_bytes,omitempty"`
+	// MaxUsagePercent evicts when filesystem usage exceeds N percent
+	// (0 = server default 90).
+	MaxUsagePercent int `yaml:"max_usage_percent,omitempty"`
+	// Image overrides the cache server image (pin a digest for reproducible
+	// deploys; empty = ghcr.io/falcondev-oss/github-actions-cache-server:latest).
+	Image string `yaml:"image,omitempty"`
+	// ManagementAPIKey is the management API key (supports env:VAR refs).
+	// Empty = auto-generate and persist one in the storage dir on first deploy.
+	ManagementAPIKey string `yaml:"management_api_key,omitempty"`
+	// URLOverride replaces the runner-facing cache URL verbatim (escape hatch
+	// for non-docker0 topologies; must include the scheme).
+	URLOverride string `yaml:"url_override,omitempty"`
 }
 
 // ContainerRunnerImageConfig controls optional customization of the locally built
@@ -201,6 +241,62 @@ func validateContainerRunnerImage(img *ContainerRunnerImageConfig) error {
 		if !debianPackageNamePattern.MatchString(p) {
 			return fmt.Errorf("container_runner_image.extra_apt_packages[%d]: invalid package name %q (use lowercase Debian package tokens: [a-z0-9+.-])", i, p)
 		}
+	}
+	return nil
+}
+
+// CacheEnabled reports whether the per-host cache server should be deployed
+// and wired into container runners. Unset (zero-value Config, e.g. tests that
+// never ran applyDefaults) means disabled.
+func (c *Config) CacheEnabled() bool {
+	if c == nil || c.Cache.Enabled == nil {
+		return false
+	}
+	return *c.Cache.Enabled
+}
+
+// CacheStoragePath returns the host storage dir for cache data ("$HOME/..."
+// allowed; "" = the cache package default).
+func (c *Config) CacheStoragePath() string {
+	if c == nil {
+		return ""
+	}
+	return c.Cache.StoragePath
+}
+
+// validateCache checks the cache: section of runners.yml.
+func validateCache(cfg *CacheConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.Port != 0 && (cfg.Port < 1 || cfg.Port > 65535) {
+		return fmt.Errorf("cache.port: must be between 1 and 65535 (got %d)", cfg.Port)
+	}
+	if cfg.BindAddr != "" {
+		if net.ParseIP(strings.TrimSpace(cfg.BindAddr)) == nil {
+			return fmt.Errorf("cache.bind_addr: invalid IP address %q", cfg.BindAddr)
+		}
+	}
+	if cfg.RetentionDays < 0 || cfg.RetentionDays > 3650 {
+		return fmt.Errorf("cache.retention_days: must be between 0 (server default) and 3650 (got %d)", cfg.RetentionDays)
+	}
+	if cfg.MaxSizeBytes < 0 {
+		return fmt.Errorf("cache.max_size_bytes: must not be negative (got %d)", cfg.MaxSizeBytes)
+	}
+	if cfg.MaxUsagePercent != 0 && (cfg.MaxUsagePercent < 1 || cfg.MaxUsagePercent > 100) {
+		return fmt.Errorf("cache.max_usage_percent: must be between 1 and 100 (got %d)", cfg.MaxUsagePercent)
+	}
+	if err := validateDockerImageRef("cache.image", cfg.Image); err != nil {
+		return err
+	}
+	if cfg.URLOverride != "" {
+		u, err := url.Parse(cfg.URLOverride)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("cache.url_override: must be an absolute http(s) URL (got %q)", cfg.URLOverride)
+		}
+	}
+	if len(cfg.ManagementAPIKey) > 512 {
+		return fmt.Errorf("cache.management_api_key: too long (max 512 characters)")
 	}
 	return nil
 }
@@ -491,6 +587,7 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) resolveEnvRefs() {
 	c.GitHub.PAT = resolveEnv(c.GitHub.PAT)
+	c.Cache.ManagementAPIKey = resolveEnv(c.Cache.ManagementAPIKey)
 }
 
 func resolveEnv(val string) string {
@@ -502,6 +599,12 @@ func resolveEnv(val string) string {
 }
 
 func (c *Config) applyDefaults() {
+	// The cache server is enabled unless explicitly disabled — a `cache:`
+	// section is only needed to tune or turn it off.
+	if c.Cache.Enabled == nil {
+		enabled := true
+		c.Cache.Enabled = &enabled
+	}
 	for name, h := range c.Hosts {
 		if IsLocalAddr(h.Addr) {
 			if h.OS == "" {
@@ -684,6 +787,9 @@ func (c *Config) Validate() error {
 	}
 
 	if err := validateContainerRunnerImage(&c.ContainerRunnerImage); err != nil {
+		return err
+	}
+	if err := validateCache(&c.Cache); err != nil {
 		return err
 	}
 

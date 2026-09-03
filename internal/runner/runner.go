@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/an-lee/gh-sr/internal/autostart"
+	"github.com/an-lee/gh-sr/internal/cache"
 	"github.com/an-lee/gh-sr/internal/config"
 	"github.com/an-lee/gh-sr/internal/host"
 )
@@ -28,10 +29,12 @@ type Manager struct {
 	// image derives FROM (from runners.yml container_runner_image.base_image). Empty
 	// means the DefaultForkRunnerImage constant; see containerImageBaseImage().
 	ContainerImageBaseImage string
-	// CacheURL is the local Actions cache server base URL (trailing slash) injected
-	// into container runners as CUSTOM_ACTIONS_RESULTS_URL. Empty = use GitHub's
-	// cache service. Set by ops from the cache section of runners.yml.
-	CacheURL string
+	// Cache optionally wires the per-host local Actions cache server (from the
+	// runners.yml cache: section; nil = disabled = runners use GitHub's cache
+	// service). Read-only for the Manager: createContainerInstance resolves the
+	// runner-facing URL per host so concurrent host goroutines never share
+	// mutable state. Deployed by ops via the cache package.
+	Cache *cache.Settings
 	// ContainerMTU, when > 0, forces the inner/outer Docker MTU for container-mode runners
 	// (overriding host egress MTU auto-detection). From runners.yml
 	// container_runner_image.mtu; set by ops before container setup. 0 = auto-detect.

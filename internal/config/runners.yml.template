@@ -14,6 +14,25 @@
 #     - ffmpeg
 #     - sqlite3
 
+# Optional: local Actions cache server (one per Linux host, auto-deployed as a
+# gh-sr-cache container by `gh sr up`/`gh sr setup`). Container-mode runners
+# restore/save cache from it instead of GitHub's cache service; artifacts and
+# other Actions results still pass through to GitHub. Native (macOS/Windows)
+# runners are not affected.
+#
+# cache:
+#   enabled: true                     # default true on Linux hosts; set false to opt out
+#   port: 3000                        # host port for the cache API
+#   # bind_addr: 172.17.0.1           # default: docker0 gateway IP (containers can reach it;
+#   #                                 # 0.0.0.0 works but exposes the API to your LAN)
+#   # storage_path: ~/.gh-sr/cache    # persistent cache data on the host
+#   # retention_days: 90              # delete entries older than N days (0 = server default)
+#   # max_size_bytes: 10737418240     # hard cap on cache size (0 = unlimited)
+#   # max_usage_percent: 90           # skip writes when disk usage exceeds this (0 = server default)
+#   # image: ghcr.io/falcondev-oss/github-actions-cache-server:latest  # pin a digest for reproducibility
+#   # management_api_key: env:CACHE_MGMT_KEY  # env ref; enables `gh sr cache prune` delete operations
+#   # url_override: http://10.0.0.5:3000/  # escape hatch: force the runner-facing URL
+
 hosts:
   # Example hosts (os and arch are auto-detected over SSH -- you only need addr):
   #
