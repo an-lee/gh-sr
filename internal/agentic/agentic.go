@@ -30,252 +30,13 @@ const SeverityError = "error"
 // SeverityWarning indicates a non-blocking warning.
 const SeverityWarning = "warning"
 
-// ValidatePrereqs checks all agentic prerequisites on the host and returns
-// a list of failures. Returns an empty slice if all checks pass.
-//
-// Checks are parallelized across all independent SSH calls to minimize
-// wall-clock latency. Dependent chains (docker version → daemon → socket;
-// id -u → sudo iptables; host.docker.internal → host-network variant) run
-// sequentially within each goroutine.
-func ValidatePrereqs(h *host.Host) []PrereqFailure {
-	if h.OS != "linux" {
-		return []PrereqFailure{{
-			Name:     "linux-required",
-			Severity: SeverityError,
-			Message:  "agentic profile is only supported on Linux",
-			Remediation: "Use a Linux host for agentic runners. gh-aw requires Linux for its " +
-				"network egress control (iptables DOCKER-USER chain) and Docker-based sandbox.",
-			DocRef: "agentic-workflows.md §2",
-		}}
-	}
-
-	var collector failureCollector
-
-	hostDockerInternalOK := make(chan bool, 1)
-
-	appendFailure := collector.append
-
-	// ── Independent checks (all run in parallel) ──────────────────────────────
-
-	// docker CLI → daemon → socket chain — all three sub-probes run in one
-	// SSH round-trip via dockerChainCheckCommand. Exit codes are captured
-	// by parseDockerChainOutput and mapped to PrereqFailure entries via
-	// dockerChainSpecs. Replaces 3 sequential h.Run calls with 1.
-	collector.spawn(func() {
-		out, _ := h.Run(dockerChainCheckCommand("socket"))
-		for _, f := range parseDockerChainOutput(out, dockerChainSpecs("socket")) {
-			appendFailure(f)
-		}
-	})
-
-	// iptables availability
-	collector.spawn(func() {
-		out, err := h.Run(`command -v iptables >/dev/null 2>&1 && echo ok || echo missing`)
-		if err != nil || strings.TrimSpace(out) != "ok" {
-			appendFailure(PrereqFailure{
-				Name:     "iptables-missing",
-				Severity: SeverityError,
-				Message:  "iptables not found on PATH; gh-aw needs it for network egress control",
-				Remediation: `Install iptables on the host:
-
-  sudo apt-get update && sudo apt-get install -y iptables`,
-				DocRef: "agentic-workflows.md §5",
-			})
-		}
-	})
-
-	// RUNNER_TEMP check
-	collector.spawn(func() {
-		out, err := h.Run(`
-FOUND_BAD=0
-for ENV_FILE in $(find "$HOME/.gh-sr/runners" -maxdepth 2 -name ".env" 2>/dev/null); do
-  RUNNER_TEMP=$(grep "^RUNNER_TEMP=" "$ENV_FILE" 2>/dev/null | cut -d= -f2)
-  INSTANCE=$(basename "$(dirname "$ENV_FILE")")
-  if [ -z "$RUNNER_TEMP" ]; then
-    echo "unset:$INSTANCE"
-    FOUND_BAD=1
-  elif [ "$RUNNER_TEMP" = "/tmp" ]; then
-    echo "tmp:$INSTANCE"
-    FOUND_BAD=1
-  fi
-done
-[ $FOUND_BAD -eq 0 ] && echo "ok"
-`)
-		if err == nil {
-			lines := strings.TrimSpace(out)
-			if lines != "ok" {
-				for _, line := range strings.Split(lines, "\n") {
-					if strings.HasPrefix(line, "unset:") {
-						instance := strings.TrimPrefix(line, "unset:")
-						appendFailure(PrereqFailure{
-							Name:     "runner-temp-unset",
-							Severity: SeverityWarning,
-							Message:  fmt.Sprintf("RUNNER_TEMP is not set in %s's .env; gh-aw requires it to be set to a path other than /tmp", instance),
-							Remediation: `Set RUNNER_TEMP in the runner's .env file:
-
-  echo "RUNNER_TEMP=$HOME/.gh-sr/runners/_temp" >> ~/actions-runner/.env
-  mkdir -p "$HOME/.gh-sr/runners/_temp"`,
-							DocRef: "agentic-workflows.md §6",
-						})
-					} else if strings.HasPrefix(line, "tmp:") {
-						instance := strings.TrimPrefix(line, "tmp:")
-						appendFailure(PrereqFailure{
-							Name:     "runner-temp-tmp",
-							Severity: SeverityWarning,
-							Message:  fmt.Sprintf("RUNNER_TEMP=/tmp in %s's .env conflicts with gh-aw runtime tree at /tmp/gh-aw", instance),
-							Remediation: `Set RUNNER_TEMP to a different path in the runner's .env file:
-
-  sed -i 's|RUNNER_TEMP=/tmp|RUNNER_TEMP='"$HOME"'/.gh-sr/runners/_temp|' ~/actions-runner/.env
-  mkdir -p "$HOME/.gh-sr/runners/_temp"`,
-							DocRef: "agentic-workflows.md §6",
-						})
-					}
-				}
-			}
-		}
-	})
-
-	// id -u → sudo iptables (dependent chain: only if non-root)
-	collector.spawn(func() {
-		uidOut, err := h.Run(`id -u`)
-		if err == nil && strings.TrimSpace(uidOut) != "0" {
-			out, err := h.Run(`sudo -n iptables -L DOCKER-USER >/dev/null 2>&1 && echo ok || echo no`)
-			if err != nil || strings.TrimSpace(out) != "ok" {
-				userName, _ := h.Run(`id -un`)
-				userName = strings.TrimSpace(userName)
-				appendFailure(PrereqFailure{
-					Name:     "sudo-iptables",
-					Severity: SeverityWarning,
-					Message:  "passwordless sudo for iptables not available; gh-aw may fail to set egress rules",
-					Remediation: fmt.Sprintf(`On the host, create a sudoers rule for iptables:
-
-  echo "%s ALL=(ALL) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables" | \\
-    sudo tee /etc/sudoers.d/gh-sr-iptables
-  sudo chmod 0440 /etc/sudoers.d/gh-sr-iptables`, userName),
-					DocRef: "agentic-workflows.md §5",
-				})
-			}
-		}
-	})
-
-	// host.docker.internal DNS check (default bridge)
-	collector.spawn(func() {
-		out, err := h.Run(`docker run --rm alpine sh -c "getent hosts host.docker.internal 2>/dev/null" 2>/dev/null`)
-		out = strings.TrimSpace(out)
-		if err != nil || out == "" || out == "failed" {
-			hostDockerInternalOK <- false
-			appendFailure(PrereqFailure{
-				Name:     "host-docker-internal",
-				Severity: SeverityError,
-				Message:  "host.docker.internal does not resolve inside containers; MCP gateway unreachable",
-				Remediation: `Run 'gh sr setup' for this runner, which automatically configures Docker DNS via dnsmasq.
-If you already ran setup, manually configure dnsmasq:
-
-  # Detect docker0 bridge IP
-  BRIDGE_IP=$(docker inspect bridge --format='{{(index .IPAM.Config 0).Gateway}}')
-
-  # Install and configure dnsmasq
-  sudo apt-get update && sudo apt-get install -y dnsmasq
-
-  echo "address=/host.docker.internal/$BRIDGE_IP
-listen-address=$BRIDGE_IP
-bind-interfaces
-server=127.0.0.53
-server=8.8.8.8" | sudo tee /etc/dnsmasq.d/gh-sr-docker.conf
-
-  sudo systemctl restart dnsmasq
-  sudo systemctl restart docker`,
-				DocRef: "agentic-workflows.md §4b",
-			})
-			return
-		}
-		if strings.Contains(out, "127.0.0.1") || strings.Contains(out, "::1") {
-			hostDockerInternalOK <- false
-			appendFailure(PrereqFailure{
-				Name:     "host-docker-internal-loopback",
-				Severity: SeverityError,
-				Message:  "host.docker.internal resolves to loopback (127.0.0.1) inside containers; breaks MCP gateway",
-				Remediation: `The /etc/hosts entry for host.docker.internal is pointing to 127.0.0.1, which is
-the container's own loopback. It must point to the Docker bridge gateway.
-
-Fix by running on the host:
-
-  # Get the Docker bridge gateway IP
-  BRIDGE_IP=$(docker inspect bridge --format='{{(index .IPAM.Config 0).Gateway}}')
-
-  # Update /etc/hosts (remove any existing host.docker.internal entry first)
-  grep -v "host.docker.internal" /etc/hosts | sudo tee /etc/hosts.tmp
-  echo "$BRIDGE_IP  host.docker.internal" | sudo tee -a /etc/hosts.tmp
-  sudo mv /etc/hosts.tmp /etc/hosts`,
-				DocRef: "agentic-workflows.md §4b",
-			})
-			return
-		}
-		hostDockerInternalOK <- true
-	})
-
-	// host-network DNS check (depends on host-docker-internal passing)
-	collector.spawn(func() {
-		if ok := <-hostDockerInternalOK; !ok {
-			return
-		}
-		outHN, errHN := h.Run(`docker run --rm --network host alpine sh -c "getent hosts host.docker.internal 2>/dev/null" 2>/dev/null`)
-		outHN = strings.TrimSpace(outHN)
-		fields := strings.Fields(outHN)
-		badHN := errHN != nil || len(fields) == 0 || fields[0] == "127.0.0.1" || fields[0] == "::1"
-		if badHN {
-			appendFailure(PrereqFailure{
-				Name:     "host-docker-internal-host-network",
-				Severity: SeverityWarning,
-				Message:  "`host.docker.internal` not usable from `docker run --network host` (same mode as gh-aw-mcpg); MCP gateway or in-sandbox MCP clients may still fail",
-				Remediation: `Verify on the host (must not be 127.0.0.1):
-
-  getent hosts host.docker.internal
-  docker run --rm --network host alpine sh -c "getent hosts host.docker.internal"
-
-Map host.docker.internal to the docker0 bridge gateway; see agentic-workflows.md §4b.`,
-				DocRef: "agentic-workflows.md §4b",
-			})
-		}
-	})
-
-	// external DNS check
-	collector.spawn(func() {
-		out, err := h.Run(`docker run --rm alpine sh -c "nslookup github.com >/dev/null 2>&1 && echo ok || echo failed" 2>/dev/null`)
-		if err != nil || strings.TrimSpace(out) != "ok" {
-			appendFailure(PrereqFailure{
-				Name:     "external-dns",
-				Severity: SeverityError,
-				Message:  "external DNS (github.com) does not resolve inside containers",
-				Remediation: `Docker containers cannot resolve external domains. This usually means dnsmasq
-is not configured with upstream DNS servers, or Docker's DNS config is missing.
-
-Check your dnsmasq config has upstream servers:
-
-  cat /etc/dnsmasq.d/gh-sr-docker.conf
-  # Should contain: server=127.0.0.53 and/or server=8.8.8.8
-
-If missing, update the config and restart:
-
-  echo "server=8.8.8.8" | sudo tee -a /etc/dnsmasq.d/gh-sr-docker.conf
-  sudo systemctl restart dnsmasq
-  sudo systemctl restart docker`,
-				DocRef: "agentic-workflows.md §4b",
-			})
-		}
-	})
-
-	return collector.wait()
-}
-
 // ValidateContainerPrereqs checks host prerequisites for runner_mode: container (DinD).
-// Unlike ValidatePrereqs (for native agentic), the host only needs:
+// The host only needs:
 //   - Docker available on the host (to run the outer runner container)
 //   - Support for --privileged containers (required for the inner dockerd)
 //
 // dnsmasq, sudoers/iptables, host.docker.internal, gh-aw tooling, and RUNNER_TEMP
-// live inside the runner image (or apply only to native agentic) and are not
-// validated here.
+// live inside the runner image and are not validated here.
 func ValidateContainerPrereqs(h *host.Host) []PrereqFailure {
 	var failures []PrereqFailure
 
@@ -346,38 +107,6 @@ func runAWFHygieneChecks(h *host.Host, pfx, nameSuffix string, checks []awfHygie
 	return collector.wait()
 }
 
-// awfHostHygieneChecks returns the host-level AWF hygiene check definitions.
-// All probes run on the host's Docker daemon and produce host-level remediation.
-func awfHostHygieneChecks() []awfHygieneCheck {
-	return []awfHygieneCheck{
-		{
-			Name:    "awf-orphan-containers",
-			Cmd:     `docker ps -a --filter "name=awf-" --filter "name=gh-aw" --format '{{.Names}}' 2>/dev/null | head -20`,
-			Message: "orphan gh-aw/awf containers found from previously crashed jobs",
-			Remediation: `Clean up orphan containers to free resources and avoid port conflicts:
-
-  docker ps -a --filter "name=awf-" --format '{{.ID}}' | xargs -r docker rm -f
-  docker ps -a --filter "name=gh-aw" --format '{{.ID}}' | xargs -r docker rm -f`,
-		},
-		{
-			Name:    "stale-docker-user-rules",
-			Cmd:     `sudo -n iptables -L DOCKER-USER --line-numbers -n 2>/dev/null | grep -i "awf\|gh-aw" | head -20`,
-			Message: "stale DOCKER-USER iptables rules referencing gh-aw/awf containers",
-			Remediation: `Flush stale AWF egress rules (only safe to do when no agentic jobs are running):
-
-  sudo iptables -F DOCKER-USER`,
-		},
-		{
-			Name:    "mcpg-orphan-containers",
-			Cmd:     `docker ps -a --filter "name=gh-aw-mcpg-" --format '{{.Names}}' 2>/dev/null | head -20`,
-			Message: "orphan gh-aw-mcpg-* containers found from previously crashed jobs",
-			Remediation: `Clean up orphan MCP gateway containers:
-
-  docker ps -a --filter "name=gh-aw-mcpg-" --format '{{.ID}}' | xargs -r docker rm -f`,
-		},
-	}
-}
-
 // awfInnerHygieneChecks returns the inner-Docker (DinD runner) AWF hygiene
 // check definitions. Each remediation is pre-formatted with the outer
 // container name so the operator running `gh sr doctor` knows which runner
@@ -415,22 +144,7 @@ func awfInnerHygieneChecks(outerContainer string) []awfHygieneCheck {
 	}
 }
 
-// ValidateAWFHygiene checks for leftover AWF/gh-aw Docker artefacts from crashed jobs.
-// These are not blocking failures, only warnings.
-//
-// All three checks run in parallel to minimize wall-clock latency.
-func ValidateAWFHygiene(h *host.Host) []PrereqFailure {
-	if h.OS != "linux" {
-		return nil
-	}
-	return runAWFHygieneChecks(h, "", "", awfHostHygieneChecks())
-}
-
-// ValidateAWFHygieneInner runs the same orphan/stale checks as ValidateAWFHygiene
-// against the inner Docker daemon inside a running DinD runner container (outerContainer
-// is the host-visible name, e.g. gh-sr-myinstance).
-//
-// All three checks run in parallel to minimize wall-clock latency.
+// ValidateAWFHygieneInner runs orphan/stale AWF/gh-aw artefact checks against the
 func ValidateAWFHygieneInner(h *host.Host, outerContainer string) []PrereqFailure {
 	if h.OS != "linux" {
 		return nil
@@ -851,20 +565,16 @@ func parseContainerAgenticFanoutOutput(out string, specs map[string]PrereqFailur
 // so a single failing prerequisite surfaces every dependent failure in one
 // pass — the Go parser maps each non-zero tag back to its PrereqFailure
 // via the chain's specs. Replaces 3 sequential h.Run calls with 1 SSH
-// round-trip on the `gh sr doctor` ValidatePrereqs / ValidateContainerPrereqs
-// hot paths.
+// round-trip on the `gh sr doctor` ValidateContainerPrereqs hot path.
 //
 // variant selects the third probe and its associated spec key:
-//   - "socket": docker run against the host socket (used by ValidatePrereqs)
 //   - "privileged": --privileged support probe (used by ValidateContainerPrereqs)
 //
-// The first two probes (CLI version, daemon info) are identical across both
-// variants; only the third differs to match each caller's intent.
+// The first two probes (CLI version, daemon info) are shared; only the third
+// differs to match the caller's intent.
 func dockerChainCheckCommand(variant string) string {
 	var third string
 	switch variant {
-	case "socket":
-		third = `{ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli docker ps >/dev/null 2>&1; } >/dev/null 2>&1; echo "#docker-socket:$?"`
 	case "privileged":
 		// Mirrors the original probe's dual check: docker must exit 0 AND
 		// the inner shell must echo "privileged-ok". Either failing the
@@ -909,18 +619,6 @@ func dockerChainSpecs(variant string) map[string]PrereqFailure {
 		},
 	}
 	switch variant {
-	case "socket":
-		specs["docker-socket"] = PrereqFailure{
-			Name:     "docker-socket",
-			Severity: SeverityError,
-			Message:  "cannot spawn containers via Docker socket; MCP gateway will fail",
-			Remediation: `The MCP Gateway needs access to the Docker socket to spawn MCP server containers.
-Ensure the runner user is in the docker group:
-
-  sudo usermod -aG docker $USER
-  # Log out and back in for group membership to take effect`,
-			DocRef: "agentic-workflows.md §4c",
-		}
 	case "privileged":
 		specs["docker-privileged"] = PrereqFailure{
 			Name:     "docker-privileged",
@@ -1046,8 +744,8 @@ func runContainerCheck(h *host.Host, spec containerCheckSpec) []PrereqFailure {
 // its checks out across independent goroutines: declare `var c failureCollector`,
 // spawn each check via `c.spawn(func(){ ... })`, then return `c.wait()`.
 //
-// The three Validate* funcs in this file (ValidatePrereqs, ValidateAWFHygiene,
-// ValidateAWFHygieneInner) all need exactly this pattern — a mutex-guarded
+// The Validate* funcs in this file (runAWFHygieneChecks for
+// ValidateAWFHygieneInner) need exactly this pattern — a mutex-guarded
 // failures slice plus a WaitGroup — so the boilerplate lives here instead of
 // being copied. The helper is private because no caller outside this package
 // should reach for the failure-append primitives directly; failures are a

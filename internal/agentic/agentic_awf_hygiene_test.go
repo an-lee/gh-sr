@@ -8,227 +8,23 @@ import (
 	"github.com/an-lee/gh-sr/internal/host"
 )
 
-// The three docker/iptables probes that ValidateAWFHygiene fans out across
-// goroutines. Lifted into named constants so the test assertions can reuse
-// the same strings the function emits — guard against silent refactors of
-// the probe shapes (the previous test-improver run noted that the exact-string
-// match in prereqTestExecutor is a feature, not a bug, for exactly this reason).
+// The docker/iptables probes that ValidateAWFHygieneInner fans out across the
+// inner Docker daemon of a DinD runner container. Lifted into named constants
+// so the test assertions can reuse the same strings the function emits —
+// guard against silent refactors of the probe shapes (the previous
+// test-improver run noted that the exact-string match in prereqTestExecutor
+// is a feature, not a bug, for exactly this reason).
 //
-// Note: the host-level iptables probe uses `sudo -n` (operators don't run
-// gh-sr as root on the host), but the inner-Docker probe drops sudo because
-// DinD runs its inner daemon as root. The two helpers below keep the two
-// shapes in sync — touching one without the other will break
-// ValidateAWFHygieneInner's tests.
+// Note: the inner-Docker iptables probe has no `sudo -n` prefix because the
+// DinD inner daemon runs as root.
 const (
-	awfHygieneAwfCmd      = `docker ps -a --filter "name=awf-" --filter "name=gh-aw" --format '{{.Names}}' 2>/dev/null | head -20`
-	awfHygieneIptablesCmd = `sudo -n iptables -L DOCKER-USER --line-numbers -n 2>/dev/null | grep -i "awf\|gh-aw" | head -20`
-	awfHygieneMcpgCmd     = `docker ps -a --filter "name=gh-aw-mcpg-" --format '{{.Names}}' 2>/dev/null | head -20`
+	awfHygieneAwfCmd  = `docker ps -a --filter "name=awf-" --filter "name=gh-aw" --format '{{.Names}}' 2>/dev/null | head -20`
+	awfHygieneMcpgCmd = `docker ps -a --filter "name=gh-aw-mcpg-" --format '{{.Names}}' 2>/dev/null | head -20`
 
 	// The inner-Docker variant of the iptables probe — no `sudo -n`
 	// because the DinD inner daemon runs as root.
 	awfHygieneIptablesInnerCmd = `iptables -L DOCKER-USER --line-numbers -n 2>/dev/null | grep -i "awf\|gh-aw" | head -20`
 )
-
-// allAwfHygieneClean is the canonical "no leftovers" mock: every probe returns
-// an empty string. Build a fresh map per test so concurrent subtests don't
-// share mutation state.
-func allAwfHygieneClean() *prereqTestExecutor {
-	return &prereqTestExecutor{
-		response: map[string]string{
-			awfHygieneAwfCmd:      "",
-			awfHygieneIptablesCmd: "",
-			awfHygieneMcpgCmd:     "",
-		},
-	}
-}
-
-func TestValidateAWFHygiene(t *testing.T) {
-	t.Parallel()
-
-	t.Run("non-linux short-circuits", func(t *testing.T) {
-		t.Parallel()
-		for _, os := range []string{"darwin", "windows"} {
-			os := os
-			t.Run(os, func(t *testing.T) {
-				t.Parallel()
-				h := host.NewHost("h", config.HostConfig{OS: os})
-				h.SetConn(&prereqTestExecutor{}) // unused — short-circuit
-				if got := ValidateAWFHygiene(h); got != nil {
-					t.Errorf("non-linux must return nil, got %#v", got)
-				}
-			})
-		}
-	})
-
-	t.Run("clean host returns nil and all three probes ran", func(t *testing.T) {
-		t.Parallel()
-		exec := allAwfHygieneClean()
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		if got := ValidateAWFHygiene(h); got != nil {
-			t.Errorf("clean host must return nil, got %#v", got)
-		}
-		// Lock in the fan-out: all three goroutines must have run, even when
-		// the result is empty. A regression that short-circuits after the
-		// first probe would leave mcpg-orphan-detector blind.
-		for _, cmd := range []string{awfHygieneAwfCmd, awfHygieneIptablesCmd, awfHygieneMcpgCmd} {
-			if !exec.saw(cmd) {
-				t.Errorf("expected probe to run: %q", cmd)
-			}
-		}
-	})
-
-	t.Run("whitespace-only output treated as clean", func(t *testing.T) {
-		t.Parallel()
-		// TrimSpace is the function's "no artefact" gate; a probe that
-		// returns "   \n  " should not produce a failure.
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				awfHygieneAwfCmd:      "   \n  \t",
-				awfHygieneIptablesCmd: "",
-				awfHygieneMcpgCmd:     "",
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		if got := ValidateAWFHygiene(h); got != nil {
-			t.Errorf("whitespace-only output must be treated as clean, got %#v", got)
-		}
-	})
-
-	t.Run("orphan awf containers returns awf-orphan-containers warning", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				awfHygieneAwfCmd:      "awf-c1\nawf-c2",
-				awfHygieneIptablesCmd: "",
-				awfHygieneMcpgCmd:     "",
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateAWFHygiene(h)
-		f := failureByName(t, failures, "awf-orphan-containers")
-		if f.Name == "" {
-			t.Fatalf("expected awf-orphan-containers failure, got %#v", failures)
-		}
-		if f.Severity != SeverityWarning {
-			t.Errorf("Severity = %q, want warning", f.Severity)
-		}
-		if !strings.Contains(f.Message, "crashed jobs") {
-			t.Errorf("Message should mention crashed jobs, got %q", f.Message)
-		}
-		if !strings.Contains(f.Remediation, "docker rm -f") {
-			t.Errorf("Remediation should show docker rm -f cleanup, got %q", f.Remediation)
-		}
-		if !strings.Contains(f.Remediation, "xargs") {
-			t.Errorf("Remediation should pipeline through xargs, got %q", f.Remediation)
-		}
-		if f.DocRef == "" {
-			t.Error("DocRef should be populated")
-		}
-		// The other two probes ran with empty output → only one failure total.
-		if len(failures) != 1 {
-			t.Errorf("expected 1 failure, got %d (%#v)", len(failures), failures)
-		}
-	})
-
-	t.Run("stale DOCKER-USER rules returns stale-docker-user-rules warning", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				awfHygieneAwfCmd:      "",
-				awfHygieneIptablesCmd: "1  DROP  all  --  172.30.0.5  anywhere",
-				awfHygieneMcpgCmd:     "",
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateAWFHygiene(h)
-		f := failureByName(t, failures, "stale-docker-user-rules")
-		if f.Name == "" {
-			t.Fatalf("expected stale-docker-user-rules failure, got %#v", failures)
-		}
-		if f.Severity != SeverityWarning {
-			t.Errorf("Severity = %q, want warning", f.Severity)
-		}
-		if !strings.Contains(f.Remediation, "iptables -F DOCKER-USER") {
-			t.Errorf("Remediation should show the flush command, got %q", f.Remediation)
-		}
-		if !strings.Contains(f.Remediation, "no agentic jobs are running") {
-			t.Errorf("Remediation should warn about safe-flush precondition, got %q", f.Remediation)
-		}
-		if len(failures) != 1 {
-			t.Errorf("expected 1 failure, got %d (%#v)", len(failures), failures)
-		}
-	})
-
-	t.Run("orphan MCP gateway containers returns mcpg-orphan-containers warning", func(t *testing.T) {
-		t.Parallel()
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				awfHygieneAwfCmd:      "",
-				awfHygieneIptablesCmd: "",
-				awfHygieneMcpgCmd:     "gh-aw-mcpg-1\ngh-aw-mcpg-2",
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateAWFHygiene(h)
-		f := failureByName(t, failures, "mcpg-orphan-containers")
-		if f.Name == "" {
-			t.Fatalf("expected mcpg-orphan-containers failure, got %#v", failures)
-		}
-		if f.Severity != SeverityWarning {
-			t.Errorf("Severity = %q, want warning", f.Severity)
-		}
-		if !strings.Contains(f.Remediation, "MCP gateway") {
-			t.Errorf("Remediation should mention MCP gateway, got %q", f.Remediation)
-		}
-		if !strings.Contains(f.Remediation, "gh-aw-mcpg-") {
-			t.Errorf("Remediation should reference the filter pattern, got %q", f.Remediation)
-		}
-		if len(failures) != 1 {
-			t.Errorf("expected 1 failure, got %d (%#v)", len(failures), failures)
-		}
-	})
-
-	t.Run("all three probes fail returns three warnings", func(t *testing.T) {
-		t.Parallel()
-		// No responses → every Run errors → out is "" → no failure.
-		// So we need to wire up all three commands with non-empty output.
-		exec := &prereqTestExecutor{
-			response: map[string]string{
-				awfHygieneAwfCmd:      "awf-c1",
-				awfHygieneIptablesCmd: "1  DROP",
-				awfHygieneMcpgCmd:     "gh-aw-mcpg-1",
-			},
-		}
-		h := host.NewHost("h", config.HostConfig{OS: "linux"})
-		h.SetConn(exec)
-		failures := ValidateAWFHygiene(h)
-		if len(failures) != 3 {
-			t.Fatalf("expected 3 failures when all probes hit, got %d (%#v)", len(failures), failures)
-		}
-		// Lookup by name because the goroutine fan-out makes the slice order
-		// non-deterministic — a regression that serialised the probes via
-		// an ordered channel would not be caught by this test, but a
-		// regression that dropped one of the three would be.
-		for _, want := range []string{"awf-orphan-containers", "stale-docker-user-rules", "mcpg-orphan-containers"} {
-			f := failureByName(t, failures, want)
-			if f.Name == "" {
-				t.Errorf("missing %q in failures %#v", want, failures)
-				continue
-			}
-			if f.Severity != SeverityWarning {
-				t.Errorf("%s: Severity = %q, want warning", want, f.Severity)
-			}
-			if f.DocRef == "" {
-				t.Errorf("%s: DocRef should be populated", want)
-			}
-		}
-	})
-}
 
 func TestValidateAWFHygieneInner(t *testing.T) {
 	t.Parallel()
@@ -236,7 +32,7 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 	const outerContainer = "gh-sr-myinstance"
 
 	// The three inner probes are the outer ones wrapped in `docker exec "X" `.
-	// strcov.Quote is used by the function so the prefix is literally
+	// strconv.Quote is used by the function so the prefix is literally
 	// `docker exec "gh-sr-myinstance" ` (double-quoted, space-prefixed).
 	// The iptables probe drops the `sudo -n` prefix because the DinD inner
 	// daemon runs as root.
@@ -251,7 +47,7 @@ func TestValidateAWFHygieneInner(t *testing.T) {
 			t.Run(os, func(t *testing.T) {
 				t.Parallel()
 				h := host.NewHost("h", config.HostConfig{OS: os})
-				h.SetConn(&prereqTestExecutor{})
+				h.SetConn(&prereqTestExecutor{}) // unused — short-circuit
 				if got := ValidateAWFHygieneInner(h, outerContainer); got != nil {
 					t.Errorf("non-linux must return nil, got %#v", got)
 				}
