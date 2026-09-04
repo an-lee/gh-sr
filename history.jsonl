@@ -1,0 +1,1 @@
+{"date":"2026-09-04T20:42:00Z","run_id":"33917082895","branch":"test-assist/lockfiles-orchestrator","commit":"1197043","pr_number":"draft","target":"checkLockWorkflows","coverage_before":"75.9%","coverage_after":"81.4%","tests_added":7,"sub_tests":7}
