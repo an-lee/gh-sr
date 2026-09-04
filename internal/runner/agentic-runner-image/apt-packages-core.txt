@@ -7,6 +7,12 @@ chromium
 chromium-chromedriver
 curl
 dnsutils
+git
+gnupg
+imagemagick
+iproute2
+iptables
+jq
 # Chrome for Testing runtime libs (ohmyxin script/ci_browser.sh system tests):
 # the chromium/chromium-chromedriver entries above are Ubuntu 24.04
 # snap-transition stubs that install no browser libraries, so a CfT download

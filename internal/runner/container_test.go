@@ -190,6 +190,26 @@ func TestAgenticRunnerDockerfileRootlessBase(t *testing.T) {
 	if !strings.Contains(agenticRunnerAptPackagesCore, "zstd") {
 		t.Fatal("apt-packages-core.txt must install zstd (Actions-cache compression codec)")
 	}
+	// Exact-name manifest lines (substring matching is not enough: e.g. "git"
+	// would match inside "gnupg"-adjacent names once the list grows).
+	installed := map[string]bool{}
+	for _, line := range strings.Split(agenticRunnerAptPackagesCore, "\n") {
+		if name := strings.TrimSpace(line); name != "" && !strings.HasPrefix(name, "#") {
+			installed[name] = true
+		}
+	}
+	for _, want := range []string{
+		"iptables",   // inner dockerd: bridge NAT chain (missing ⇒ dockerd fails to start, bootstrap holds)
+		"iproute2",   // inner dockerd diagnostics + entrypoint MTU pinning (`ip -o route show default`)
+		"git",        // every checkout step
+		"jq",         // gh-aw framework steps
+		"gnupg",      // apt keyrings / gpg-signed workflows
+		"imagemagick",
+	} {
+		if !installed[want] {
+			t.Errorf("apt-packages-core.txt must install %q (as its own line)", want)
+		}
+	}
 }
 
 // TestAgenticRunnerImageForbidsRetiredHacks guards the rootless cutover: gh-aw
