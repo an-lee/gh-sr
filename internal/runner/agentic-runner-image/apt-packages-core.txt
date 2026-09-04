@@ -3,8 +3,6 @@
 automake
 build-essential
 ca-certificates
-chromium
-chromium-chromedriver
 curl
 dnsutils
 git
@@ -13,12 +11,14 @@ imagemagick
 iproute2
 iptables
 jq
-# Chrome for Testing runtime libs (ohmyxin script/ci_browser.sh system tests):
-# the chromium/chromium-chromedriver entries above are Ubuntu 24.04
-# snap-transition stubs that install no browser libraries, so a CfT download
-# fails to launch with "cannot open shared object file: libatk-1.0.so.0".
-# Names carry the noble t64 suffix; validated against a CfT 152 headless smoke
-# launch (baizhiheizi/gh-sr#471).
+# Chrome for Testing runtime libs (ohmyxin script/ci_browser.sh system tests).
+# Replaced the snap-transition chromium / chromium-chromedriver entries that
+# used to live in this manifest: on Ubuntu 24.04 they are transitional stubs
+# (2:1snap1-0ubuntu2) that install no browser binary and no shared libraries,
+# so a CfT download fails to launch with
+# "cannot open shared object file: libatk-1.0.so.0". Names carry the noble
+# t64 suffix; validated against a CfT 152 headless smoke launch
+# (baizhiheizi/gh-sr#471).
 fonts-liberation
 libatk-bridge2.0-0t64
 libatk1.0-0t64
