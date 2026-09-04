@@ -7,20 +7,47 @@ chromium
 chromium-chromedriver
 curl
 dnsutils
-git
-gnupg
-imagemagick
-iproute2
-iptables
-jq
+# Chrome for Testing runtime libs (ohmyxin script/ci_browser.sh system tests):
+# the chromium/chromium-chromedriver entries above are Ubuntu 24.04
+# snap-transition stubs that install no browser libraries, so a CfT download
+# fails to launch with "cannot open shared object file: libatk-1.0.so.0".
+# Names carry the noble t64 suffix; validated against a CfT 152 headless smoke
+# launch (baizhiheizi/gh-sr#471).
+fonts-liberation
+libatk-bridge2.0-0t64
+libatk1.0-0t64
+libasound2t64
+libatspi2.0-0t64
+libcairo2
+libcups2t64
+libdbus-1-3
+libdrm2
+libexpat1
 libffi-dev
+libfontconfig1
+libgbm1
 libgmp-dev
 libicu-dev
+libnspr4
+libnss3
+libpango-1.0-0
+libpangocairo-1.0-0
 libpq-dev
 libssl-dev
 libsodium-dev
 libtool
 libvips
+libx11-xcb1
+libxcomposite1
+libxcursor1
+libxdamage1
+libxfixes3
+libxi6
+libxkbcommon0
+libxrandr2
+libxrender1
+libxss1
+libxtst6
 libyaml-0-2
 libyaml-dev
 lsb-release
