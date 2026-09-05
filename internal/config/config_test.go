@@ -737,6 +737,30 @@ func TestValidate_agenticMCPPortsRemoved(t *testing.T) {
 	}
 }
 
+// TestValidate_awfServiceBridgeRequiresAgentic asserts awf_service_bridge is
+// only accepted on agentic runners (the bridge joins services: containers to
+// the AWF awf-net topology network, which only agentic jobs create).
+func TestValidate_awfServiceBridgeRequiresAgentic(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		Hosts:   map[string]HostConfig{"h": {Addr: "local", OS: "linux", Arch: "amd64"}},
+		Runners: []RunnerConfig{{Name: "r", Repo: "o/r", Host: "h", AWFServiceBridge: true}},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error: awf_service_bridge without profile: agentic")
+	}
+	if !strings.Contains(err.Error(), "awf_service_bridge requires profile: agentic") {
+		t.Fatalf("expected bridge-requires-agentic message, got %v", err)
+	}
+
+	// With the agentic profile the same config validates.
+	cfg.Runners[0].Profile = "agentic"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("awf_service_bridge with profile: agentic should validate, got %v", err)
+	}
+}
+
 // TestValidate_agenticImpliesContainer asserts profile: agentic resolves to container
 // mode (no runner_mode needed) and validates.
 func TestValidate_agenticImpliesContainer(t *testing.T) {

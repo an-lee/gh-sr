@@ -199,13 +199,13 @@ func TestAgenticRunnerDockerfileRootlessBase(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"iptables",   // inner dockerd: bridge NAT chain (missing ⇒ dockerd fails to start, bootstrap holds)
-		"iproute2",   // inner dockerd diagnostics + entrypoint MTU pinning (`ip -o route show default`)
-		"git",        // every checkout step
-		"jq",         // gh-aw framework steps
-		"gnupg",      // apt keyrings / gpg-signed workflows
+		"iptables", // inner dockerd: bridge NAT chain (missing ⇒ dockerd fails to start, bootstrap holds)
+		"iproute2", // inner dockerd diagnostics + entrypoint MTU pinning (`ip -o route show default`)
+		"git",      // every checkout step
+		"jq",       // gh-aw framework steps
+		"gnupg",    // apt keyrings / gpg-signed workflows
 		"imagemagick",
-		"wget",   // fetched by consumer workflows; also a hard Depends of the Google Chrome .deb
+		"wget",      // fetched by consumer workflows; also a hard Depends of the Google Chrome .deb
 		"libpq-dev", // Rails/pg system tests (ohmyxin workload)
 	} {
 		if !installed[want] {
@@ -227,6 +227,7 @@ func TestAgenticRunnerImageForbidsRetiredHacks(t *testing.T) {
 		"entrypoint.sh":         agenticRunnerEntrypoint,
 		"job-started.sh":        agenticRunnerJobStartedHook,
 		"job-completed.sh":      agenticRunnerJobCompletedHook,
+		"awf-service-bridge.sh": agenticRunnerAWFServiceBridgeHook,
 	}
 	for name, content := range files {
 		for _, forbidden := range []string{
@@ -416,12 +417,50 @@ func TestAgenticRunnerDockerfileBakesHooksAndEntrypoint(t *testing.T) {
 	for _, want := range []string{
 		"COPY hooks/job-started.sh /opt/gh-sr/hooks/job-started.sh",
 		"COPY hooks/job-completed.sh /opt/gh-sr/hooks/job-completed.sh",
+		"COPY hooks/awf-service-bridge.sh /opt/gh-sr/hooks/awf-service-bridge.sh",
 		"COPY entrypoint.sh /entrypoint.sh",
 		`ENTRYPOINT ["/entrypoint.sh"]`,
 	} {
 		if !strings.Contains(agenticRunnerDockerfile, want) {
 			t.Fatalf("Dockerfile should bake %q, got:\n%s", want, agenticRunnerDockerfile)
 		}
+	}
+}
+
+// TestAgenticRunnerAWFServiceBridgeHook pins the service-bridge contract: it
+// only ever JOINS service containers to the AWF topology network (never the
+// reverse — attaching the agent to the runner's network would bypass the
+// egress firewall), reuses the runner-assigned service alias, and exits 0 on
+// every "nothing to bridge" path so it never alarms.
+func TestAgenticRunnerAWFServiceBridgeHook(t *testing.T) {
+	t.Parallel()
+	for _, want := range []string{
+		"grep '^github_network_'",        // discover this job's service network
+		"docker network inspect awf-net", // wait for the AWF topology network
+		"docker network connect --alias", // the join itself
+		`.[$net].Aliases[0]`,             // reuse the runner-assigned service alias
+		"exit 0",                         // every nothing-to-bridge path exits 0
+	} {
+		if !strings.Contains(agenticRunnerAWFServiceBridgeHook, want) {
+			t.Fatalf("awf-service-bridge hook must contain %q", want)
+		}
+	}
+	// Join direction is load-bearing: the hook must never connect anything TO
+	// the runner's service network (that side of the bridge would grant the
+	// sandbox egress outside the firewall).
+	if strings.Contains(agenticRunnerAWFServiceBridgeHook, "connect --alias \"$alias_name\" github_network_") ||
+		strings.Contains(agenticRunnerAWFServiceBridgeHook, "connect --alias \"$alias_name\" \"$SERVICE_NET\"") {
+		t.Fatal("awf-service-bridge must join services INTO awf-net, never into the runner network")
+	}
+	// The bridge is armed by job-started.sh and reaped by job-completed.sh.
+	if !strings.Contains(agenticRunnerJobStartedHook, "/opt/gh-sr/hooks/awf-service-bridge.sh") {
+		t.Fatal("job-started hook must spawn the service bridge when GH_SR_AWF_SERVICE_BRIDGE=1")
+	}
+	if !strings.Contains(agenticRunnerJobStartedHook, "GH_SR_AWF_SERVICE_BRIDGE") {
+		t.Fatal("job-started hook must gate the bridge on GH_SR_AWF_SERVICE_BRIDGE")
+	}
+	if !strings.Contains(agenticRunnerJobCompletedHook, "pkill -f /opt/gh-sr/hooks/awf-service-bridge.sh") {
+		t.Fatal("job-completed hook must kill lingering bridge waiters")
 	}
 }
 
@@ -549,6 +588,21 @@ func TestCacheURLDockerCreateArg(t *testing.T) {
 	got := cacheURLDockerCreateArg("http://172.17.0.1:3000/")
 	if !strings.Contains(got, "-e GH_SR_CACHE_URL=") || !strings.Contains(got, "'http://172.17.0.1:3000/'") {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// TestAWFServiceBridgeDockerCreateArg pins the service-bridge opt-in contract:
+// awf_service_bridge: true becomes a -e GH_SR_AWF_SERVICE_BRIDGE=1 line (the
+// entrypoint forwards it to the runner .env so job-started.sh arms the
+// bridge), and the default emits nothing.
+func TestAWFServiceBridgeDockerCreateArg(t *testing.T) {
+	t.Parallel()
+	if got := awfServiceBridgeDockerCreateArg(config.RunnerConfig{Name: "r", Repo: "o/r"}); got != "" {
+		t.Fatalf("bridge off should omit env, got %q", got)
+	}
+	got := awfServiceBridgeDockerCreateArg(config.RunnerConfig{Name: "r", Repo: "o/r", Profile: "agentic", AWFServiceBridge: true})
+	if !strings.Contains(got, "-e GH_SR_AWF_SERVICE_BRIDGE=1") {
+		t.Fatalf("bridge on should emit env, got %q", got)
 	}
 }
 

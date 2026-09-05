@@ -390,6 +390,15 @@ type RunnerConfig struct {
 	Ephemeral  bool     `yaml:"ephemeral"`
 	Profile    string   `yaml:"profile"`     // "agentic" for GitHub Agentic Workflows
 	RunnerMode string   `yaml:"runner_mode"` // "native" (default) or "container"
+	// AWFServiceBridge opts the runner into the AWF service bridge: a per-job
+	// detached waiter (hooks/awf-service-bridge.sh, armed by job-started.sh)
+	// that joins the job's GitHub Actions `services:` containers to the AWF
+	// topology network (awf-net) once it appears, so the sandboxed agent can
+	// reach them by service name over native TCP (the gh-aw#57988 pattern —
+	// under AWF network isolation awf-net has no host route, so services on
+	// the runner are otherwise unreachable from the sandbox). Requires
+	// profile: agentic.
+	AWFServiceBridge bool `yaml:"awf_service_bridge"`
 	// Deprecated: the per-instance MCP port-label scheme was removed. agentic runners
 	// now use runner_mode: container, which isolates the MCP gateway port per runner.
 	// These fields are retained only so old configs still parse; Validate rejects them
@@ -726,6 +735,11 @@ func (c *Config) Validate() error {
 		// each agentic runner its own isolated MCP gateway port, so ports/labels are unnecessary.
 		if len(r.AgenticMCPPorts) > 0 || r.AgenticMCPPortBase != nil {
 			return fmt.Errorf("runner %q: agentic_mcp_ports / agentic_mcp_port_base have been removed; agentic runners use runner_mode: container, which isolates the MCP gateway port per runner — delete these fields", r.Name)
+		}
+		// The service bridge joins the job's services: containers to the AWF
+		// awf-net topology network; it only exists in agentic jobs.
+		if r.AWFServiceBridge && !r.IsAgentic() {
+			return fmt.Errorf("runner %q: awf_service_bridge requires profile: agentic (the bridge joins services: containers to the AWF awf-net topology network, which only agentic jobs create)", r.Name)
 		}
 		// Inline the `name-N` construction instead of calling r.InstanceNames(): the
 		// per-call slice+fmt.Sprintf allocs are the dominant cost on large configs.

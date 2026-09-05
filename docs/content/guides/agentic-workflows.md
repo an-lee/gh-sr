@@ -23,9 +23,11 @@ If several agentic jobs share one host, these collide. To make concurrent agenti
 
 ### Rootless sandbox, GitHub-hosted equivalence
 
-gh-aw v0.88+ runs its firewall **rootless** (default `docker` runtime profile): the AWF agent, Squid proxy, and api-proxy run as unprivileged containers on the **inner bridge topology** (`awf-net` + Squid), with no `sudo`, no `iptables` manipulation, and no `NET_ADMIN`. gh-aw job containers reach the MCP gateway and workflow `services:` through the bridge and the standard `--add-host=host.docker.internal:host-gateway` mapping — exactly the environment of a GitHub-hosted VM, where the runner filesystem **is** the Docker daemon's filesystem.
+gh-aw v0.88+ runs its firewall **rootless** (default `docker` runtime profile): the AWF agent, Squid proxy, and api-proxy run as unprivileged containers on the **inner bridge topology** (`awf-net` + Squid), with no `sudo`, no `iptables` manipulation, and no `NET_ADMIN`. gh-aw job containers reach the MCP gateway through the bridge and the standard `--add-host=host.docker.internal:host-gateway` mapping — exactly the environment of a GitHub-hosted VM, where the runner filesystem **is** the Docker daemon's filesystem.
 
 That is the property the DinD container provides: the actions runner and the inner `dockerd` share one filesystem and one network namespace, so gh-aw's compiled steps (gateway on `--network bridge` with `127.0.0.1` port mapping, socket mount, `host-gateway` alias) behave identically to GitHub-hosted.
+
+> **`services:` containers are the one exception** — the agent cannot reach them through `host.docker.internal` on this topology. Under network isolation the agent sits on the internal `awf-net` bridge with no route to the runner host, and the gh-aw-documented `services:` + `docker-sudo-iptables` host-access path only works on GitHub-hosted VM runners (it relies on host iptables that topology mode never programs; see gh-aw#52140, gh-aw-firewall#7266). Enable the [service bridge](#service-bridge-services-containers-in-the-sandbox) below to give the sandbox native TCP access to `services:` containers.
 
 ### Pristine per job
 
@@ -117,6 +119,48 @@ gh extension upgrade gh-aw
 gh aw compile
 gh sr doctor --check-lockfiles   # optional gate: fails on stale-era lock files
 ```
+
+### Service bridge: `services:` containers in the sandbox
+
+Agents that run test suites against a database (Postgres, Redis, …) need to reach the workflow's GitHub Actions [`services:`](https://docs.github.com/en/actions/using-containerized-services/about-service-containers) containers. On this runner topology that needs one opt-in:
+
+```yaml
+runners:
+  - name: my-agentic
+    repo: owner/repo
+    host: my-linux-host
+    profile: agentic
+    awf_service_bridge: true   # join each job's services: to the AWF topology network
+```
+
+**Why it is needed.** Under gh-aw v0.88+ network isolation the sandboxed agent sits on the internal `awf-net` bridge — its only egress is the Squid HTTP proxy — while the actions runner places `services:` containers on a separate `github_network_<hash>` bridge. The two are unrouted, so the gh-aw-documented `services:` + `host.docker.internal` + `sandbox.agent.runtime: docker-sudo-iptables` pattern is inert here: that path relies on host iptables that topology mode never programs (it only works on GitHub-hosted VM runners — see [gh-aw#51433](https://github.com/github/gh-aw/issues/51433), [gh-aw#52140](https://github.com/github/gh-aw/issues/52140), [gh-aw-firewall#7266](https://github.com/github/gh-aw-firewall/issues/7266)). gh-aw's strict validator also rejects `services:` with published ports unless that runtime is selected.
+
+**What the bridge does.** A per-job waiter (armed by the job-started hook, killed by the job-completed hook, so it never leaks across jobs) waits for the AWF sandbox to create `awf-net`, then joins each of the job's `services:` containers to it with `docker network connect --alias <service-key>` — the same trusted-topology-peer mechanism AWF itself uses for the MCP gateway (`awf-net`'s name is pinned by awf's network policy for exactly this). Docker's embedded DNS, the agent's only resolver, then serves the service keys, and the agent speaks native TCP. This is the pattern proposed upstream in [gh-aw#57988](https://github.com/github/gh-aw/issues/57988); if gh-aw productizes it (e.g. `services.<name>.attach: true`), you can turn the bridge off and let the workflow own the join.
+
+**Writing the workflow.** Declare `services:` **without port mappings** (the agent reaches them over `awf-net`; ports would also be rejected by gh-aw's strict validator under the default runtime) and point environment at the service keys:
+
+```yaml
+---
+services:
+  postgres:
+    image: pgvector/pgvector:pg16-trixie
+    env:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    options: >-
+      --health-cmd="pg_isready -U postgres"
+      --health-interval=10s --health-timeout=5s --health-retries=5
+env:
+  DATABASE_HOST: postgres   # resolved by the sandbox via awf-net
+  RAILS_ENV: test
+---
+```
+
+Steps that run **on the runner** (e.g. `pre-agent-steps` preparing a schema) cannot resolve the alias; reach the service by its container IP instead — the inner docker host routes to bridge IPs (`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' <container>`).
+
+**Security.** The bridge only ever joins service containers **into** `awf-net` (never the agent into the runner's network — that would bypass the egress firewall). Services gain an interface on the agent's internal network, which has no route out, and keep their original runner-network interface — the same trust already extended by declaring them under `services:`. Logs land in `/tmp/gh-sr-awf-service-bridge.log` inside the runner container.
+
+Applying the setting to existing runners requires recreating their containers (`gh sr rebuild <name>`), and the image gains the new hook automatically on the next `gh sr setup` (the layout revision changes).
 
 ## 4. What the runner image provides
 

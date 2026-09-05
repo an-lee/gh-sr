@@ -97,6 +97,19 @@ runners:
 
 The image is built locally from a fork runner base (`container_runner_image.base_image`, default `ghcr.io/falcondev-oss/actions-runner:v2.337.0`) and adds Docker CE, Node.js LTS, zstd, and the per-job reset hooks. The gh-aw v0.88+ sandbox is **rootless** — no `sudo`, no iptables rules: the AWF firewall runs unprivileged on the inner Docker bridge, and inner containers resolve `host.docker.internal` via `--add-host=host.docker.internal:host-gateway`. Workflows must be compiled with **gh-aw >= v0.88** (`gh aw compile`); `gh sr doctor --check-lockfiles` flags retired sudo/iptables-era lockfiles.
 
+**Workflow `services:` in the sandbox (opt-in):** under the rootless network-isolation topology the agent has no route to runner-published service ports (`host.docker.internal` is unreachable from the internal `awf-net` bridge — the documented `services:` + `docker-sudo-iptables` pattern only works on GitHub-hosted VM runners). Set `awf_service_bridge: true` on an agentic runner and gh-sr joins each job's `services:` containers to `awf-net` as trusted topology peers, so the sandboxed agent reaches them by service name over native TCP (the [gh-aw#57988](https://github.com/github/gh-aw/issues/57988) pattern):
+
+```yaml
+runners:
+  - name: aw-runner
+    repo: owner/repo
+    host: my-vps
+    profile: agentic
+    awf_service_bridge: true   # services: containers join awf-net per job
+```
+
+Workflows then just declare `services:` (no port mappings) and point env at the service keys (`DATABASE_HOST: postgres`).
+
 A **local Actions cache server** is deployed per host by default (`cache.enabled` is on), so `actions/cache` reads and writes the local host instead of round-tripping GitHub. `gh sr doctor` verifies the inner Docker, registration, rootless-sandbox hygiene, and cache wiring.
 
 For details, see the [Agentic Workflows guide](https://an-lee.github.io/gh-sr/guides/agentic-workflows/).

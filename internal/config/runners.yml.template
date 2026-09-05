@@ -111,6 +111,10 @@ runners:
   #   host: vps-1
   #   count: 3             # run 3 concurrent agentic jobs safely
   #   profile: agentic     # implies runner_mode: container (DinD isolation)
+  #   awf_service_bridge: true  # optional: join the job's `services:` containers to
+  #                             # the AWF awf-net topology network so the sandboxed
+  #                             # agent reaches them by service name (see
+  #                             # guides/agentic-workflows.md; requires profile: agentic)
   #
   # Same container image (DinD + actions runner) works for ordinary CI without
   # profile: agentic — use when you want isolated dockerd and work dirs per instance:

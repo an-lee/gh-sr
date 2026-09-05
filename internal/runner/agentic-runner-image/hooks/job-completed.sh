@@ -46,11 +46,16 @@ for img in ghcr.io/github/gh-aw-mcpg \
     docker ps -aq --filter "ancestor=$img" 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1
 done
 
-# 3. Prune unused networks (awf-net, awmg-* sidecar networks, github_network_* once
+# 3. Kill any lingering AWF service-bridge waiter armed by job-started. The
+#    waiter exits on its own once it joins, when a network never appears
+#    (timeout), or here — so it can never leak into the next job.
+pkill -f /opt/gh-sr/hooks/awf-service-bridge.sh >/dev/null 2>&1
+
+# 4. Prune unused networks (awf-net, awmg-* sidecar networks, github_network_* once
 #    their containers are gone).
 docker network prune -f >/dev/null 2>&1
 
-# 4. Remove the gh-aw runtime tree so the next job's setup starts from a clean slate.
+# 5. Remove the gh-aw runtime tree so the next job's setup starts from a clean slate.
 rm -rf /tmp/gh-aw >/dev/null 2>&1
 
 log "teardown complete"
