@@ -205,6 +205,8 @@ func TestAgenticRunnerDockerfileRootlessBase(t *testing.T) {
 		"jq",         // gh-aw framework steps
 		"gnupg",      // apt keyrings / gpg-signed workflows
 		"imagemagick",
+		"wget",   // fetched by consumer workflows; also a hard Depends of the Google Chrome .deb
+		"libpq-dev", // Rails/pg system tests (ohmyxin workload)
 	} {
 		if !installed[want] {
 			t.Errorf("apt-packages-core.txt must install %q (as its own line)", want)
@@ -384,6 +386,25 @@ func TestAgenticRunnerDockerfileInstallsNodeLTS(t *testing.T) {
 	} {
 		if !strings.Contains(agenticRunnerDockerfile, want) {
 			t.Fatalf("Dockerfile should install Node.js LTS with %q, got:\n%s", want, agenticRunnerDockerfile)
+		}
+	}
+}
+
+// TestAgenticRunnerDockerfileBakesChrome guards the baked browser: Selenium
+// system tests in consumer workflows need google-chrome on PATH (Selenium
+// WebDriver 4.x auto-manages the matching chromedriver), and the install must
+// stay arm64-guarded because Google publishes no arm64 Linux build — an
+// unguarded download would break arm64 image builds.
+func TestAgenticRunnerDockerfileBakesChrome(t *testing.T) {
+	t.Parallel()
+	for _, want := range []string{
+		"https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
+		`case "${TARGETARCH}" in arm64)`,
+		"apt-get install -y --no-install-recommends /tmp/chrome.deb",
+		"google-chrome --version",
+	} {
+		if !strings.Contains(agenticRunnerDockerfile, want) {
+			t.Fatalf("Dockerfile should bake Google Chrome with %q, got:\n%s", want, agenticRunnerDockerfile)
 		}
 	}
 }

@@ -66,4 +66,5 @@ sudo
 tar
 uidmap
 unzip
+wget
 zstd

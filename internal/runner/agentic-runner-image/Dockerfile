@@ -61,6 +61,21 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && npm -v \
     && rm -rf /var/lib/apt/lists/*
 
+# Google Chrome stable — Selenium system tests in consumer workflows (Selenium
+# WebDriver 4.x auto-manages the matching chromedriver, so no driver package is
+# installed here; the manifest's chromium-chromedriver entry is the Ubuntu snap
+# stub that ships nothing). The dl.google.com .deb registers Google's apt repo
+# and keyring itself, so the build-time version is pinned per image like every
+# other layer. Google publishes no arm64 Linux build, so arm64 builds skip the
+# install (same defensive TARGETARCH case as the compose step below).
+RUN case "${TARGETARCH}" in arm64) : ;; *) \
+      apt-get update \
+      && curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+      && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+      && rm -f /tmp/chrome.deb \
+      && google-chrome --version ;; esac \
+    && rm -rf /var/lib/apt/lists/*
+
 # Docker Compose CLI plugin — gh-aw's rootless sandbox (AWF) starts its squid
 # proxy and agent containers via `docker compose`. The fork base's static Docker
 # bundle ships buildx but no compose, and the plugin lookup then fails with the
