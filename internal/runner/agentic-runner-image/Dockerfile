@@ -132,10 +132,15 @@ RUN mkdir -p /runner-state && chown runner:runner /runner-state
 # pristine inner environment per job — no leftover containers, networks, or
 # /tmp/gh-aw — while preserving the image-layer cache. Stored OUTSIDE the actions
 # runner application directory, as GitHub requires.
+#
+# awf-service-bridge.sh is the opt-in (GH_SR_AWF_SERVICE_BRIDGE) per-job waiter
+# that joins the job's `services:` containers to the AWF awf-net topology
+# network; job-started.sh spawns it detached, job-completed.sh kills it.
 RUN mkdir -p /opt/gh-sr/hooks
 COPY hooks/job-started.sh /opt/gh-sr/hooks/job-started.sh
 COPY hooks/job-completed.sh /opt/gh-sr/hooks/job-completed.sh
-RUN chmod +x /opt/gh-sr/hooks/job-started.sh /opt/gh-sr/hooks/job-completed.sh
+COPY hooks/awf-service-bridge.sh /opt/gh-sr/hooks/awf-service-bridge.sh
+RUN chmod +x /opt/gh-sr/hooks/job-started.sh /opt/gh-sr/hooks/job-completed.sh /opt/gh-sr/hooks/awf-service-bridge.sh
 
 # Entrypoint
 COPY entrypoint.sh /entrypoint.sh

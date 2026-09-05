@@ -36,6 +36,10 @@
 #                         below 1500 (reduced-MTU host networks); unset/≥1500 ⇒ Docker default
 #   GH_SR_DOCKERD_START_TIMEOUT — seconds to wait for inner dockerd (default 90)
 #   GH_SR_BOOTSTRAP_MAX_RETRIES — consecutive dockerd-start failures before giving up (default 5)
+#   GH_SR_AWF_SERVICE_BRIDGE — "1" to arm the AWF service bridge (runners.yml
+#                         `awf_service_bridge: true`): forwarded to the runner
+#                         .env so job-started.sh spawns the per-job waiter that
+#                         joins this job's `services:` containers to awf-net
 
 set -euo pipefail
 
@@ -247,6 +251,9 @@ export RUNNER_TOOL_CACHE="/home/runner/.toolcache"
     echo "RUNNER_TOOL_CACHE=/home/runner/.toolcache"
     if [ -n "${GH_SR_CACHE_URL:-}" ]; then
         echo "CUSTOM_ACTIONS_RESULTS_URL=${GH_SR_CACHE_URL}"
+    fi
+    if [ "${GH_SR_AWF_SERVICE_BRIDGE:-0}" = "1" ]; then
+        echo "GH_SR_AWF_SERVICE_BRIDGE=1"
     fi
     echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/gh-sr/hooks/job-started.sh"
     echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/gh-sr/hooks/job-completed.sh"

@@ -59,6 +59,7 @@ func ContainerImageLayoutRevision(ghSrVersion, baseImage string, extraApt []stri
 	b.WriteString(agenticRunnerEntrypoint)
 	b.WriteString(agenticRunnerJobStartedHook)
 	b.WriteString(agenticRunnerJobCompletedHook)
+	b.WriteString(agenticRunnerAWFServiceBridgeHook)
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])[:12]
 }
@@ -488,6 +489,18 @@ func bootstrapMaxRetriesDockerCreateArg(maxRetries int) string {
 	return dockerCreateEnvLineIf("GH_SR_BOOTSTRAP_MAX_RETRIES", maxRetries, maxRetries > 0)
 }
 
+// awfServiceBridgeDockerCreateArg returns the `-e GH_SR_AWF_SERVICE_BRIDGE=1`
+// line for the `docker create` command when the runner opts into the AWF
+// service bridge (runners.yml `awf_service_bridge: true`, agentic profile
+// only), or "" otherwise. The entrypoint forwards a set value to the runner
+// .env so the job-started hook arms the bridge waiter.
+func awfServiceBridgeDockerCreateArg(rc config.RunnerConfig) string {
+	if !rc.AWFServiceBridge {
+		return ""
+	}
+	return "  -e GH_SR_AWF_SERVICE_BRIDGE=1 \\\n"
+}
+
 // cacheURLDockerCreateArg returns the `-e GH_SR_CACHE_URL=<url>` line for the
 // `docker create` command when a per-host Actions cache server URL is resolved,
 // or "" when the runner should send cache traffic to GitHub as usual. The
@@ -629,6 +642,7 @@ func (m *Manager) createContainerInstance(h *host.Host, rc config.RunnerConfig, 
 	dockerdTimeoutEnv := dockerdStartTimeoutDockerCreateArg(m.containerDockerdStartTimeout())
 	bootstrapRetriesEnv := bootstrapMaxRetriesDockerCreateArg(m.containerBootstrapMaxRetries())
 	cacheURLEnv := cacheURLEnvFor(h, m.Cache)
+	awfBridgeEnv := awfServiceBridgeDockerCreateArg(rc)
 	restartPolicy := containerRestartPolicy()
 
 	// Build the `docker create` command. We use `--restart unless-stopped` so any
@@ -654,7 +668,7 @@ docker create \
   -e GH_SR_RUNNER_LABELS=%s \
   -e GH_SR_RUNNER_GROUP=%s \
   -e GH_SR_RUNNER_EPHEMERAL=%s \
-%s%s%s%s  %s`,
+%s%s%s%s%s  %s`,
 		hostshell.PosixSingleQuote(stateDir),
 		hostshell.PosixSingleQuote(containerName(instanceName)),
 		hostshell.PosixSingleQuote(restartPolicy),
@@ -669,6 +683,7 @@ docker create \
 		dockerdTimeoutEnv,
 		bootstrapRetriesEnv,
 		cacheURLEnv,
+		awfBridgeEnv,
 		hostshell.PosixSingleQuote(imageTag),
 	)
 
@@ -1122,9 +1137,12 @@ func buildAgenticRunnerImage(h *host.Host, imageTag, baseImage, ghSrVersion stri
 
 	// Write per-job reset hooks into the build context (Pillar 1). The helper mkdirs
 	// the parent of every path, so the explicit `mkdir -p buildDir/hooks` is gone.
+	// awf-service-bridge.sh is the opt-in services:→awf-net joiner spawned by
+	// job-started.sh (see runners.yml awf_service_bridge).
 	for _, hk := range []struct{ name, content string }{
 		{"job-started.sh", agenticRunnerJobStartedHook},
 		{"job-completed.sh", agenticRunnerJobCompletedHook},
+		{"awf-service-bridge.sh", agenticRunnerAWFServiceBridgeHook},
 	} {
 		if err := writeRemoteHeredocExecutable(h, buildDir+"/hooks/"+hk.name, hk.content); err != nil {
 			return err

@@ -30,7 +30,20 @@ docker ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1
 docker network prune -f >/dev/null 2>&1
 rm -rf /tmp/gh-aw >/dev/null 2>&1
 
-# 2. Ensure the inner dockerd is responsive (entrypoint starts it before run.sh;
+# 2. Arm the AWF service bridge (opt-in: runners.yml `awf_service_bridge: true`,
+#    agentic profile only — propagated via the runner .env). This hook runs
+#    before prepare_job creates the job's service containers/network and long
+#    before the agent step creates awf-net, so the bridge joins from a detached
+#    waiter (it polls for both networks and exits once joined, on timeout, or
+#    when job-completed.sh kills it). See hooks/awf-service-bridge.sh.
+if [ "${GH_SR_AWF_SERVICE_BRIDGE:-0}" = "1" ]; then
+    log "awf_service_bridge enabled — arming service bridge waiter"
+    : > /tmp/gh-sr-awf-service-bridge.log 2>/dev/null
+    nohup /opt/gh-sr/hooks/awf-service-bridge.sh >/dev/null 2>&1 &
+    disown
+fi
+
+# 3. Ensure the inner dockerd is responsive (entrypoint starts it before run.sh;
 #    this guards against a daemon that died between jobs).
 for i in $(seq 1 30); do
     if docker info >/dev/null 2>&1; then

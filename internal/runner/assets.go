@@ -22,3 +22,6 @@ var agenticRunnerJobStartedHook string
 
 //go:embed agentic-runner-image/hooks/job-completed.sh
 var agenticRunnerJobCompletedHook string
+
+//go:embed agentic-runner-image/hooks/awf-service-bridge.sh
+var agenticRunnerAWFServiceBridgeHook string
